@@ -157,14 +157,24 @@ class AvitoParser:
         try:
             r = self.session.get(url, timeout=20)
 
-            # Если получили 429/439 или challenge
-            pow_challenge = self.session.cookies.get("pow_challenge")
-            if (r.status_code in (429, 439) or "firewall-container" in r.text) and pow_challenge:
+            # Если получили 403/429/439 или challenge
+            pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
+            if (r.status_code in (403, 429, 439) or "firewall-container" in r.text) and pow_challenge:
                 logger.info("Обнаружена PoW-защита Авито, решаем...")
                 if self._solve_pow_challenge(pow_challenge):
                     time.sleep(0.5)
                     r = self.session.get(url, timeout=20)
                     logger.info(f"Повторный запрос после PoW: статус {r.status_code}")
+            elif r.status_code == 403:
+                # Если 403 и кука устарела, сбрасываем сессию
+                logger.info("Сброс сессии из-за 403...")
+                self._init_session()
+                time.sleep(1.0)
+                r = self.session.get(url, timeout=20)
+                pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
+                if pow_challenge:
+                    self._solve_pow_challenge(pow_challenge)
+                    r = self.session.get(url, timeout=20)
 
             if r.status_code == 200:
                 return r.text
