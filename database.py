@@ -12,6 +12,9 @@ async def init_db():
     """Инициализация базы данных и создание таблиц."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA cache_size = -2000;")  # Ограничение кэша в памяти 2 МБ (для 512 МБ RAM)
+        await db.execute("PRAGMA temp_store = MEMORY;")
+        await db.execute("PRAGMA auto_vacuum = INCREMENTAL;")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -283,3 +286,26 @@ async def mark_items_seen_bulk(search_id: int, item_ids: List[str]):
             records
         )
         await db.commit()
+
+
+async def cleanup_old_seen_items(days: int = 5) -> int:
+    """
+    Очистка старых объявлений из БД для оптимизации памяти и размера базы.
+    Удаляет записи старше указанного количества дней и сжимает базу.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "DELETE FROM seen_items WHERE created_at < datetime('now', '-' || ? || ' days')",
+                (days,)
+            )
+            deleted_count = cursor.rowcount
+            await db.commit()
+            if deleted_count > 0:
+                await db.execute("PRAGMA incremental_vacuum;")
+                logger.info(f"Очистка БД: удалено {deleted_count} устаревших записей seen_items")
+            return deleted_count
+    except Exception as e:
+        logger.error(f"Ошибка при очистке устаревших записей БД: {e}")
+        return 0
+

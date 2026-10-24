@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import html
 import logging
 import random
@@ -184,9 +185,11 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
 async def monitoring_worker(bot: Bot):
     """
     Главный бесконечный цикл фонового мониторинга поисков.
+    Оптимизирован для 512 МБ RAM: выполняет регулярную очистку памяти и старых записей БД.
     """
-    logger.info("Запуск фонового сервиса мониторинга Авито...")
+    logger.info("Запуск фонового сервиса мониторинга Авито (low-memory режим)...")
     parser = AvitoParser()
+    cycle_count = 0
 
     while True:
         try:
@@ -198,6 +201,14 @@ async def monitoring_worker(bot: Bot):
                     # Небольшая пауза между запросами к разным ссылкам, чтобы распределять нагрузку
                     await asyncio.sleep(random.uniform(2.0, 4.0))
 
+            cycle_count += 1
+            # Каждые 50 циклов (~50 минут) очищаем базу от старых объявлений и чистим RAM
+            if cycle_count >= 50:
+                cycle_count = 0
+                await database.cleanup_old_seen_items(days=5)
+                gc.collect()
+                logger.info("Оптимизация памяти (gc.collect) и БД успешно завершена")
+
             # Ждем интервал до следующего круга проверок
             await asyncio.sleep(CHECK_INTERVAL)
 
@@ -206,4 +217,6 @@ async def monitoring_worker(bot: Bot):
             break
         except Exception as e:
             logger.error(f"Непредвиденная ошибка в цикле мониторинга: {e}", exc_info=True)
+            gc.collect()
             await asyncio.sleep(10)
+

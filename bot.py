@@ -1,7 +1,9 @@
+import os
 import asyncio
 import logging
 import sys
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -25,6 +27,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def start_health_server():
+    """
+    Легковесный HTTP-сервер для хостингов вроде Render (Web Service).
+    Render требует привязки к порту $PORT, иначе считает сервис упавшим.
+    Потребляет < 1 МБ RAM.
+    """
+    port = os.getenv("PORT")
+    if not port:
+        return None
+    try:
+        app = web.Application()
+        async def handle_ping(request):
+            return web.Response(text="Avito Bot OK (512MB RAM Mode)")
+        app.router.add_get("/", handle_ping)
+        app.router.add_get("/health", handle_ping)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(port))
+        await site.start()
+        logger.info(f"Health-check HTTP сервер запущен на 0.0.0.0:{port} (Render-совместимость)")
+        return runner
+    except Exception as e:
+        logger.warning(f"Не удалось запустить health-check сервер на порту {port}: {e}")
+        return None
+
+
 async def main():
     if not config.BOT_TOKEN or config.BOT_TOKEN == "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ":
         logger.error(
@@ -32,6 +60,9 @@ async def main():
             "Пожалуйста, создайте бота через @BotFather в Telegram и укажите токен в файле .env."
         )
         return
+
+    # Запуск легковесного сервера для Render Web Service (если передан PORT)
+    web_runner = await start_health_server()
 
     # Инициализация базы данных
     await database.init_db()
@@ -68,6 +99,8 @@ async def main():
         except asyncio.CancelledError:
             pass
         await bot.session.close()
+        if web_runner:
+            await web_runner.cleanup()
         logger.info("Бот остановлен.")
 
 
