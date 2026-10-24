@@ -34,6 +34,25 @@ class AccessControlMiddleware(BaseMiddleware):
 
         # 3. Проверяем, есть ли доступ
         if await database.is_user_allowed(user_id):
+            # Автоматический сброс FSM-состояния при нажатии любой кнопки главного меню или команд
+            if isinstance(event, Message) and event.text:
+                txt = event.text.strip()
+                menu_keywords = {
+                    "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
+                    "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
+                    "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
+                    "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
+                    "📖 Инструкция", "❓ Помощь", "Инструкция",
+                    "👑 Админ-панель", "👑 Админка",
+                    "❌ Отмена", "Отмена"
+                }
+                if txt.startswith("/") or txt in menu_keywords:
+                    fsm_state = data.get("state")
+                    if fsm_state:
+                        current_st = await fsm_state.get_state()
+                        if current_st:
+                            await fsm_state.clear()
+
             return await handler(event, data)
 
         # 4. Если доступ НЕ одобрен:

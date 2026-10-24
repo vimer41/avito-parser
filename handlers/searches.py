@@ -44,7 +44,21 @@ async def btn_add_search(event, state: FSMContext):
         "<i>Пример корректной ссылки:\n"
         "<code>https://www.avito.ru/moskva/tovary_dlya_kompyutera/...</code></i>"
     )
-    await message.answer(text, parse_mode="HTML")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm"),
+            InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")
+        ]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+
+@router.callback_query(F.data == "cancel_fsm")
+async def cb_cancel_fsm(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("❌ <b>Действие отменено.</b>", parse_mode="HTML")
+    await call.answer()
 
 
 @router.message(F.text.regexp(r"(?i)avito\.ru"))
@@ -52,6 +66,39 @@ async def btn_add_search(event, state: FSMContext):
 async def process_avito_url(message: Message, state: FSMContext):
     raw_url = message.text.strip()
     user_id = message.from_user.id
+
+    menu_buttons = {
+        "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
+        "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
+        "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
+        "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
+        "📖 Инструкция", "❓ Помощь", "Инструкция",
+        "👑 Админ-панель", "👑 Админка",
+        "❌ Отмена", "Отмена"
+    }
+
+    if raw_url in menu_buttons or raw_url.startswith("/"):
+        await state.clear()
+        if raw_url in {"📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары"}:
+            return await show_searches(message, state)
+        if raw_url in {"🎯 Добавить радар", "➕ Добавить радар"}:
+            return await btn_add_search(message, state)
+        return
+
+    # Проверяем, что ссылка действительно с avito.ru
+    if "avito.ru" not in raw_url.lower():
+        await message.answer(
+            "⚠️ <b>Ссылка должна быть с сайта avito.ru!</b>\n\n"
+            "Пример корректной ссылки:\n"
+            "<code>https://www.avito.ru/moskva/telefony/apple...</code>\n\n"
+            "<i>Если передумали добавлять радар — нажмите кнопку отмены:</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить добавление", callback_data="cancel_fsm")],
+                [InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")]
+            ]),
+            parse_mode="HTML"
+        )
+        return
 
     # Проверяем, не на одно ли объявление ссылка
     if "/item/" in raw_url or re.search(r"_\d{8,}", raw_url):
@@ -79,6 +126,7 @@ async def process_avito_url(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка в ссылке: {e}\nУбедитесь, что ссылка ведёт на avito.ru.")
         return
+
 
     status_msg = await message.answer(
         "⏳ <b>Подключаюсь к Авито и калибрую радар...</b>",
@@ -375,11 +423,15 @@ async def cb_add_stop_word_prompt(call: CallbackQuery, state: FSMContext):
     await state.set_state(SearchStates.waiting_for_stop_word)
     await state.update_data(search_id=search_id)
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")]
+    ])
     await call.message.answer(
         "✍️ <b>Введите стоп-слово или фразу:</b>\n\n"
         "<i>Например:\n"
         "<code>на запчасти, копия, без комплекта</code>\n"
         "(Можно прислать несколько слов через запятую)</i>",
+        reply_markup=kb,
         parse_mode="HTML"
     )
     await call.answer()
@@ -387,9 +439,24 @@ async def cb_add_stop_word_prompt(call: CallbackQuery, state: FSMContext):
 
 @router.message(SearchStates.waiting_for_stop_word)
 async def process_stop_word_input(message: Message, state: FSMContext):
+    raw_text = message.text.strip()
+    menu_buttons = {
+        "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
+        "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
+        "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
+        "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
+        "📖 Инструкция", "❓ Помощь", "Инструкция",
+        "👑 Админ-панель", "👑 Админка",
+        "❌ Отмена", "Отмена"
+    }
+    if raw_text in menu_buttons or raw_text.startswith("/"):
+        await state.clear()
+        if raw_text in {"📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары"}:
+            return await show_searches(message, state)
+        return
+
     data = await state.get_data()
     search_id = data.get("search_id")
-    raw_text = message.text.strip()
 
     words = [w.strip() for w in raw_text.split(",") if w.strip()]
     added = []
@@ -398,6 +465,7 @@ async def process_stop_word_input(message: Message, state: FSMContext):
             added.append(w)
 
     await state.clear()
+
     added_str = ", ".join(f"«{html.escape(w)}»" for w in added)
     await message.answer(
         f"✅ <b>Стоп-слова успешно добавлены:</b> {added_str}\n\n"
@@ -462,10 +530,14 @@ async def cb_set_tmpl_prompt(call: CallbackQuery, state: FSMContext):
     await state.set_state(SearchStates.waiting_for_template)
     await state.update_data(search_id=search_id)
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")]
+    ])
     await call.message.answer(
         "✍️ <b>Введите персональный текст сообщения продавцу для этого радара:</b>\n\n"
         "<i>Пример:\n"
         "Здравствуйте! Интересует данный лот. Готов забрать самовывозом прямо сейчас, оплата наличными.</i>",
+        reply_markup=kb,
         parse_mode="HTML"
     )
     await call.answer()
@@ -473,12 +545,28 @@ async def cb_set_tmpl_prompt(call: CallbackQuery, state: FSMContext):
 
 @router.message(SearchStates.waiting_for_template)
 async def process_template_input(message: Message, state: FSMContext):
+    text = message.text.strip()
+    menu_buttons = {
+        "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
+        "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
+        "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
+        "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
+        "📖 Инструкция", "❓ Помощь", "Инструкция",
+        "👑 Админ-панель", "👑 Админка",
+        "❌ Отмена", "Отмена"
+    }
+    if text in menu_buttons or text.startswith("/"):
+        await state.clear()
+        if text in {"📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары"}:
+            return await show_searches(message, state)
+        return
+
     data = await state.get_data()
     search_id = data.get("search_id")
-    text = message.text.strip()
 
     await database.update_search_template(search_id, message.from_user.id, text)
     await state.clear()
+
 
     await message.answer(
         "✅ <b>Индивидуальный отклик для радара сохранён!</b>\n\n"

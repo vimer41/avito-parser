@@ -184,8 +184,9 @@ async def cmd_profile(event):
 
 @router.message(F.text.in_({"⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию"}))
 @router.callback_query(F.data == "open_quick_response_menu")
-async def cmd_default_template(event, state: FSMContext):
-    await state.clear()
+async def cmd_default_template(event, state: Optional[FSMContext] = None):
+    if state:
+        await state.clear()
     if isinstance(event, CallbackQuery):
         message = event.message
         user_id = event.from_user.id
@@ -193,6 +194,7 @@ async def cmd_default_template(event, state: FSMContext):
     else:
         message = event
         user_id = message.from_user.id
+
 
     user = await database.get_or_create_user(user_id)
     current_tmpl = user.get("default_template") or database.DEFAULT_SELLER_MESSAGE
@@ -251,10 +253,14 @@ async def cb_set_preset(call: CallbackQuery):
 @router.callback_query(F.data == "change_default_template")
 async def cb_change_default_template(call: CallbackQuery, state: FSMContext):
     await state.set_state(DefaultTemplateStates.waiting_for_template)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")]
+    ])
     await call.message.answer(
         "✍️ <b>Отправьте ваш текст сообщения продавцу:</b>\n\n"
         "<i>Пример:\n"
         "Здравствуйте! Товар ещё актуален? Готов приехать и забрать за наличные прямо сегодня.</i>",
+        reply_markup=kb,
         parse_mode="HTML"
     )
     await call.answer()
@@ -263,12 +269,26 @@ async def cb_change_default_template(call: CallbackQuery, state: FSMContext):
 @router.message(DefaultTemplateStates.waiting_for_template)
 async def process_new_default_template(message: Message, state: FSMContext):
     new_text = message.text.strip()
+    menu_buttons = {
+        "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
+        "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
+        "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
+        "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
+        "📖 Инструкция", "❓ Помощь", "Инструкция",
+        "👑 Админ-панель", "👑 Админка",
+        "❌ Отмена", "Отмена"
+    }
+    if new_text in menu_buttons or new_text.startswith("/"):
+        await state.clear()
+        return
+
     if not new_text or len(new_text) > 500:
         await message.answer("⚠️ Текст шаблона должен быть от 1 до 500 символов. Попробуйте еще раз:")
         return
 
     await database.update_user_default_template(message.from_user.id, new_text)
     await state.clear()
+
 
     text = (
         "✅ <b>Шаблон отклика успешно сохранен!</b>\n\n"
