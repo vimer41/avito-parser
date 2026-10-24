@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import random
+import re
 from typing import Optional
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -15,47 +16,58 @@ logger = logging.getLogger(__name__)
 
 def build_notification_text(item: AvitoItem, search_title: str) -> str:
     """
-    Форматирует текст уведомления точно по образцу:
-    2 747 ₽ · Динамический микрофон fifine am8
-    📍 Санкт-Петербург, Ириновский пр-т
-    🚚 Авито Доставка (от 1 дня)
-    👤 Продавец · ⭐ 5,0 (192 отзыва)
-    🕒 1 мин назад
-    📝 Описание...
-    🔍 fifine am8
+    Форматирует красивый текст уведомления:
+    12 000 ₽ · iPhone X, 128 ГБ, 1 SIM
+    📍 Санкт-Петербург
+    ✨ Удовлетворительное · 🚚 Доставка от 1 дня
+    👤 Арсений · ⭐ 5,0 (6 отзывов)
+    🕒 1 час назад
+    📝 Продаю iphone x из-за ненадобности.
+    🔍 Apple iPhone X в Санкт-Петербурге
     """
     lines = []
 
-    # Заголовок и цена
+    # 1. Заголовок и цена
     clean_title = html.escape(item.title)
     clean_price = html.escape(item.price)
     lines.append(f"<b>{clean_price}</b> · {clean_title}")
 
-    # Адрес
-    if item.address:
-        lines.append(f"📍 {html.escape(item.address)}")
+    # 2. Адрес (если не найден в карточке, берем город из названия поиска)
+    address = item.address
+    clean_search = search_title.replace("\xa0", " ").strip()
+    if not address:
+        m = re.search(r"в\s+([А-Яа-яЁё\s\-]+)$", clean_search)
+        if m:
+            address = m.group(1).strip()
+    if address:
+        lines.append(f"📍 {html.escape(address)}")
 
-    # Доставка
+    # 3. Состояние и доставка
+    status_line = []
+    if item.condition:
+        status_line.append(f"✨ {html.escape(item.condition)}")
     if item.delivery:
-        lines.append(f"🚚 {html.escape(item.delivery)}")
+        status_line.append(f"🚚 {html.escape(item.delivery)}")
+    if status_line:
+        lines.append(" · ".join(status_line))
 
-    # Продавец
+    # 4. Продавец
     if item.seller:
         lines.append(f"👤 {html.escape(item.seller)}")
 
-    # Время
+    # 5. Время публикации
     if item.date:
         lines.append(f"🕒 {html.escape(item.date)}")
 
-    # Описание (до 300 символов, чтобы не превысить лимиты Telegram)
+    # 6. Описание (аккуратно очищенное)
     if item.description:
         desc = item.description.strip()
-        if len(desc) > 300:
-            desc = desc[:297] + "..."
+        if len(desc) > 350:
+            desc = desc[:347] + "..."
         lines.append(f"📝 {html.escape(desc)}")
 
-    # Название поиска
-    lines.append(f"🔍 {html.escape(search_title)}")
+    # 7. Название поиска
+    lines.append(f"🔍 {html.escape(clean_search)}")
 
     return "\n".join(lines)
 

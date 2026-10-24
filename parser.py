@@ -26,6 +26,7 @@ class AvitoItem:
     description: Optional[str] = None
     seller: Optional[str] = None
     delivery: Optional[str] = None
+    condition: Optional[str] = None
 
 
 class AvitoParser:
@@ -182,27 +183,103 @@ class AvitoParser:
             soup = BeautifulSoup(html, "html.parser")
             h1 = soup.find("h1")
             if h1 and h1.text.strip():
-                title = h1.text.strip()
-                # Убираем лишние фразы вроде 'купить'
+                title = h1.text.replace("\xa0", " ").strip()
                 return title
 
             title_tag = soup.find("title")
             if title_tag and title_tag.text.strip():
-                t = title_tag.text.strip()
-                # Отрезаем ' | Авито' или '— купить...'
+                t = title_tag.text.replace("\xa0", " ").strip()
                 t = t.split("—")[0].split("|")[0].split("купить")[-1].strip()
                 if t:
                     return t
         except Exception:
             pass
 
-        # Fallback: берем из пути URL
         parsed = urlparse(fallback_url)
         parts = [p for p in parsed.path.split("/") if p and p != "all"]
         return parts[-1] if parts else "Поиск Авито"
 
     @staticmethod
-    def parse_items(html: str) -> List[AvitoItem]:
+    def _clean_seller_info(seller_elem) -> Optional[str]:
+        if not seller_elem:
+            return None
+        full_text = seller_elem.get_text(separator=" ", strip=True)
+
+        name = None
+        a_tag = seller_elem.find("a")
+        if a_tag and a_tag.text.strip():
+            name = a_tag.text.strip()
+        else:
+            p_tag = seller_elem.find("p")
+            if p_tag and p_tag.text.strip():
+                name = p_tag.text.strip()
+
+        if not name:
+            m = re.search(r"^[^\d]+", full_text)
+            name = m.group(0).strip() if m else "Продавец"
+
+        for bad in ["Самозанятый", "Компания", "Частное лицо", "Реквизиты проверены"]:
+            name = name.replace(bad, "").strip()
+
+        name = re.sub(r"\s+", " ", name).strip()
+        if not name or len(name) < 2:
+            name = "Продавец"
+
+        rating_match = re.search(r"([1-5][,\.]\d)", full_text)
+        rating = rating_match.group(1).replace(".", ",") if rating_match else None
+
+        reviews_match = re.search(r"(\d+[\s\d]*\s*отзыв(?:а|ов)?)", full_text)
+        reviews = reviews_match.group(1).strip() if reviews_match else None
+
+        if rating and reviews:
+            return f"{name} · ⭐ {rating} ({reviews})"
+        elif rating:
+            return f"{name} · ⭐ {rating}"
+        return name
+
+    @staticmethod
+    def _clean_description(desc_elem, date_str: Optional[str] = None) -> Optional[str]:
+        if not desc_elem:
+            return None
+
+        # Удаляем вложенные теги даты
+        for d in desc_elem.find_all(attrs={"data-marker": lambda m: m and "date" in m}):
+            d.decompose()
+        for d in desc_elem.find_all(class_=lambda c: c and "date" in c):
+            d.decompose()
+
+        txt = desc_elem.get_text(separator=" ", strip=True)
+        if date_str and date_str in txt:
+            txt = txt.replace(date_str, "").strip()
+
+        # Отрезаем прилипшую дату с конца
+        txt = re.sub(r"[\.\,\s]*(\d+\s+(?:секунд|минут|час|дня|дней|недел|месяц)\w*\s+назад|только\s+что)[\.\s]*$", "", txt, flags=re.I).strip()
+        return txt if txt else None
+
+    @staticmethod
+    def _extract_delivery_and_condition(it) -> Tuple[Optional[str], Optional[str]]:
+        full_text = it.text
+
+        condition = None
+        for c in ["Новое", "Идеальное", "Отличное", "Хорошее", "Удовлетворительное"]:
+            if c.lower() in full_text.lower():
+                condition = c
+                break
+
+        delivery = None
+        m = re.search(r"(?:Авито\s+)?Доставка(?:\s+от\s+\d+\s+дн[яей]+)?", full_text, re.I)
+        if m:
+            deliv = m.group(0).strip()
+            if not deliv.lower().startswith("авито"):
+                deliv = f"Авито {deliv}"
+            delivery = deliv
+        elif "доставка" in full_text.lower():
+            delivery = "Авито Доставка"
+
+        return delivery, condition
+
+    @classmethod
+    def parse_items(cls, html: str) -> List[AvitoItem]:
         """
         Парсит все объявления на странице выдачи.
         """
@@ -222,19 +299,15 @@ class AvitoParser:
                 title_elem = it.find(attrs={"data-marker": "item-title"})
                 if not title_elem:
                     continue
-                title = title_elem.text.strip()
+                title = title_elem.text.replace("\xa0", " ").strip()
                 href = title_elem.get("href", "")
-                if href.startswith("/"):
-                    full_url = f"https://www.avito.ru{href}"
-                else:
-                    full_url = href
+                full_url = f"https://www.avito.ru{href}" if href.startswith("/") else href
 
                 # 3. Цена
                 price = "Цена не указана"
                 price_meta = it.find(attrs={"itemprop": "price"})
                 if price_meta and price_meta.get("content"):
                     price_val = price_meta.get("content")
-                    # Форматируем с пробелами (например 25 000)
                     try:
                         price = f"{int(price_val):,} ₽".replace(",", " ")
                     except Exception:
@@ -242,7 +315,7 @@ class AvitoParser:
                 else:
                     price_elem = it.find(attrs={"data-marker": "item-price"})
                     if price_elem:
-                        price = price_elem.text.strip()
+                        price = price_elem.text.replace("\xa0", " ").strip()
 
                 # 4. Фотография
                 image_url = None
@@ -252,13 +325,15 @@ class AvitoParser:
                     if src and src.startswith("http"):
                         image_url = src
 
-                # 5. Адрес / Город
+                # 5. Адрес / Город / Метро
                 address = None
                 geo_elem = it.find(attrs={"data-marker": "item-location"}) or it.find(attrs={"data-marker": "item-address"})
                 if not geo_elem:
-                    geo_elem = it.find(class_=lambda x: x and ("geo-root" in x or "item-location" in x))
+                    geo_elem = it.find(class_=lambda x: x and ("geo-root" in x or "item-location" in x or "geo-geo" in x))
                 if geo_elem:
-                    address = geo_elem.text.strip()
+                    address = geo_elem.get_text(separator=" ", strip=True).replace("\xa0", " ")
+                    # Убираем дублирование пробелов
+                    address = re.sub(r"\s+", " ", address)
 
                 # 6. Дата публикации
                 date = None
@@ -266,44 +341,24 @@ class AvitoParser:
                 if not date_elem:
                     date_elem = it.find(class_=lambda x: x and "date-root" in x)
                 if date_elem:
-                    date = date_elem.text.strip()
+                    date = date_elem.text.replace("\xa0", " ").strip()
 
-                # 7. Описание
-                description = None
+                # 7. Описание (аккуратно очищенное от даты)
                 desc_elem = (
                     it.find(attrs={"data-marker": "item-description"}) or
                     it.find(class_=lambda x: x and ("bottomBlock-" in x or "iva-item-description" in x))
                 )
-                if desc_elem:
-                    description = desc_elem.text.strip()
+                description = cls._clean_description(desc_elem, date)
 
                 # 8. Продавец и рейтинг
-                seller = None
                 seller_elem = (
                     it.find(class_=lambda x: x and ("sellerInfo-" in x or "iva-item-sellerInfo" in x or "userInfoStep-" in x)) or
                     it.find(attrs={"data-marker": "item-line/company"})
                 )
-                if seller_elem:
-                    seller_text = seller_elem.text.strip()
-                    # Убираем дублирование пробелов
-                    seller = re.sub(r"\s+", " ", seller_text)
+                seller = cls._clean_seller_info(seller_elem)
 
-                # 9. Доставка
-                delivery = None
-                deliv_elem = it.find(attrs={"data-marker": lambda m: m and "delivery" in m})
-                if not deliv_elem:
-                    deliv_elem = it.find(class_=lambda x: x and "delivery" in x.lower())
-                if deliv_elem:
-                    d_txt = deliv_elem.text.strip()
-                    if d_txt and len(d_txt) < 50:
-                        delivery = d_txt
-                if not delivery:
-                    # Поиск фрагмента с доставкой в тексте
-                    for p_tag in it.find_all(["div", "span", "p"]):
-                        t_p = p_tag.text.strip()
-                        if 3 < len(t_p) < 40 and "доставка" in t_p.lower():
-                            delivery = t_p
-                            break
+                # 9. Доставка и состояние
+                delivery, condition = cls._extract_delivery_and_condition(it)
 
                 results.append(AvitoItem(
                     item_id=item_id,
@@ -315,7 +370,8 @@ class AvitoParser:
                     date=date,
                     description=description,
                     seller=seller,
-                    delivery=delivery
+                    delivery=delivery,
+                    condition=condition
                 ))
 
             except Exception as e:
