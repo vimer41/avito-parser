@@ -237,7 +237,7 @@ async def cmd_subscription_menu(event):
         "├ 📡 Мониторинг раз в 60 секунд\n"
         "├ 📸 Доставка с реальными фото товара в HD\n"
         "└ ⚡️ Быстрый отклик продавцу в 1 клик\n\n"
-        "🔥 <b>Тариф «PRO»</b> — <b>490 ₽ / мес</b>\n"
+        "🔥 <b>Тариф «PRO»</b> — <b>700 ₽ / мес</b>\n"
         "├ 🎯 До <b>15</b> активных радаров\n"
         "├ 🚀 Приоритетная очередь сканирования\n"
         "├ 🛡 Фильтрация по стоп-словам\n"
@@ -250,7 +250,7 @@ async def cmd_subscription_menu(event):
             InlineKeyboardButton(text="⚡️ Standart (5 радаров) — 250 ₽", callback_data="buy_tariff:standart")
         ],
         [
-            InlineKeyboardButton(text="🔥 PRO (15 радаров) — 490 ₽", callback_data="buy_tariff:pro")
+            InlineKeyboardButton(text="🔥 PRO (15 радаров) — 700 ₽", callback_data="buy_tariff:pro")
         ],
         [
             InlineKeyboardButton(text="👤 Назад в профиль", callback_data="refresh_profile")
@@ -279,7 +279,7 @@ async def cb_select_tariff(call: CallbackQuery):
         "pro": {
             "name": "🔥 PRO",
             "radars": 15,
-            "price": "490 ₽"
+            "price": "700 ₽"
         }
     }
     selected = tariffs.get(tariff_key, tariffs["standart"])
