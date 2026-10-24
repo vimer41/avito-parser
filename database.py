@@ -26,15 +26,24 @@ async def init_db():
             );
         """)
 
-        # Миграция: добавляем is_allowed если таблица уже создана
+        # Миграция: добавляем is_allowed, subscription_until, trial_used если таблица уже создана
         try:
             await db.execute("ALTER TABLE users ADD COLUMN is_allowed INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN subscription_until TIMESTAMP;")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN trial_used INTEGER DEFAULT 0;")
         except Exception:
             pass
 
         # Администраторы всегда имеют полный доступ
         for aid in ADMIN_IDS:
             await db.execute("UPDATE users SET is_allowed = 1 WHERE user_id = ?", (aid,))
+
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS searches (
@@ -85,15 +94,23 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
 
 
 async def is_user_allowed(user_id: int) -> bool:
-    """Проверяет, одобрен ли доступ пользователю администратором."""
+    """
+    Проверяет, есть ли у пользователя активный доступ к функциям бота:
+    1. Администратор (всегда полный доступ)
+    2. Ручное одобрение (is_allowed = 1 для тестов/друзей)
+    3. Действующая подписка или пробный период (subscription_until > datetime('now'))
+    """
     if user_id in ADMIN_IDS:
         return True
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT is_allowed FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        async with db.execute("""
+            SELECT 1 FROM users 
+            WHERE user_id = ? 
+              AND (is_allowed = 1 OR subscription_until > datetime('now'))
+        """, (user_id,)) as cursor:
             row = await cursor.fetchone()
-            if not row:
-                return False
-            return bool(row[0])
+            return bool(row)
+
 
 
 async def set_user_allowed(user_id: int, is_allowed: int = 1):
@@ -240,14 +257,25 @@ async def update_search_template(search_id: int, user_id: int, template: Optiona
 
 
 async def get_all_active_searches() -> List[Dict[str, Any]]:
+    """
+    Возвращает список активных радаров пользователей, у которых:
+    - активен статус администратора, ИЛИ
+    - выдан ручной доступ (is_allowed = 1), ИЛИ
+    - действует подписка / триал (subscription_until > datetime('now'))
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("""
+        admin_placeholders = ",".join("?" for _ in ADMIN_IDS)
+        query = f"""
             SELECT s.*, u.default_template 
             FROM searches s 
             JOIN users u ON s.user_id = u.user_id 
             WHERE s.is_active = 1
-        """) as cursor:
+              AND (u.user_id IN ({admin_placeholders}) 
+                   OR u.is_allowed = 1 
+                   OR u.subscription_until > datetime('now'))
+        """
+        async with db.execute(query, ADMIN_IDS) as cursor:
             rows = await cursor.fetchall()
             results = []
             for row in rows:
@@ -255,6 +283,7 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
                 data["stop_words"] = json.loads(data["stop_words"]) if data["stop_words"] else []
                 results.append(data)
             return results
+
 
 
 async def is_item_seen(search_id: int, item_id: str) -> bool:
@@ -335,5 +364,84 @@ async def get_system_stats() -> Dict[str, int]:
             "active_searches": active_searches,
             "total_seen": total_seen,
         }
+
+
+async def activate_trial(user_id: int) -> Dict[str, Any]:
+    """Активирует пробный период 24 часа. Строго 1 раз на пользователя."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT trial_used, subscription_until FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return {"success": False, "message": "Пользователь не найден."}
+            if row["trial_used"]:
+                return {"success": False, "message": "Пробный период уже был использован ранее."}
+
+        await db.execute("""
+            UPDATE users 
+            SET trial_used = 1,
+                subscription_until = datetime('now', '+1 day')
+            WHERE user_id = ?
+        """, (user_id,))
+        await db.commit()
+
+        async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (user_id,)) as cur:
+            r = await cur.fetchone()
+            until = r[0] if r else ""
+
+        return {"success": True, "message": "Пробный период 24 часа успешно активирован!", "until": until}
+
+
+async def grant_subscription(user_id: int, days: int = 30) -> str:
+    """Выдаёт или продлевает подписку на N дней."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE users 
+            SET subscription_until = CASE 
+                WHEN subscription_until > datetime('now') 
+                THEN datetime(subscription_until, '+' || ? || ' days')
+                ELSE datetime('now', '+' || ? || ' days')
+            END
+            WHERE user_id = ?
+        """, (days, days, user_id))
+        await db.commit()
+
+        async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (user_id,)) as cur:
+            r = await cur.fetchone()
+            return r[0] if r else ""
+
+
+async def deactivate_user_searches(user_id: int):
+    """Ставит все радары пользователя на паузу (например, если бот заблокирован)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE searches SET is_active = 0 WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
+def create_database_backup_file() -> Optional[str]:
+    """
+    Создает консистентный бинарный бэкап базы данных SQLite через встроенный API backup().
+    Возвращает путь к созданному файлу бэкапа.
+    """
+    import os
+    import sqlite3
+    import tempfile
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_filename = f"avito_radar_backup_{timestamp}.db"
+    backup_path = os.path.join(tempfile.gettempdir(), backup_filename)
+
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dest = sqlite3.connect(backup_path)
+        src.backup(dest)
+        dest.close()
+        src.close()
+        return backup_path
+    except Exception as e:
+        logger.error(f"Ошибка при создании бэкапа SQLite: {e}")
+        return None
+
 
 

@@ -152,28 +152,46 @@ async def cmd_profile(event):
 
     current_tmpl = user.get("default_template") or database.DEFAULT_SELLER_MESSAGE
     is_adm = config.is_admin(user_id)
-    status_str = "👑 <b>Администратор системы</b>" if is_adm else "🟢 <b>Активен (PRO доступ)</b>"
+    sub_until = user.get("subscription_until")
+    trial_used = bool(user.get("trial_used"))
+
+    if is_adm:
+        status_str = "👑 <b>Администратор (Вечный PRO)</b>"
+    elif sub_until:
+        status_str = f"🟢 <b>PRO Подписка</b> (до {str(sub_until)[:16]})"
+    elif user.get("is_allowed"):
+        status_str = "🟢 <b>VIP Доступ (Одобрен)</b>"
+    else:
+        status_str = "⚪️ <b>Базовый доступ</b>"
+
+    from scheduler import get_last_scan_info
+    scan_info = get_last_scan_info()
 
     text = (
         "┌ 👤 <b>ЛИЧНЫЙ КАБИНЕТ</b>\n"
         f"├ 🆔 <b>Ваш ID:</b> <code>{user_id}</code>\n"
         f"├ ⚡️ <b>Статус:</b> {status_str}\n"
-        f"├ 🎯 <b>Радары:</b> <b>{active_count}</b> акт. / <b>{searches_count}</b> всего (лимит: {config.MAX_SEARCHES_PER_USER})\n"
+        f"├ 🎯 <b>Радары:</b> <b>{active_count}</b> акт. / <b>{searches_count}</b> всего (макс: {config.MAX_SEARCHES_PER_USER})\n"
+        f"├ 📡 <b>Проверка Авито:</b> <code>{scan_info}</code> 🟢\n"
         f"└ 🔔 <b>Доставка лотов:</b> ⚡️ Мгновенно (с фото HD)\n\n"
         "💬 <b>Текущий шаблон отклика:</b>\n"
         f"<code>{html.escape(current_tmpl)}</code>"
     )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
-            InlineKeyboardButton(text=f"📁 Мои радары ({searches_count})", callback_data="list_searches")
-        ],
-        [
-            InlineKeyboardButton(text="✏️ Настроить отклик", callback_data="open_quick_response_menu"),
-            InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_profile")
-        ]
+    buttons = []
+    # Если нет подписки и триал еще не использован — предлагаем бесплатный триал 24 часа
+    if not is_adm and not sub_until and not trial_used:
+        buttons.append([InlineKeyboardButton(text="🎁 Попробовать 24 часа бесплатно", callback_data="activate_trial_btn")])
+
+    buttons.append([
+        InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
+        InlineKeyboardButton(text=f"📁 Мои радары ({searches_count})", callback_data="list_searches")
     ])
+    buttons.append([
+        InlineKeyboardButton(text="✏️ Настроить отклик", callback_data="open_quick_response_menu"),
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_profile")
+    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     if isinstance(event, CallbackQuery):
         try:
@@ -183,6 +201,17 @@ async def cmd_profile(event):
             pass
 
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "activate_trial_btn")
+async def cb_activate_trial(call: CallbackQuery):
+    res = await database.activate_trial(call.from_user.id)
+    if res["success"]:
+        await call.answer("🎉 Пробный период 24 часа успешно активирован!", show_alert=True)
+        await cmd_profile(call)
+    else:
+        await call.answer(res["message"], show_alert=True)
+
 
 
 @router.message(F.text.in_({"⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию"}))

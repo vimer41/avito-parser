@@ -4,15 +4,34 @@ import html
 import logging
 import random
 import re
+import time
 from typing import Optional
 from aiogram import Bot
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
+import config
 import database
 from config import CHECK_INTERVAL
 from parser import AvitoParser, AvitoItem
 
 logger = logging.getLogger(__name__)
+
+LAST_SCAN_TIMESTAMP = 0
+
+
+def get_last_scan_info() -> str:
+    """Возвращает читаемый статус времени последней проверки для UI."""
+    global LAST_SCAN_TIMESTAMP
+    if not LAST_SCAN_TIMESTAMP:
+        return "менее 1 мин. назад"
+    diff = int(time.time() - LAST_SCAN_TIMESTAMP)
+    if diff < 10:
+        return "только что"
+    if diff < 60:
+        return f"{diff} сек. назад"
+    return f"{diff // 60} мин. назад"
+
 
 
 def build_notification_text(item: AvitoItem, search_title: str) -> str:
@@ -198,6 +217,13 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
 
                 logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО: #{it.item_id} «{it.title[:30]}...» ({it.price}) пользователю ID: {user_id}")
 
+            except TelegramForbiddenError:
+                logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{user_id} заблокировал бота. Отключаем его радары.")
+                await database.deactivate_user_searches(user_id)
+                break
+            except TelegramRetryAfter as retry_err:
+                logger.warning(f"⏳ [FLOODWAIT] Telegram лимит отправки: пауза {retry_err.retry_after} сек.")
+                await asyncio.sleep(retry_err.retry_after + 1)
             except Exception as send_err:
                 # Если отправка фото не удалась (например, неверный URL картинки или Telegram заблокировал),
                 # отправляем текстом
@@ -210,12 +236,19 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
                         parse_mode="HTML"
                     )
                     logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО ТЕКСТОМ: #{it.item_id} пользователю ID: {user_id}")
+                except TelegramForbiddenError:
+                    logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{user_id} заблокировал бота. Отключаем его радары.")
+                    await database.deactivate_user_searches(user_id)
+                    break
                 except Exception as msg_err:
                     logger.error(f"❌ [РАДАР #{search_id}] Не удалось отправить сообщение #{it.item_id}: {msg_err}")
 
             # Запоминаем ID объявления
             await database.mark_item_seen(search_id, it.item_id)
             await asyncio.sleep(0.5)
+
+        global LAST_SCAN_TIMESTAMP
+        LAST_SCAN_TIMESTAMP = time.time()
 
     except Exception as e:
         logger.error(f"❌ [РАДАР #{search_id}] Ошибка при обработке поиска «{search_title}»: {e}")
@@ -259,8 +292,20 @@ async def monitoring_worker(bot: Bot):
             logger.info("🛑 Фоновый сервис мониторинга остановлен.")
             break
         except Exception as e:
-            logger.error(f"❌ Непредвиденная ошибка в цикле мониторинга: {e}", exc_info=True)
+            logger.error(f"❌ Фатальная ошибка в цикле мониторинга: {e}", exc_info=True)
+            alert_text = (
+                f"🚨 <b>Алерт системы мониторинга!</b>\n\n"
+                f"Произошёл сбой в основном цикле планировщика:\n"
+                f"<code>{html.escape(str(e)[:300])}</code>\n\n"
+                f"<i>Автоматический перезапуск цикла через 10 секунд...</i>"
+            )
+            for aid in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(chat_id=aid, text=alert_text, parse_mode="HTML")
+                except Exception:
+                    pass
             gc.collect()
             await asyncio.sleep(10)
+
 
 

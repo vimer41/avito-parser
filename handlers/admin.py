@@ -130,7 +130,10 @@ async def cmd_admin_panel(event):
             text_lines.append(f"🔴 <b>{fname}</b> ({uname}) — <i>Ограничен / Заблокирован</i>")
             buttons.append([InlineKeyboardButton(text=f"✅ Разрешить {uname}", callback_data=f"admin_approve:{u_id}")])
 
-    buttons.append([InlineKeyboardButton(text="🔄 Обновить сводку", callback_data="admin_refresh")])
+    buttons.append([
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_refresh"),
+        InlineKeyboardButton(text="💾 Скачать бэкап БД", callback_data="admin_backup")
+    ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     full_text = "\n".join(text_lines)
@@ -155,4 +158,48 @@ async def cb_admin_revoke(call: CallbackQuery):
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} отозвал доступ у пользователя ID:{target_user_id}")
     await call.answer("Доступ отозван")
     await cmd_admin_panel(call)
+
+
+@router.message(Command("backup"))
+@router.callback_query(F.data == "admin_backup")
+async def cmd_admin_backup(event):
+    user_id = event.from_user.id
+    if not config.is_admin(user_id):
+        return
+
+    if isinstance(event, CallbackQuery):
+        message = event.message
+        await event.answer("Формирую бэкап...")
+    else:
+        message = event
+
+    import os
+    from aiogram.types import BufferedInputFile
+
+    backup_path = database.create_database_backup_file()
+    if not backup_path or not os.path.exists(backup_path):
+        await message.answer("❌ Не удалось создать резервную копию базы данных.")
+        return
+
+    try:
+        with open(backup_path, "rb") as f:
+            data = f.read()
+
+        filename = os.path.basename(backup_path)
+        file_to_send = BufferedInputFile(data, filename=filename)
+
+        await message.answer_document(
+            document=file_to_send,
+            caption=(
+                "💾 <b>Резервная копия базы данных SQLite (WAL-безопасная)</b>\n\n"
+                f"📦 Размер: <b>{len(data):,} байт</b>\n"
+                "Файл полностью консистентен и готов к восстановлению."
+            ),
+            parse_mode="HTML"
+        )
+        logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил бэкап базы данных ({filename})")
+    finally:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+
 

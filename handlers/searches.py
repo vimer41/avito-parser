@@ -213,12 +213,17 @@ async def show_searches(event, state: FSMContext):
         await message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
 
+    from scheduler import get_last_scan_info
+    scan_info = get_last_scan_info()
+
     active_cnt = sum(1 for s in searches if s.get("is_active"))
     header_text = (
         f"📁 <b>ВАШИ РАДАРЫ</b> (Всего: <b>{len(searches)}</b> · Активно: <b>{active_cnt}</b> 🟢)\n"
+        f"📡 <i>Проверка выдачи: <b>{scan_info}</b></i>\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
     await message.answer(header_text, parse_mode="HTML")
+
 
     for i, s in enumerate(searches, 1):
         s_id = s["id"]

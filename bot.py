@@ -11,20 +11,22 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
 import database
+from logging.handlers import RotatingFileHandler
 from handlers import main_router
 from middlewares import AccessControlMiddleware, ActionLoggingMiddleware
 from scheduler import monitoring_worker
 
-# Настройка логирования
+# Настройка логирования с автоматической ротацией (максимум 3 файла по 10 МБ)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8")
+        RotatingFileHandler("bot.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
     ]
 )
 logger = logging.getLogger(__name__)
+
 
 
 
