@@ -22,11 +22,20 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+@router.callback_query(F.data == "start_approved")
+async def cmd_start(event, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    username = message.from_user.username
-    first_name = message.from_user.first_name
+    if isinstance(event, CallbackQuery):
+        message = event.message
+        user = event.from_user
+        await event.answer()
+    else:
+        message = event
+        user = message.from_user
+
+    user_id = user.id
+    username = user.username
+    first_name = user.first_name
 
     await database.get_or_create_user(user_id, username, first_name)
 

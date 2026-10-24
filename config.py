@@ -9,6 +9,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 MAX_SEARCHES_PER_USER = int(os.getenv("MAX_SEARCHES_PER_USER", "10"))
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
+ADMIN_ID = int(os.getenv("ADMIN_ID", "986832959"))
 
 # Database path
 DATA_DIR = BASE_DIR / "data"

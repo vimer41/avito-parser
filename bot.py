@@ -10,6 +10,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import config
 import database
 from handlers import main_router
+from middlewares import AccessControlMiddleware
 from scheduler import monitoring_worker
 
 # Настройка логирования
@@ -41,6 +42,12 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     dp = Dispatcher(storage=MemoryStorage())
+    
+    # Регистрация проверки прав доступа (вайтлист с одобрением админом)
+    access_middleware = AccessControlMiddleware()
+    dp.message.middleware(access_middleware)
+    dp.callback_query.middleware(access_middleware)
+
     dp.include_router(main_router)
 
     # Удаляем вебхуки перед началом поллинга
