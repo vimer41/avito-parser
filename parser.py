@@ -278,6 +278,47 @@ class AvitoParser:
 
         return delivery, condition
 
+    @staticmethod
+    def _extract_image(it) -> Optional[str]:
+        """
+        Извлекает фото товара:
+        1. Из data-marker="slider-image/image-..." (Avito lazy load)
+        2. Из тегов <img> (src, data-src, srcset)
+        3. Из блока item-photo с ссылками на img.avito.st
+        """
+        # 1. Слайдер изображений Авито
+        li_img = it.find(attrs={"data-marker": lambda m: m and "slider-image/image-" in m})
+        if li_img:
+            marker = li_img.get("data-marker", "")
+            url = marker.split("slider-image/image-")[-1].strip()
+            if url.startswith("http"):
+                return url
+
+        # 2. Обычные теги img и srcset
+        for img in it.find_all("img"):
+            src = img.get("src") or img.get("data-src")
+            if src and src.startswith("http"):
+                return src
+            srcset = img.get("srcset")
+            if srcset:
+                parts = srcset.split(",")
+                if parts:
+                    first = parts[0].strip().split(" ")[0]
+                    if first.startswith("http"):
+                        return first
+
+        # 3. Блок item-photo
+        photo_div = it.find(attrs={"data-marker": "item-photo"})
+        if photo_div:
+            for tag in photo_div.find_all(True):
+                for attr_name, attr_val in tag.attrs.items():
+                    if isinstance(attr_val, str) and "img.avito.st" in attr_val:
+                        m = re.search(r"(https?://[^\s\"\']+\.img\.avito\.st/[^\s\"\']+)", attr_val)
+                        if m:
+                            return m.group(1)
+
+        return None
+
     @classmethod
     def parse_items(cls, html: str) -> List[AvitoItem]:
         """
@@ -317,13 +358,8 @@ class AvitoParser:
                     if price_elem:
                         price = price_elem.text.replace("\xa0", " ").strip()
 
-                # 4. Фотография
-                image_url = None
-                img_tag = it.find("img")
-                if img_tag:
-                    src = img_tag.get("src") or img_tag.get("data-src")
-                    if src and src.startswith("http"):
-                        image_url = src
+                # 4. Фотография (100% извлечение через слайдер и lazy-load)
+                image_url = cls._extract_image(it)
 
                 # 5. Адрес / Город / Метро
                 address = None
