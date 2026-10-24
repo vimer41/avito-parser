@@ -10,7 +10,27 @@ import database
 logger = logging.getLogger(__name__)
 
 
+class ActionLoggingMiddleware(BaseMiddleware):
+    """Логирует каждое действие пользователя (сообщения, команды, нажатия на инлайн-кнопки)."""
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        user_info = f"ID: {user.id} (@{user.username or 'нет'}, {user.first_name or ''})" if user else "ID: Unknown"
+
+        if isinstance(event, Message) and event.text:
+            logger.info(f"👤 [USER] {user_info} ──▶ Сообщение: «{event.text}»")
+        elif isinstance(event, CallbackQuery) and event.data:
+            logger.info(f"🔘 [КНОПКА] {user_info} ──▶ Нажата инлайн-кнопка: «{event.data}»")
+
+        return await handler(event, data)
+
+
 class AccessControlMiddleware(BaseMiddleware):
+
     async def __call__(
         self,
         handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],

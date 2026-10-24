@@ -131,6 +131,7 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
 
         items = parser.parse_items(html_content)
         if not items:
+            logger.info(f"📡 [РАДАР #{search_id}] «{search_title}»: страница получена, лоты в каталоге не найдены")
             return
 
         # Новые объявления идут сверху вниз. Чтобы присылать в хронологическом порядке,
@@ -140,10 +141,12 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
             if not await database.is_item_seen(search_id, it.item_id):
                 new_items.append(it)
 
+        logger.info(f"📡 [РАДАР #{search_id}] «{search_title}» (User: {user_id}): в выдаче {len(items)} лотов, новых для отправки: {len(new_items)}")
+
         # Защита от спама старыми товарами: если "новых" сразу больше 5 штук
         # (первичная подгрузка или сдвиг выдачи Авито), просто запоминаем их в базу без спама
         if len(new_items) > 5:
-            logger.info(f"Обнаружена пачка из {len(new_items)} лотов для #{search_id}. Запоминаем без спама пользователю.")
+            logger.info(f"📦 [РАДАР #{search_id}] Обнаружена пачка из {len(new_items)} лотов. Запоминаем в базу без спама пользователю.")
             for it in new_items:
                 await database.mark_item_seen(search_id, it.item_id)
             return
@@ -152,14 +155,14 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
         for it in reversed(new_items):
             # 1. Проверяем свежесть: отправляем ТОЛЬКО лоты, выложенные после добавления поиска
             if not is_ad_fresh_enough(it.date):
-                logger.info(f"Объявление {it.item_id} пропущено как старое (дата: '{it.date}')")
+                logger.info(f"⏳ [РАДАР #{search_id}] Объявление #{it.item_id} пропущено как старое (дата: '{it.date}')")
                 await database.mark_item_seen(search_id, it.item_id)
                 continue
 
             # 2. Проверяем стоп-слова
             matched_stop = is_stop_word_matched(it, stop_words)
             if matched_stop:
-                logger.info(f"Объявление {it.item_id} пропущено по стоп-слову '{matched_stop}'")
+                logger.info(f"🛡 [РАДАР #{search_id}] Объявление #{it.item_id} отсеяно по стоп-слову «{matched_stop}»")
                 await database.mark_item_seen(search_id, it.item_id)
                 continue
 
@@ -193,12 +196,12 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
                         disable_web_page_preview=False
                     )
 
-                logger.info(f"Отправлено новое объявление {it.item_id} пользователю {user_id}")
+                logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО: #{it.item_id} «{it.title[:30]}...» ({it.price}) пользователю ID: {user_id}")
 
             except Exception as send_err:
                 # Если отправка фото не удалась (например, неверный URL картинки или Telegram заблокировал),
                 # отправляем текстом
-                logger.warning(f"Не удалось отправить фото {it.image_url}: {send_err}, отправляем текстом")
+                logger.warning(f"⚠️ [РАДАР #{search_id}] Не удалось отправить фото {it.image_url}: {send_err}, отправляем текстом")
                 try:
                     await bot.send_message(
                         chat_id=user_id,
@@ -206,15 +209,16 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
                         reply_markup=keyboard,
                         parse_mode="HTML"
                     )
+                    logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО ТЕКСТОМ: #{it.item_id} пользователю ID: {user_id}")
                 except Exception as msg_err:
-                    logger.error(f"Не удалось отправить сообщение {it.item_id}: {msg_err}")
+                    logger.error(f"❌ [РАДАР #{search_id}] Не удалось отправить сообщение #{it.item_id}: {msg_err}")
 
             # Запоминаем ID объявления
             await database.mark_item_seen(search_id, it.item_id)
             await asyncio.sleep(0.5)
 
     except Exception as e:
-        logger.error(f"Ошибка при обработке поиска #{search_id} ({search_title}): {e}")
+        logger.error(f"❌ [РАДАР #{search_id}] Ошибка при обработке поиска «{search_title}»: {e}")
 
 
 async def monitoring_worker(bot: Bot):
@@ -222,7 +226,7 @@ async def monitoring_worker(bot: Bot):
     Главный бесконечный цикл фонового мониторинга поисков.
     Оптимизирован для 512 МБ RAM: выполняет регулярную очистку памяти и старых записей БД.
     """
-    logger.info("Запуск фонового сервиса мониторинга Авито (low-memory режим)...")
+    logger.info("🚀 Запуск фонового сервиса мониторинга Авито...")
     parser = AvitoParser()
     cycle_count = 0
 
@@ -231,10 +235,13 @@ async def monitoring_worker(bot: Bot):
             active_searches = await database.get_all_active_searches()
 
             if active_searches:
+                logger.info(f"🔄 [МОНИТОРИНГ] Начинаем круг сканирования ({len(active_searches)} активных радаров)...")
                 for search in active_searches:
                     await process_search(bot, parser, search)
                     # Небольшая пауза между запросами к разным ссылкам, чтобы распределять нагрузку
                     await asyncio.sleep(random.uniform(2.0, 4.0))
+            else:
+                logger.info("ℹ️ [МОНИТОРИНГ] Нет активных радаров для сканирования.")
 
             cycle_count += 1
             # Каждые 50 циклов (~50 минут) очищаем базу от старых объявлений и чистим RAM
@@ -242,16 +249,18 @@ async def monitoring_worker(bot: Bot):
                 cycle_count = 0
                 await database.cleanup_old_seen_items(days=5)
                 gc.collect()
-                logger.info("Оптимизация памяти (gc.collect) и БД успешно завершена")
+                logger.info("🧹 [ОПТИМИЗАЦИЯ] Очистка памяти (gc.collect) и БД успешно завершена")
 
             # Ждем интервал до следующего круга проверок
+            logger.info(f"💤 [МОНИТОРИНГ] Круг завершён. Ожидание {CHECK_INTERVAL} сек. до следующей проверки...")
             await asyncio.sleep(CHECK_INTERVAL)
 
         except asyncio.CancelledError:
-            logger.info("Фоновый сервис мониторинга остановлен.")
+            logger.info("🛑 Фоновый сервис мониторинга остановлен.")
             break
         except Exception as e:
-            logger.error(f"Непредвиденная ошибка в цикле мониторинга: {e}", exc_info=True)
+            logger.error(f"❌ Непредвиденная ошибка в цикле мониторинга: {e}", exc_info=True)
             gc.collect()
             await asyncio.sleep(10)
+
 

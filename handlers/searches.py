@@ -155,7 +155,10 @@ async def process_avito_url(message: Message, state: FSMContext):
     if item_ids:
         await database.mark_items_seen_bulk(search_id, item_ids)
 
+    logger.info(f"🎯 [РАДАР] Пользователь ID:{user_id} создал радар #{search_id}: «{search_title}» ({len(items)} базовых лотов проиндексировано)")
+
     await state.clear()
+
 
     clean_title = html.escape(search_title)
     text = (
@@ -262,6 +265,7 @@ async def cb_toggle_search(call: CallbackQuery):
         return
 
     status_str = "возобновлён 🟢" if new_status else "приостановлен ⏸"
+    logger.info(f"⏯ [РАДАР] Пользователь ID:{call.from_user.id} переключил статус радара #{search_id} -> {status_str}")
     await call.answer(f"Радар {status_str}!")
 
     s = await database.get_search(search_id)
@@ -328,6 +332,7 @@ async def cb_delete_search(call: CallbackQuery):
 async def cb_confirm_delete(call: CallbackQuery):
     search_id = int(call.data.split(":")[1])
     await database.delete_search(search_id, call.from_user.id)
+    logger.info(f"🗑 [РАДАР] Пользователь ID:{call.from_user.id} удалил радар #{search_id}")
     await call.message.edit_text("🗑 <b>Радар успешно удалён!</b>", parse_mode="HTML")
     await call.answer("Удалено")
 
@@ -465,6 +470,7 @@ async def process_stop_word_input(message: Message, state: FSMContext):
             added.append(w)
 
     await state.clear()
+    logger.info(f"🛡 [СТОП-СЛОВА] Пользователь ID:{message.from_user.id} добавил к радару #{search_id}: {added}")
 
     added_str = ", ".join(f"«{html.escape(w)}»" for w in added)
     await message.answer(
@@ -485,6 +491,7 @@ async def cb_remove_stop_word(call: CallbackQuery):
     word = parts[2]
 
     await database.remove_stop_word_from_search(search_id, word)
+    logger.info(f"🛡 [СТОП-СЛОВА] Пользователь ID:{call.from_user.id} удалил «{word}» из радара #{search_id}")
     await call.answer(f"Слово «{word}» удалено")
     await cb_manage_stops(call)
 
@@ -565,6 +572,7 @@ async def process_template_input(message: Message, state: FSMContext):
     search_id = data.get("search_id")
 
     await database.update_search_template(search_id, message.from_user.id, text)
+    logger.info(f"💬 [ОТКЛИК] Пользователь ID:{message.from_user.id} обновил персональный отклик для радара #{search_id}")
     await state.clear()
 
 

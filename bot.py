@@ -12,19 +12,20 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import config
 import database
 from handlers import main_router
-from middlewares import AccessControlMiddleware
+from middlewares import AccessControlMiddleware, ActionLoggingMiddleware
 from scheduler import monitoring_worker
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler("bot.log", encoding="utf-8")
     ]
 )
 logger = logging.getLogger(__name__)
+
 
 
 async def start_health_server():
@@ -74,12 +75,17 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     
+    # Регистрация детального логирования действий каждого пользователя
+    dp.message.middleware(ActionLoggingMiddleware())
+    dp.callback_query.middleware(ActionLoggingMiddleware())
+
     # Регистрация проверки прав доступа (вайтлист с одобрением админом)
     access_middleware = AccessControlMiddleware()
     dp.message.middleware(access_middleware)
     dp.callback_query.middleware(access_middleware)
 
     dp.include_router(main_router)
+
 
     # Удаляем вебхуки перед началом поллинга
     await bot.delete_webhook(drop_pending_updates=True)

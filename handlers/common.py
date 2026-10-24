@@ -1,4 +1,5 @@
 import html
+import logging
 from typing import Optional
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
@@ -16,7 +17,9 @@ from aiogram.fsm.state import State, StatesGroup
 import config
 import database
 
+logger = logging.getLogger(__name__)
 router = Router()
+
 
 
 class DefaultTemplateStates(StatesGroup):
@@ -245,6 +248,7 @@ async def cb_set_preset(call: CallbackQuery):
         return
 
     await database.update_user_default_template(call.from_user.id, new_text)
+    logger.info(f"💬 [ОТКЛИК] Пользователь ID:{call.from_user.id} установил пресет отклика «{preset_key}»")
     await call.answer("✅ Шаблон успешно применен!")
     # Повторно открываем меню с обновленным текстом
     await cmd_default_template(call, None)
@@ -287,7 +291,9 @@ async def process_new_default_template(message: Message, state: FSMContext):
         return
 
     await database.update_user_default_template(message.from_user.id, new_text)
+    logger.info(f"💬 [ОТКЛИК] Пользователь ID:{message.from_user.id} сохранил собственный общий отклик")
     await state.clear()
+
 
 
     text = (

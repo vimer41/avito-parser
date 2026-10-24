@@ -25,12 +25,15 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
     user = await database.get_or_create_user(target_user_id)
     username_str = f"@{user['username']}" if user.get("username") else f"ID {target_user_id}"
 
+    logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} одобрил доступ пользователю ID:{target_user_id} ({username_str})")
+
     await call.message.edit_text(
         f"✅ <b>Доступ успешно одобрен!</b>\n\n"
         f"Пользователь: <b>{html.escape(user.get('first_name') or '')}</b> ({username_str}) теперь имеет полный доступ к мониторингу.",
         parse_mode="HTML"
     )
     await call.answer("Доступ одобрен")
+
 
     # Уведомляем пользователя
     try:
@@ -58,12 +61,14 @@ async def cb_admin_reject(call: CallbackQuery, bot: Bot):
 
     target_user_id = int(call.data.split(":")[1])
     await database.set_user_allowed(target_user_id, 0)
+    logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} отклонил доступ пользователю ID:{target_user_id}")
 
     await call.message.edit_text(
         f"❌ <b>Заявка пользователя {target_user_id} отклонена.</b>",
         parse_mode="HTML"
     )
     await call.answer("Доступ отклонён")
+
 
     try:
         await bot.send_message(
@@ -147,5 +152,7 @@ async def cb_admin_revoke(call: CallbackQuery):
 
     target_user_id = int(call.data.split(":")[1])
     await database.set_user_allowed(target_user_id, 0)
+    logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} отозвал доступ у пользователя ID:{target_user_id}")
     await call.answer("Доступ отозван")
     await cmd_admin_panel(call)
+
