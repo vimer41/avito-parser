@@ -128,6 +128,14 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
             if not await database.is_item_seen(search_id, it.item_id):
                 new_items.append(it)
 
+        # Защита от спама старыми товарами: если "новых" сразу больше 5 штук
+        # (первичная подгрузка или сдвиг выдачи Авито), просто запоминаем их в базу без спама
+        if len(new_items) > 5:
+            logger.info(f"Обнаружена пачка из {len(new_items)} лотов для #{search_id}. Запоминаем без спама пользователю.")
+            for it in new_items:
+                await database.mark_item_seen(search_id, it.item_id)
+            return
+
         # Отправляем в правильном порядке (от менее свежих к самым свежим)
         for it in reversed(new_items):
             # Проверяем стоп-слова
