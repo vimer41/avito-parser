@@ -17,10 +17,10 @@ async def init_db():
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
-                default_template TEXT DEFAULT ?,
+                default_template TEXT DEFAULT 'Здравствуйте! Товар ещё продаётся? Готов забрать сегодня.',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        """, (DEFAULT_SELLER_MESSAGE,))
+        """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS searches (
