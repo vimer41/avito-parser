@@ -15,7 +15,7 @@ router = Router()
 
 @router.callback_query(F.data.startswith("admin_approve:"))
 async def cb_admin_approve(call: CallbackQuery, bot: Bot):
-    if call.from_user.id != config.ADMIN_ID:
+    if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
 
@@ -52,7 +52,7 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("admin_reject:"))
 async def cb_admin_reject(call: CallbackQuery, bot: Bot):
-    if call.from_user.id != config.ADMIN_ID:
+    if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
 
@@ -80,7 +80,7 @@ async def cb_admin_reject(call: CallbackQuery, bot: Bot):
 @router.message(Command("admin"))
 @router.message(Command("users"))
 async def cmd_admin_users(message: Message):
-    if message.from_user.id != config.ADMIN_ID:
+    if not config.is_admin(message.from_user.id):
         return
 
     users = await database.get_all_users()
@@ -93,14 +93,14 @@ async def cmd_admin_users(message: Message):
 
     for u in users:
         u_id = u["user_id"]
-        status = "🟢 Доступ есть" if u.get("is_allowed") else "🔴 Заблокирован"
+        status = "👑 Администратор" if config.is_admin(u_id) else ("🟢 Доступ есть" if u.get("is_allowed") else "🔴 Заблокирован")
         uname = f"@{u['username']}" if u.get("username") else f"ID: {u_id}"
         fname = html.escape(u.get("first_name") or "")
 
         lines.append(f"• <b>{fname}</b> ({uname}) — {status}")
 
         # Для не-админов добавляем кнопку блокировки / разблокировки
-        if u_id != config.ADMIN_ID:
+        if not config.is_admin(u_id):
             if u.get("is_allowed"):
                 buttons.append([InlineKeyboardButton(text=f"🚫 Заблокировать {uname}", callback_data=f"admin_revoke:{u_id}")])
             else:
@@ -112,7 +112,7 @@ async def cmd_admin_users(message: Message):
 
 @router.callback_query(F.data.startswith("admin_revoke:"))
 async def cb_admin_revoke(call: CallbackQuery):
-    if call.from_user.id != config.ADMIN_ID:
+    if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав", show_alert=True)
         return
 

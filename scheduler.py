@@ -6,7 +6,7 @@ import random
 import re
 from typing import Optional
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
 import database
 from config import CHECK_INTERVAL
@@ -142,9 +142,18 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
 
             try:
                 if it.image_url:
+                    # Скачиваем изображение через сессию парсера, чтобы Telegram-сервер не блокировался CDN Авито
+                    photo_to_send = it.image_url
+                    try:
+                        img_resp = parser.session.get(it.image_url, timeout=10)
+                        if img_resp.status_code == 200 and len(img_resp.content) > 200:
+                            photo_to_send = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
+                    except Exception as dl_err:
+                        logger.debug(f"Не удалось предварительно скачать фото {it.image_url}: {dl_err}")
+
                     await bot.send_photo(
                         chat_id=user_id,
-                        photo=it.image_url,
+                        photo=photo_to_send,
                         caption=caption,
                         reply_markup=keyboard,
                         parse_mode="HTML"

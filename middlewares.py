@@ -62,15 +62,16 @@ class AccessControlMiddleware(BaseMiddleware):
             ]
         ])
 
-        try:
-            await bot.send_message(
-                chat_id=config.ADMIN_ID,
-                text=admin_text,
-                reply_markup=admin_kb,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отправить уведомление админу {config.ADMIN_ID}: {e}")
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=admin_text,
+                    reply_markup=admin_kb,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
 
         # Прерываем выполнение дальнейших обработчиков
         return

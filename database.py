@@ -2,7 +2,7 @@ import json
 import logging
 from typing import List, Optional, Dict, Any
 import aiosqlite
-from config import DB_PATH, ADMIN_ID
+from config import DB_PATH, ADMIN_ID, ADMIN_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +32,9 @@ async def init_db():
         except Exception:
             pass
 
-        # Администратор всегда имеет доступ
-        await db.execute("UPDATE users SET is_allowed = 1 WHERE user_id = ?", (ADMIN_ID,))
-        # Разрешаем доступ пользователю 455386428, который уже тестировал
-        await db.execute("UPDATE users SET is_allowed = 1 WHERE user_id = 455386428")
+        # Администраторы всегда имеют полный доступ
+        for aid in ADMIN_IDS:
+            await db.execute("UPDATE users SET is_allowed = 1 WHERE user_id = ?", (aid,))
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS searches (
@@ -73,7 +72,7 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
             if row:
                 return dict(row)
 
-        is_allowed = 1 if user_id == ADMIN_ID else 0
+        is_allowed = 1 if user_id in ADMIN_IDS else 0
         await db.execute(
             "INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed) VALUES (?, ?, ?, ?, ?)",
             (user_id, username, first_name, DEFAULT_SELLER_MESSAGE, is_allowed)
@@ -87,7 +86,7 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
 
 async def is_user_allowed(user_id: int) -> bool:
     """Проверяет, одобрен ли доступ пользователю администратором."""
-    if user_id == ADMIN_ID:
+    if user_id in ADMIN_IDS:
         return True
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT is_allowed FROM users WHERE user_id = ?", (user_id,)) as cursor:
