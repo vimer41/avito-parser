@@ -286,6 +286,17 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
 
 
 
+async def get_seen_item_ids_for_search(search_id: int) -> set:
+    """Возвращает множество всех ID объявлений, уже просмотренных в данном радаре."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT item_id FROM seen_items WHERE search_id = ?",
+            (search_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return {r[0] for r in rows}
+
+
 async def is_item_seen(search_id: int, item_id: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(

@@ -269,7 +269,7 @@ async def cmd_default_template(event, state: Optional[FSMContext] = None):
 
 
 @router.callback_query(F.data.startswith("set_preset:"))
-async def cb_set_preset(call: CallbackQuery):
+async def cb_set_preset(call: CallbackQuery, state: FSMContext):
     preset_key = call.data.split(":")[1]
     new_text = PRESET_TEMPLATES.get(preset_key)
     if not new_text:
@@ -280,7 +280,7 @@ async def cb_set_preset(call: CallbackQuery):
     logger.info(f"💬 [ОТКЛИК] Пользователь ID:{call.from_user.id} установил пресет отклика «{preset_key}»")
     await call.answer("✅ Шаблон успешно применен!")
     # Повторно открываем меню с обновленным текстом
-    await cmd_default_template(call, None)
+    await cmd_default_template(call, state)
 
 
 @router.callback_query(F.data == "change_default_template")

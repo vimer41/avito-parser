@@ -75,6 +75,8 @@ class AvitoParser:
         - добавляет https:// если нет
         - проверяет, что это avito.ru
         - устанавливает s=104 (сортировка 'Сначала новые')
+        - удаляет динамические параметры сессий и трекинга (context, localPriority, utm_*, etc.)
+        - сортирует query params для дедупликации одинаковых поисков
         """
         raw_url = raw_url.strip()
         if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
@@ -86,11 +88,19 @@ class AvitoParser:
 
         # Парсим параметры запроса
         query_params = parse_qs(parsed.query)
+
+        # Удаляем мусорные / сессионные параметры, меняющиеся между запросами
+        junk_keys = {"context", "localPriority", "presentationType", "from", "searchRadius", "view"}
+        for k in list(query_params.keys()):
+            if k in junk_keys or k.startswith("utm_"):
+                query_params.pop(k, None)
+
         # Устанавливаем сортировку по дате (сначала новые)
         query_params["s"] = ["104"]
 
-        # Собираем query обратно (doseq=True чтобы списки разворачивались корректно)
-        new_query = urlencode(query_params, doseq=True)
+        # Сортируем параметры для стабильного хеша URL при группировке
+        sorted_params = sorted(query_params.items())
+        new_query = urlencode(sorted_params, doseq=True)
 
         normalized = urlunparse((
             parsed.scheme or "https",
@@ -351,10 +361,29 @@ class AvitoParser:
     @classmethod
     def parse_items(cls, html: str) -> List[AvitoItem]:
         """
-        Парсит все объявления на странице выдачи.
+        Парсит органические объявления на странице выдачи:
+        1. Ограничивается главным блоком выдачи catalog-serp (без рекомендаций и подвала).
+        2. Удаляет мусорные блоки VIP и рекламы внутри каталога.
+        3. Ограничивает выборку верхними 25 карточками (самые свежие при s=104).
         """
         soup = BeautifulSoup(html, "html.parser")
-        items_raw = soup.find_all(attrs={"data-marker": "item"})
+        
+        # 1. Ищем ТОЛЬКО контейнер органической поисковой выдачи
+        main_catalog = soup.find("div", {"data-marker": "catalog-serp"})
+        
+        if not main_catalog:
+            # Фолбэк, если Авито отдало нестандартную разметку
+            items_raw = soup.find_all(attrs={"data-marker": "item"}, limit=25)
+        else:
+            # 2. Удаляем из каталога карусели VIP/рекламы и врезки других регионов
+            for junk in main_catalog.find_all(attrs={"data-marker": ["witcher/block", "items-vip"]}):
+                junk.decompose()
+            for junk in main_catalog.find_all(class_=lambda c: c and any(x in c for x in ["items-vip", "witcher"])):
+                junk.decompose()
+
+            # 3. Берем карточки только из очищенного контейнера (топ-25)
+            items_raw = main_catalog.find_all(attrs={"data-marker": "item"}, limit=25)
+
         results: List[AvitoItem] = []
 
         for it in items_raw:

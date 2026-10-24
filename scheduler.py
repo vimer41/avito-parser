@@ -5,7 +5,8 @@ import logging
 import random
 import re
 import time
-from typing import Optional
+from collections import defaultdict
+from typing import Optional, List, Dict
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
@@ -135,129 +136,159 @@ def is_stop_word_matched(item: AvitoItem, stop_words: list) -> Optional[str]:
     return None
 
 
-async def process_search(bot: Bot, parser: AvitoParser, search: dict):
-    search_id = search["id"]
-    user_id = search["user_id"]
-    search_title = search["title"]
-    url = search["url"]
-    stop_words = search.get("stop_words", [])
+async def send_ad_to_user(
+    bot: Bot,
+    parser: AvitoParser,
+    user_id: int,
+    search_id: int,
+    search_title: str,
+    it: AvitoItem
+) -> bool:
+    """
+    Отправляет уведомление пользователю (фото или текст).
+    Возвращает False, если пользователь заблокировал бота (для прерывания цикла отправки).
+    """
+    caption = build_notification_text(it, search_title)
+    keyboard = build_notification_keyboard(it.url, search_id)
 
     try:
-        # Выполняем запрос в отдельном потоке (т.к. curl_cffi синхронный в Session)
-        html_content = await asyncio.to_thread(parser.fetch_page, url)
+        if it.image_url:
+            photo_to_send = it.image_url
+            try:
+                img_resp = parser.session.get(it.image_url, timeout=10)
+                if img_resp.status_code == 200 and len(img_resp.content) > 200:
+                    photo_to_send = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
+            except Exception as dl_err:
+                logger.debug(f"Не удалось предварительно скачать фото {it.image_url}: {dl_err}")
+
+            await bot.send_photo(
+                chat_id=user_id,
+                photo=photo_to_send,
+                caption=caption,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        else:
+            await bot.send_message(
+                chat_id=user_id,
+                text=caption,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=False
+            )
+
+        logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО: #{it.item_id} «{it.title[:30]}...» ({it.price}) пользователю ID: {user_id}")
+        return True
+
+    except TelegramForbiddenError:
+        logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{user_id} заблокировал бота. Отключаем его радары.")
+        await database.deactivate_user_searches(user_id)
+        return False
+    except TelegramRetryAfter as retry_err:
+        logger.warning(f"⏳ [FLOODWAIT] Telegram лимит отправки: пауза {retry_err.retry_after} сек.")
+        await asyncio.sleep(retry_err.retry_after + 1)
+        return True
+    except Exception as send_err:
+        logger.warning(f"⚠️ [РАДАР #{search_id}] Не удалось отправить фото {it.image_url}: {send_err}, пробуем текстом...")
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=caption,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+            logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО ТЕКСТОМ: #{it.item_id} пользователю ID: {user_id}")
+            return True
+        except TelegramForbiddenError:
+            logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{user_id} заблокировал бота. Отключаем его радары.")
+            await database.deactivate_user_searches(user_id)
+            return False
+        except Exception as msg_err:
+            logger.error(f"❌ [РАДАР #{search_id}] Не удалось отправить сообщение #{it.item_id}: {msg_err}")
+            return True
+
+
+async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radars_for_url: List[dict]):
+    """
+    Обрабатывает один уникальный URL выдачи Авито:
+    - Делает ровно 1 HTTP-запрос к Авито
+    - Парсит органическую выдачу (топ-25)
+    - Раздает результаты всем радарам, следящим за этой ссылкой
+    - Сразу запоминает новые ID в базе для каждого радара
+    """
+    try:
+        # Выполняем 1 сетевой запрос к Авито на всю группу радаров с этим URL
+        html_content = await asyncio.to_thread(parser.fetch_page, clean_url)
         if not html_content:
             return
 
         items = parser.parse_items(html_content)
         if not items:
-            logger.info(f"📡 [РАДАР #{search_id}] «{search_title}»: страница получена, лоты в каталоге не найдены")
+            logger.info(f"📡 [ПАРСЕР] По URL «{clean_url[:60]}...»: страница получена, лотов в каталоге не найдено")
             return
 
-        # Новые объявления идут сверху вниз. Чтобы присылать в хронологическом порядке,
-        # разворачиваем список новых элементов
-        new_items = []
-        for it in items:
-            if not await database.is_item_seen(search_id, it.item_id):
-                new_items.append(it)
+        # Раздаем полученные объявления каждому радару, подписанному на этот URL
+        for radar in radars_for_url:
+            radar_id = radar["id"]
+            user_id = radar["user_id"]
+            search_title = radar["title"]
+            stop_words = radar.get("stop_words", [])
 
-        logger.info(f"📡 [РАДАР #{search_id}] «{search_title}» (User: {user_id}): в выдаче {len(items)} лотов, новых для отправки: {len(new_items)}")
+            seen_ids = await database.get_seen_item_ids_for_search(radar_id)
+            new_items = [it for it in items if it.item_id not in seen_ids]
 
-        # Защита от спама старыми товарами: если "новых" сразу больше 5 штук
-        # (первичная подгрузка или сдвиг выдачи Авито), просто запоминаем их в базу без спама
-        if len(new_items) > 5:
-            logger.info(f"📦 [РАДАР #{search_id}] Обнаружена пачка из {len(new_items)} лотов. Запоминаем в базу без спама пользователю.")
-            for it in new_items:
-                await database.mark_item_seen(search_id, it.item_id)
-            return
+            logger.info(
+                f"📡 [РАДАР #{radar_id}] «{search_title}» (User: {user_id}): "
+                f"в выдаче {len(items)} лотов, новых для отправки: {len(new_items)}"
+            )
 
-        # Отправляем в правильном порядке (от менее свежих к самым свежим)
-        for it in reversed(new_items):
-            # 1. Проверяем свежесть: отправляем ТОЛЬКО лоты, выложенные после добавления поиска
-            if not is_ad_fresh_enough(it.date):
-                logger.info(f"⏳ [РАДАР #{search_id}] Объявление #{it.item_id} пропущено как старое (дата: '{it.date}')")
-                await database.mark_item_seen(search_id, it.item_id)
+            if not new_items:
                 continue
 
-            # 2. Проверяем стоп-слова
-            matched_stop = is_stop_word_matched(it, stop_words)
-            if matched_stop:
-                logger.info(f"🛡 [РАДАР #{search_id}] Объявление #{it.item_id} отсеяно по стоп-слову «{matched_stop}»")
-                await database.mark_item_seen(search_id, it.item_id)
+            # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ до фильтра свежести!
+            # Тогда даже если лоту '1 час назад', на следующем круге он уже будет в seen_ids
+            # и никогда повторно не всплывет в логах.
+            await database.mark_items_seen_bulk(radar_id, [it.item_id for it in new_items])
+
+            # Защита от пачки при первом запуске или сдвиге выдачи
+            if len(new_items) > 5:
+                logger.info(
+                    f"📦 [РАДАР #{radar_id}] Обнаружена пачка из {len(new_items)} лотов. "
+                    f"Запоминаем без спама пользователю."
+                )
                 continue
 
-            caption = build_notification_text(it, search_title)
-            keyboard = build_notification_keyboard(it.url, search_id)
-
-            try:
-                if it.image_url:
-                    # Скачиваем изображение через сессию парсера, чтобы Telegram-сервер не блокировался CDN Авито
-                    photo_to_send = it.image_url
-                    try:
-                        img_resp = parser.session.get(it.image_url, timeout=10)
-                        if img_resp.status_code == 200 and len(img_resp.content) > 200:
-                            photo_to_send = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
-                    except Exception as dl_err:
-                        logger.debug(f"Не удалось предварительно скачать фото {it.image_url}: {dl_err}")
-
-                    await bot.send_photo(
-                        chat_id=user_id,
-                        photo=photo_to_send,
-                        caption=caption,
-                        reply_markup=keyboard,
-                        parse_mode="HTML"
+            # Отправляем в хронологическом порядке (снизу вверх)
+            for it in reversed(new_items):
+                if not is_ad_fresh_enough(it.date):
+                    logger.info(
+                        f"⏳ [РАДАР #{radar_id}] Объявление #{it.item_id} пропущено как старое (дата: '{it.date}')"
                     )
-                else:
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=caption,
-                        reply_markup=keyboard,
-                        parse_mode="HTML",
-                        disable_web_page_preview=False
-                    )
+                    continue
 
-                logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО: #{it.item_id} «{it.title[:30]}...» ({it.price}) пользователю ID: {user_id}")
-
-            except TelegramForbiddenError:
-                logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{user_id} заблокировал бота. Отключаем его радары.")
-                await database.deactivate_user_searches(user_id)
-                break
-            except TelegramRetryAfter as retry_err:
-                logger.warning(f"⏳ [FLOODWAIT] Telegram лимит отправки: пауза {retry_err.retry_after} сек.")
-                await asyncio.sleep(retry_err.retry_after + 1)
-            except Exception as send_err:
-                # Если отправка фото не удалась (например, неверный URL картинки или Telegram заблокировал),
-                # отправляем текстом
-                logger.warning(f"⚠️ [РАДАР #{search_id}] Не удалось отправить фото {it.image_url}: {send_err}, отправляем текстом")
-                try:
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=caption,
-                        reply_markup=keyboard,
-                        parse_mode="HTML"
+                matched_stop = is_stop_word_matched(it, stop_words)
+                if matched_stop:
+                    logger.info(
+                        f"🛡 [РАДАР #{radar_id}] Объявление #{it.item_id} отсеяно по стоп-слову «{matched_stop}»"
                     )
-                    logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО ТЕКСТОМ: #{it.item_id} пользователю ID: {user_id}")
-                except TelegramForbiddenError:
-                    logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{user_id} заблокировал бота. Отключаем его радары.")
-                    await database.deactivate_user_searches(user_id)
+                    continue
+
+                ok = await send_ad_to_user(bot, parser, user_id, radar_id, search_title, it)
+                if not ok:
                     break
-                except Exception as msg_err:
-                    logger.error(f"❌ [РАДАР #{search_id}] Не удалось отправить сообщение #{it.item_id}: {msg_err}")
-
-            # Запоминаем ID объявления
-            await database.mark_item_seen(search_id, it.item_id)
-            await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)
 
         global LAST_SCAN_TIMESTAMP
         LAST_SCAN_TIMESTAMP = time.time()
 
     except Exception as e:
-        logger.error(f"❌ [РАДАР #{search_id}] Ошибка при обработке поиска «{search_title}»: {e}")
+        logger.error(f"❌ [ГРУППА URL] Ошибка при обработке URL «{clean_url[:60]}...»: {e}", exc_info=True)
 
 
 async def monitoring_worker(bot: Bot):
     """
     Главный бесконечный цикл фонового мониторинга поисков.
-    Оптимизирован для 512 МБ RAM: выполняет регулярную очистку памяти и старых записей БД.
+    Оптимизирован для 512 МБ RAM и минимального числа HTTP-запросов к Авито (дедупликация URL).
     """
     logger.info("🚀 Запуск фонового сервиса мониторинга Авито...")
     parser = AvitoParser()
@@ -269,10 +300,20 @@ async def monitoring_worker(bot: Bot):
 
             if active_searches:
                 logger.info(f"🔄 [МОНИТОРИНГ] Начинаем круг сканирования ({len(active_searches)} активных радаров)...")
+
+                # 1. Группируем радары по нормализованному URL (без context=..., localPriority=... и т.д.)
+                url_groups = defaultdict(list)
                 for search in active_searches:
-                    await process_search(bot, parser, search)
-                    # Небольшая пауза между запросами к разным ссылкам, чтобы распределять нагрузку
-                    await asyncio.sleep(random.uniform(2.0, 4.0))
+                    clean_url = AvitoParser.normalize_url(search["url"])
+                    url_groups[clean_url].append(search)
+
+                logger.info(f"🌐 [МОНИТОРИНГ] Уникальных URL-запросов к Авито: {len(url_groups)} (радаров в базе: {len(active_searches)})")
+
+                # 2. Делаем ровно 1 запрос к Авито на каждый уникальный URL
+                for clean_url, radars_for_url in url_groups.items():
+                    await process_url_group(bot, parser, clean_url, radars_for_url)
+                    # Пауза между запросами к разным ссылкам для распределения нагрузки
+                    await asyncio.sleep(random.uniform(3.0, 5.0))
             else:
                 logger.info("ℹ️ [МОНИТОРИНГ] Нет активных радаров для сканирования.")
 
