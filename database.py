@@ -308,3 +308,32 @@ async def cleanup_old_seen_items(days: int = 5) -> int:
         logger.error(f"Ошибка при очистке устаревших записей БД: {e}")
         return 0
 
+
+async def get_system_stats() -> Dict[str, int]:
+    """Возвращает общую статистику по пользователям, радарам и объявлениям."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            row = await cur.fetchone()
+            total_users = row[0] if row else 0
+        async with db.execute("SELECT COUNT(*) FROM users WHERE is_allowed = 1") as cur:
+            row = await cur.fetchone()
+            allowed_users = row[0] if row else 0
+        async with db.execute("SELECT COUNT(*) FROM searches") as cur:
+            row = await cur.fetchone()
+            total_searches = row[0] if row else 0
+        async with db.execute("SELECT COUNT(*) FROM searches WHERE is_active = 1") as cur:
+            row = await cur.fetchone()
+            active_searches = row[0] if row else 0
+        async with db.execute("SELECT COUNT(*) FROM seen_items") as cur:
+            row = await cur.fetchone()
+            total_seen = row[0] if row else 0
+
+        return {
+            "total_users": total_users,
+            "allowed_users": allowed_users,
+            "total_searches": total_searches,
+            "active_searches": active_searches,
+            "total_seen": total_seen,
+        }
+
+

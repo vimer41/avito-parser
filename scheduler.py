@@ -16,79 +16,70 @@ logger = logging.getLogger(__name__)
 
 
 def build_notification_text(item: AvitoItem, search_title: str) -> str:
-    """
-    Форматирует красивый текст уведомления:
-    12 000 ₽ · iPhone X, 128 ГБ, 1 SIM
-    📍 Санкт-Петербург
-    ✨ Удовлетворительное · 🚚 Доставка от 1 дня
-    👤 Арсений · ⭐ 5,0 (6 отзывов)
-    🕒 1 час назад
-    📝 Продаю iphone x из-за ненадобности.
-    🔍 Apple iPhone X в Санкт-Петербурге
-    """
-    lines = []
-
-    # 1. Заголовок и цена
+    """Форматирует стильный и чистый текст карточки товара."""
     clean_title = html.escape(item.title)
     clean_price = html.escape(item.price)
-    lines.append(f"<b>{clean_price}</b> · {clean_title}")
-
-    # 2. Адрес (если не найден в карточке, берем город из названия поиска)
-    address = item.address
     clean_search = search_title.replace("\xa0", " ").strip()
+
+    lines = [
+        "⚡️ <b>НОВЫЙ ЛОТ НА АВИТО</b>",
+        f"🏷 <b>{clean_price}</b> · <b>{clean_title}</b>",
+        "────────────────────"
+    ]
+
+    # Локация
+    address = item.address
     if not address:
         m = re.search(r"в\s+([А-Яа-яЁё\s\-]+)$", clean_search)
         if m:
             address = m.group(1).strip()
     if address:
-        lines.append(f"📍 {html.escape(address)}")
+        lines.append(f"📍 <b>Локация:</b> {html.escape(address)}")
 
-    # 3. Состояние и доставка
-    status_line = []
+    # Состояние и доставка
+    details = []
     if item.condition:
-        status_line.append(f"✨ {html.escape(item.condition)}")
+        details.append(f"✨ {html.escape(item.condition)}")
     if item.delivery:
-        status_line.append(f"🚚 {html.escape(item.delivery)}")
-    if status_line:
-        lines.append(" · ".join(status_line))
+        details.append(f"🚚 {html.escape(item.delivery)}")
+    if details:
+        lines.append(f"📦 <b>Детали:</b> {' · '.join(details)}")
 
-    # 4. Продавец
+    # Продавец
     if item.seller:
-        lines.append(f"👤 {html.escape(item.seller)}")
+        lines.append(f"👤 <b>Продавец:</b> {html.escape(item.seller)}")
 
-    # 5. Время публикации
+    # Время
     if item.date:
-        lines.append(f"🕒 {html.escape(item.date)}")
+        lines.append(f"🕒 <b>Опубликовано:</b> {html.escape(item.date)}")
 
-    # 6. Описание (аккуратно очищенное)
+    # Описание
     if item.description:
         desc = item.description.strip()
-        if len(desc) > 350:
-            desc = desc[:347] + "..."
-        lines.append(f"📝 {html.escape(desc)}")
+        if len(desc) > 280:
+            desc = desc[:277] + "..."
+        lines.append("")
+        lines.append(f"📝 <i>«{html.escape(desc)}»</i>")
 
-    # 7. Название поиска
-    lines.append(f"🔍 {html.escape(clean_search)}")
+    lines.append("────────────────────")
+    lines.append(f"🎯 <b>Радар:</b> <i>{html.escape(clean_search)}</i>")
 
     return "\n".join(lines)
 
 
 def build_notification_keyboard(item_url: str, search_id: int) -> InlineKeyboardMarkup:
-    """
-    Инлайн-кнопки под объявлением:
-    [↗ Открыть на Авито] [📋 Скопировать сообщение]
-    [🚫 Добавить стоп-слово]
-    """
+    """Стильные инлайн-кнопки под карточкой товара."""
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="↗ Открыть на Авито", url=item_url),
-            InlineKeyboardButton(text="📋 Скопировать сообщение", callback_data=f"copy_msg:{search_id}")
+            InlineKeyboardButton(text="↗️ Открыть на Авито", url=item_url),
+            InlineKeyboardButton(text="📋 Скопировать отклик", callback_data=f"copy_msg:{search_id}")
         ],
         [
-            InlineKeyboardButton(text="🚫 Добавить стоп-слово", callback_data=f"add_stop_from_item:{search_id}")
+            InlineKeyboardButton(text="🛡 В стоп-слова", callback_data=f"add_stop_from_item:{search_id}")
         ]
     ])
     return kb
+
 
 
 def is_ad_fresh_enough(date_str: Optional[str]) -> bool:

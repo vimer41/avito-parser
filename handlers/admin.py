@@ -27,7 +27,7 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
 
     await call.message.edit_text(
         f"✅ <b>Доступ успешно одобрен!</b>\n\n"
-        f"Пользователь: <b>{html.escape(user.get('first_name') or '')}</b> ({username_str}) теперь может полноценно пользоваться ботом.",
+        f"Пользователь: <b>{html.escape(user.get('first_name') or '')}</b> ({username_str}) теперь имеет полный доступ к мониторингу.",
         parse_mode="HTML"
     )
     await call.answer("Доступ одобрен")
@@ -37,12 +37,12 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
         await bot.send_message(
             chat_id=target_user_id,
             text=(
-                "🎉 <b>Администратор одобрил ваш доступ к боту!</b>\n\n"
-                "Теперь вы можете отслеживать любые товары на Авито 24/7.\n"
-                "Нажмите /start или отправьте ссылку на поиск, чтобы начать!"
+                "🎉 <b>Ваш доступ к AVITO RADAR успешно одобрен!</b>\n\n"
+                "Теперь вы можете отслеживать любые товары на Авито 24/7 без ограничений.\n"
+                "Нажмите кнопку ниже или отправьте ссылку на поиск, чтобы запустить первый радар!"
             ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🚀 Начать работу", callback_data="start_approved")]
+                [InlineKeyboardButton(text="🚀 Запустить радар", callback_data="start_approved")]
             ]),
             parse_mode="HTML"
         )
@@ -63,51 +63,80 @@ async def cb_admin_reject(call: CallbackQuery, bot: Bot):
         f"❌ <b>Заявка пользователя {target_user_id} отклонена.</b>",
         parse_mode="HTML"
     )
-    await call.answer("Доступ отклонен")
+    await call.answer("Доступ отклонён")
 
     try:
         await bot.send_message(
             chat_id=target_user_id,
-            text="❌ <b>К сожалению, доступ к боту был отклонен администратором.</b>",
+            text="❌ <b>К сожалению, доступ к боту был отклонён администратором.</b>",
             parse_mode="HTML"
         )
     except Exception:
         pass
 
 
-# ── Панель управления пользователями для админа (/admin, /users) ───────
+# ── Панель администратора (/admin, /users, кнопка в меню) ─────────────
 
+@router.message(F.text.in_({"👑 Админ-панель", "👑 Админка"}))
 @router.message(Command("admin"))
 @router.message(Command("users"))
-async def cmd_admin_users(message: Message):
-    if not config.is_admin(message.from_user.id):
+@router.callback_query(F.data == "admin_refresh")
+async def cmd_admin_panel(event):
+    if isinstance(event, CallbackQuery):
+        message = event.message
+        user_id = event.from_user.id
+        await event.answer("Данные обновлены!")
+    else:
+        message = event
+        user_id = message.from_user.id
+
+    if not config.is_admin(user_id):
         return
 
+    stats = await database.get_system_stats()
     users = await database.get_all_users()
-    if not users:
-        await message.answer("В базе данных пока нет пользователей.")
-        return
 
-    lines = [f"👑 <b>Панель администратора</b> (Всего пользователей: {len(users)}):\n"]
+    text_lines = [
+        "👑 <b>ПАНЕЛЬ УПРАВЛЕНИЯ СИСТЕМОЙ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 <b>Сводная статистика:</b>\n"
+        f"• 👥 Пользователей: <b>{stats['total_users']}</b> (🟢 {stats['allowed_users']} с доступом)\n"
+        f"• 🎯 Всего радаров: <b>{stats['total_searches']}</b> (🟢 {stats['active_searches']} активно)\n"
+        f"• 📦 Обработано лотов: <b>{stats['total_seen']}</b>\n"
+        f"• 🛡 Защита: <b>TLS Chameleon / PoW Bypass</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👤 <b>Пользователи и права доступа:</b>\n"
+    ]
+
     buttons = []
-
     for u in users:
         u_id = u["user_id"]
-        status = "👑 Администратор" if config.is_admin(u_id) else ("🟢 Доступ есть" if u.get("is_allowed") else "🔴 Заблокирован")
+        is_adm = config.is_admin(u_id)
+        is_allowed = bool(u.get("is_allowed"))
         uname = f"@{u['username']}" if u.get("username") else f"ID: {u_id}"
-        fname = html.escape(u.get("first_name") or "")
+        fname = html.escape(u.get("first_name") or "Без имени")
 
-        lines.append(f"• <b>{fname}</b> ({uname}) — {status}")
+        if is_adm:
+            text_lines.append(f"👑 <b>{fname}</b> ({uname}) — <i>Администратор</i>")
+        elif is_allowed:
+            text_lines.append(f"🟢 <b>{fname}</b> ({uname}) — <i>Доступ разрешён</i>")
+            buttons.append([InlineKeyboardButton(text=f"🚫 Заблокировать {uname}", callback_data=f"admin_revoke:{u_id}")])
+        else:
+            text_lines.append(f"🔴 <b>{fname}</b> ({uname}) — <i>Ограничен / Заблокирован</i>")
+            buttons.append([InlineKeyboardButton(text=f"✅ Разрешить {uname}", callback_data=f"admin_approve:{u_id}")])
 
-        # Для не-админов добавляем кнопку блокировки / разблокировки
-        if not config.is_admin(u_id):
-            if u.get("is_allowed"):
-                buttons.append([InlineKeyboardButton(text=f"🚫 Заблокировать {uname}", callback_data=f"admin_revoke:{u_id}")])
-            else:
-                buttons.append([InlineKeyboardButton(text=f"✅ Разрешить {uname}", callback_data=f"admin_approve:{u_id}")])
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить сводку", callback_data="admin_refresh")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    await message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    full_text = "\n".join(text_lines)
+    if isinstance(event, CallbackQuery):
+        try:
+            await message.edit_text(full_text, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
+    await message.answer(full_text, reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("admin_revoke:"))
@@ -119,4 +148,4 @@ async def cb_admin_revoke(call: CallbackQuery):
     target_user_id = int(call.data.split(":")[1])
     await database.set_user_allowed(target_user_id, 0)
     await call.answer("Доступ отозван")
-    await cmd_admin_users(call.message)
+    await cmd_admin_panel(call)
