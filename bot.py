@@ -16,6 +16,14 @@ from handlers import main_router
 from middlewares import AccessControlMiddleware, ActionLoggingMiddleware
 from scheduler import monitoring_worker
 
+# Принудительная поддержка UTF-8 в консоли Windows (для эмодзи)
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # Настройка логирования с автоматической ротацией (максимум 3 файла по 10 МБ)
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +34,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
 
 
 
