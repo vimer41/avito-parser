@@ -183,10 +183,14 @@ async def cmd_profile(event):
     if not is_adm and not sub_until and not trial_used:
         buttons.append([InlineKeyboardButton(text="🎁 Попробовать 24 часа бесплатно", callback_data="activate_trial_btn")])
 
-    # Кнопка подписки/тарифов для всех, кто не администратор
-    if not is_adm:
-        sub_btn_text = "💎 Продлить / Сменить тариф" if sub_until else "💳 Выбрать тариф (Подписка)"
-        buttons.append([InlineKeyboardButton(text=sub_btn_text, callback_data="open_subscription_menu")])
+    # Кнопка подписки/тарифов (видна и пользователям, и администраторам)
+    if is_adm:
+        sub_btn_text = "👑 Тарифные планы (PRO активен)"
+    elif sub_until:
+        sub_btn_text = "💎 Продлить / Сменить тариф"
+    else:
+        sub_btn_text = "💳 Выбрать тариф (Подписка)"
+    buttons.append([InlineKeyboardButton(text=sub_btn_text, callback_data="open_subscription_menu")])
 
     buttons.append([
         InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
@@ -223,13 +227,19 @@ async def cb_activate_trial(call: CallbackQuery):
 async def cmd_subscription_menu(event):
     if isinstance(event, CallbackQuery):
         message = event.message
+        user_id = event.from_user.id
         await event.answer()
     else:
         message = event
+        user_id = message.from_user.id
+
+    is_adm = config.is_admin(user_id)
+    admin_banner = "👑 <i>Режим администратора: у вас уже включен полный доступ ко всем функциям без ограничений.</i>\n\n" if is_adm else ""
 
     text = (
         "💳 <b>ТАРИФНЫЕ ПЛАНЫ ПОДПИСКИ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{admin_banner}"
         "Подписка снимает ограничения, позволяет отслеживать больше категорий и получать новые объявления с Авито мгновенно.\n\n"
         "<b>Доступные тарифы на 1 месяц:</b>\n\n"
         "⚡️ <b>Тариф «Standart»</b> — <b>250 ₽ / мес</b>\n"
@@ -283,6 +293,14 @@ async def cb_select_tariff(call: CallbackQuery):
         }
     }
     selected = tariffs.get(tariff_key, tariffs["standart"])
+    is_adm = config.is_admin(call.from_user.id)
+
+    if is_adm:
+        info_note = "👑 <i>Вы являетесь администратором бота — для вас все функции и лимиты уже действуют бесплатно и бессрочно!</i>"
+        action_buttons = []
+    else:
+        info_note = "<i>💡 Автоматический шлюз онлайн-оплаты подключается. На данный момент активация происходит через администратора.</i>"
+        action_buttons = [[InlineKeyboardButton(text="👨‍💻 Написать админу для оплаты", url="https://t.me/vimerd")]]
 
     text = (
         "💳 <b>ОФОРМЛЕНИЕ ПОДПИСКИ</b>\n"
@@ -291,18 +309,14 @@ async def cb_select_tariff(call: CallbackQuery):
         f"Лимит радаров: <b>{selected['radars']} шт.</b>\n"
         f"Срок: <b>1 месяц (30 дней)</b>\n"
         f"Стоимость: <b>{selected['price']}</b>\n\n"
-        "<i>💡 Автоматический шлюз онлайн-оплаты подключается. На данный момент активация происходит через администратора.</i>"
+        f"{info_note}"
     )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="👨‍💻 Написать админу для оплаты", url="https://t.me/vimerd")
-        ],
-        [
-            InlineKeyboardButton(text="« Назад к тарифам", callback_data="open_subscription_menu"),
-            InlineKeyboardButton(text="👤 В профиль", callback_data="refresh_profile")
-        ]
-    ])
+    nav_buttons = [
+        InlineKeyboardButton(text="« Назад к тарифам", callback_data="open_subscription_menu"),
+        InlineKeyboardButton(text="👤 В профиль", callback_data="refresh_profile")
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=action_buttons + [nav_buttons])
 
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
