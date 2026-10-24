@@ -1,0 +1,16 @@
+[Unit]
+Description=Avito Parser Telegram Bot 24/7
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/avito_parser_bot
+ExecStart=/opt/avito_parser_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/avito_parser_bot/bot.log
+StandardError=append:/opt/avito_parser_bot/bot.log
+
+[Install]
+WantedBy=multi-user.target

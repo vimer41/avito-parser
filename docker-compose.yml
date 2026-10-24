@@ -1,0 +1,15 @@
+services:
+  avito-bot:
+    build: .
+    container_name: avito_parser_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./bot.log:/app/bot.log
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
