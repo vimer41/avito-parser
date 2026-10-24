@@ -59,6 +59,15 @@ class AvitoParser:
         )
         return session
 
+    def _init_session(self):
+        """Сброс и повторная инициализация сессии с чистыми куками."""
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = self._create_session()
+
+
     @staticmethod
     def normalize_url(raw_url: str) -> str:
         """
@@ -152,39 +161,49 @@ class AvitoParser:
 
     def fetch_page(self, url: str) -> Optional[str]:
         """
-        Загружает страницу Авито с автообходом защиты QRATOR / PoW.
+        Загружает страницу Авито с автообходом защиты QRATOR / PoW и обработкой таймаутов.
         """
-        try:
-            r = self.session.get(url, timeout=20)
-
-            # Если получили 403/429/439 или challenge
-            pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
-            if (r.status_code in (403, 429, 439) or "firewall-container" in r.text) and pow_challenge:
-                logger.info("Обнаружена PoW-защита Авито, решаем...")
-                if self._solve_pow_challenge(pow_challenge):
-                    time.sleep(0.5)
-                    r = self.session.get(url, timeout=20)
-                    logger.info(f"Повторный запрос после PoW: статус {r.status_code}")
-            elif r.status_code == 403:
-                # Если 403 и кука устарела, сбрасываем сессию
-                logger.info("Сброс сессии из-за 403...")
-                self._init_session()
-                time.sleep(1.0)
+        for attempt in range(2):
+            try:
                 r = self.session.get(url, timeout=20)
+
+                # Если получили 403/429/439 или challenge
                 pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
-                if pow_challenge:
-                    self._solve_pow_challenge(pow_challenge)
+                if (r.status_code in (403, 429, 439) or "firewall-container" in r.text) and pow_challenge:
+                    logger.info("Обнаружена PoW-защита Авито, решаем...")
+                    if self._solve_pow_challenge(pow_challenge):
+                        time.sleep(0.5)
+                        r = self.session.get(url, timeout=20)
+                        logger.info(f"Повторный запрос после PoW: статус {r.status_code}")
+                elif r.status_code == 403:
+                    # Если 403 и кука устарела, сбрасываем сессию
+                    logger.info("Сброс сессии из-за 403...")
+                    self._init_session()
+                    time.sleep(1.0)
                     r = self.session.get(url, timeout=20)
+                    pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
+                    if pow_challenge:
+                        self._solve_pow_challenge(pow_challenge)
+                        r = self.session.get(url, timeout=20)
 
-            if r.status_code == 200:
-                return r.text
-            else:
-                logger.warning(f"Не удалось получить страницу {url}, статус {r.status_code}")
+                if r.status_code == 200:
+                    return r.text
+                else:
+                    logger.warning(f"Не удалось получить страницу {url}, статус {r.status_code}")
+                    if attempt == 0 and r.status_code == 403:
+                        time.sleep(1.5)
+                        continue
+                    return None
+
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning(f"Сбой подключения к {url} ({e}), повтор через 2 сек...")
+                    time.sleep(2.0)
+                    self._init_session()
+                    continue
+                logger.error(f"Ошибка запроса к {url}: {e}")
                 return None
-
-        except Exception as e:
-            logger.error(f"Ошибка запроса к {url}: {e}")
-            return None
+        return None
 
     @staticmethod
     def extract_search_title(html: str, fallback_url: str) -> str:
