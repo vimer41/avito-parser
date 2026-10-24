@@ -152,32 +152,42 @@ async def send_ad_to_user(
     keyboard = build_notification_keyboard(it.url, search_id)
 
     try:
+        photo_file: Optional[BufferedInputFile] = None
         if it.image_url:
-            photo_to_send = it.image_url
             try:
-                img_resp = parser.session.get(it.image_url, timeout=10)
-                if img_resp.status_code == 200 and len(img_resp.content) > 200:
-                    photo_to_send = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
+                img_resp = await asyncio.to_thread(parser.session.get, it.image_url, timeout=8)
+                if img_resp.status_code == 200 and len(img_resp.content) > 500:
+                    photo_file = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
             except Exception as dl_err:
-                logger.debug(f"Не удалось предварительно скачать фото {it.image_url}: {dl_err}")
+                logger.debug(f"Не удалось скачать фото #{it.item_id}: {dl_err}")
 
-            await bot.send_photo(
-                chat_id=user_id,
-                photo=photo_to_send,
-                caption=caption,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-        else:
-            await bot.send_message(
-                chat_id=user_id,
-                text=caption,
-                reply_markup=keyboard,
-                parse_mode="HTML",
-                disable_web_page_preview=False
-            )
+        # Отправляем фото ТОЛЬКО если успешно скачали реальные байты в BufferedInputFile.
+        # Никогда не передаем сырой URL в Telegram, так как Telegram-сервер получит 403 от Avito CDN!
+        if photo_file:
+            try:
+                await bot.send_photo(
+                    chat_id=user_id,
+                    photo=photo_file,
+                    caption=caption,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+                logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО С ФОТО: #{it.item_id} «{it.title[:30]}...» ({it.price}) пользователю ID: {user_id}")
+                return True
+            except (TelegramForbiddenError, TelegramRetryAfter):
+                raise
+            except Exception as photo_send_err:
+                logger.warning(f"⚠️ [РАДАР #{search_id}] Сбой send_photo: {photo_send_err}, отправляем текстом...")
 
-        logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО: #{it.item_id} «{it.title[:30]}...» ({it.price}) пользователю ID: {user_id}")
+        # Фолбэк: если фото нет или байты не скачались
+        await bot.send_message(
+            chat_id=user_id,
+            text=caption,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
+        logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО ТЕКСТОМ: #{it.item_id} «{it.title[:30]}...» ({it.price}) пользователю ID: {user_id}")
         return True
 
     except TelegramForbiddenError:
@@ -189,23 +199,8 @@ async def send_ad_to_user(
         await asyncio.sleep(retry_err.retry_after + 1)
         return True
     except Exception as send_err:
-        logger.warning(f"⚠️ [РАДАР #{search_id}] Не удалось отправить фото {it.image_url}: {send_err}, пробуем текстом...")
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=caption,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-            logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО ТЕКСТОМ: #{it.item_id} пользователю ID: {user_id}")
-            return True
-        except TelegramForbiddenError:
-            logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{user_id} заблокировал бота. Отключаем его радары.")
-            await database.deactivate_user_searches(user_id)
-            return False
-        except Exception as msg_err:
-            logger.error(f"❌ [РАДАР #{search_id}] Не удалось отправить сообщение #{it.item_id}: {msg_err}")
-            return True
+        logger.error(f"❌ [РАДАР #{search_id}] Не удалось доставить лот #{it.item_id}: {send_err}")
+        return True
 
 
 async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radars_for_url: List[dict]):

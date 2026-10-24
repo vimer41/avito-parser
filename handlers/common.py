@@ -183,6 +183,11 @@ async def cmd_profile(event):
     if not is_adm and not sub_until and not trial_used:
         buttons.append([InlineKeyboardButton(text="🎁 Попробовать 24 часа бесплатно", callback_data="activate_trial_btn")])
 
+    # Кнопка подписки/тарифов для всех, кто не администратор
+    if not is_adm:
+        sub_btn_text = "💎 Продлить / Сменить тариф" if sub_until else "💳 Выбрать тариф (Подписка)"
+        buttons.append([InlineKeyboardButton(text=sub_btn_text, callback_data="open_subscription_menu")])
+
     buttons.append([
         InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
         InlineKeyboardButton(text=f"📁 Мои радары ({searches_count})", callback_data="list_searches")
@@ -211,6 +216,99 @@ async def cb_activate_trial(call: CallbackQuery):
         await cmd_profile(call)
     else:
         await call.answer(res["message"], show_alert=True)
+
+
+@router.message(Command("subscribe"))
+@router.callback_query(F.data == "open_subscription_menu")
+async def cmd_subscription_menu(event):
+    if isinstance(event, CallbackQuery):
+        message = event.message
+        await event.answer()
+    else:
+        message = event
+
+    text = (
+        "💳 <b>ТАРИФНЫЕ ПЛАНЫ ПОДПИСКИ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Подписка снимает ограничения, позволяет отслеживать больше категорий и получать новые объявления с Авито мгновенно.\n\n"
+        "<b>Доступные тарифы на 1 месяц:</b>\n\n"
+        "⚡️ <b>Тариф «Standart»</b> — <b>250 ₽ / мес</b>\n"
+        "├ 🎯 До <b>5</b> активных радаров\n"
+        "├ 📡 Мониторинг раз в 60 секунд\n"
+        "├ 📸 Доставка с реальными фото товара в HD\n"
+        "└ ⚡️ Быстрый отклик продавцу в 1 клик\n\n"
+        "🔥 <b>Тариф «PRO»</b> — <b>490 ₽ / мес</b>\n"
+        "├ 🎯 До <b>15</b> активных радаров\n"
+        "├ 🚀 Приоритетная очередь сканирования\n"
+        "├ 🛡 Фильтрация по стоп-словам\n"
+        "└ 👑 Персональная поддержка\n\n"
+        "Выберите тариф для подключения:"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⚡️ Standart (5 радаров) — 250 ₽", callback_data="buy_tariff:standart")
+        ],
+        [
+            InlineKeyboardButton(text="🔥 PRO (15 радаров) — 490 ₽", callback_data="buy_tariff:pro")
+        ],
+        [
+            InlineKeyboardButton(text="👤 Назад в профиль", callback_data="refresh_profile")
+        ]
+    ])
+
+    if isinstance(event, CallbackQuery):
+        try:
+            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("buy_tariff:"))
+async def cb_select_tariff(call: CallbackQuery):
+    tariff_key = call.data.split(":")[1]
+    tariffs = {
+        "standart": {
+            "name": "⚡️ Standart",
+            "radars": 5,
+            "price": "250 ₽"
+        },
+        "pro": {
+            "name": "🔥 PRO",
+            "radars": 15,
+            "price": "490 ₽"
+        }
+    }
+    selected = tariffs.get(tariff_key, tariffs["standart"])
+
+    text = (
+        "💳 <b>ОФОРМЛЕНИЕ ПОДПИСКИ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Тариф: <b>{selected['name']}</b>\n"
+        f"Лимит радаров: <b>{selected['radars']} шт.</b>\n"
+        f"Срок: <b>1 месяц (30 дней)</b>\n"
+        f"Стоимость: <b>{selected['price']}</b>\n\n"
+        "<i>💡 Автоматический шлюз онлайн-оплаты подключается. На данный момент активация происходит через администратора.</i>"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👨‍💻 Написать админу для оплаты", url="https://t.me/vimerd")
+        ],
+        [
+            InlineKeyboardButton(text="« Назад к тарифам", callback_data="open_subscription_menu"),
+            InlineKeyboardButton(text="👤 В профиль", callback_data="refresh_profile")
+        ]
+    ])
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
 
 
 
