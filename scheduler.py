@@ -91,6 +91,27 @@ def build_notification_keyboard(item_url: str, search_id: int) -> InlineKeyboard
     return kb
 
 
+def is_ad_fresh_enough(date_str: Optional[str]) -> bool:
+    """
+    Проверяет, действительно ли объявление свежее (опубликовано только что или считанные минуты назад).
+    Отсекает старые объявления ('1 час назад', '2 часа назад', 'вчера', календарные даты и т.д.).
+    """
+    if not date_str:
+        return True
+    d = date_str.lower().strip()
+    # Свежие маркеры публикации
+    if any(k in d for k in ["секунд", "только что"]):
+        return True
+    if "минут" in d:
+        m = re.search(r"(\d+)\s+минут", d)
+        if m:
+            mins = int(m.group(1))
+            return mins <= 10  # максимум 10 минут назад
+        return True
+    # Все остальное: "1 час назад", "2 часа назад", "вчера", "24 октября" и т.д. считаем старыми
+    return False
+
+
 def is_stop_word_matched(item: AvitoItem, stop_words: list) -> Optional[str]:
     """Проверяет, содержит ли объявление стоп-слово в названии или описании."""
     if not stop_words:
@@ -138,7 +159,13 @@ async def process_search(bot: Bot, parser: AvitoParser, search: dict):
 
         # Отправляем в правильном порядке (от менее свежих к самым свежим)
         for it in reversed(new_items):
-            # Проверяем стоп-слова
+            # 1. Проверяем свежесть: отправляем ТОЛЬКО лоты, выложенные после добавления поиска
+            if not is_ad_fresh_enough(it.date):
+                logger.info(f"Объявление {it.item_id} пропущено как старое (дата: '{it.date}')")
+                await database.mark_item_seen(search_id, it.item_id)
+                continue
+
+            # 2. Проверяем стоп-слова
             matched_stop = is_stop_word_matched(it, stop_words)
             if matched_stop:
                 logger.info(f"Объявление {it.item_id} пропущено по стоп-слову '{matched_stop}'")

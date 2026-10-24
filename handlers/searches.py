@@ -43,7 +43,7 @@ async def process_avito_url(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     # Проверяем, не на одно ли объявление ссылка
-    if "/item/" in raw_url:
+    if "/item/" in raw_url or re.search(r"_\d{8,}", raw_url):
         await message.answer(
             "⚠️ <b>Это ссылка на конкретное объявление, а не на поиск!</b>\n\n"
             "Чтобы бот мог отслеживать появление новых товаров, скопируйте ссылку со <b>страницы со списком объявлений</b> (с результатами поиска).",
