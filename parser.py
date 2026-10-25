@@ -106,6 +106,7 @@ class AvitoParser:
                 cookie_dict.pop("pow_challenge", None)
                 for k, v in cookie_dict.items():
                     self.session.cookies.set(k, str(v), domain=".avito.ru", path="/")
+                    self.session.cookies.set(k, str(v), domain="www.avito.ru", path="/")
                 logger.info(f"🍪 Загружено {len(cookie_dict)} сохранённых кук из {COOKIE_FILE.name}")
         except Exception as e:
             logger.warning(f"Ошибка загрузки кук из файла: {e}")
@@ -151,8 +152,15 @@ class AvitoParser:
 
         # Если 2 сбоя подряд — временный фолбэк на прямое соединение
         if self.proxy_fail_count >= 2:
-            logger.warning("🚨 Прокси недоступен 2 раза подряд! Включаем фолбэк на прямое подключение (без прокси).")
+            logger.warning("🚨 Прокси заблокирован Авито или недоступен! Включаем фолбэк на прямое подключение (без прокси).")
             self.current_proxy = None
+            self.proxy = None
+            AvitoParser._WORKING_PROXY_OVERRIDE = None
+            try:
+                if WORKING_PROXY_FILE.exists():
+                    WORKING_PROXY_FILE.unlink()
+            except Exception:
+                pass
             self._init_session(clear_cookies=False)
 
 
@@ -287,23 +295,19 @@ class AvitoParser:
                     logger.warning(f"🚫 Редирект на страницу блокировки: {r.url}")
 
                 # Если получили 403/429/439 или challenge
-                pow_challenge = r.cookies.get("pow_challenge") or self.session.cookies.get("pow_challenge")
-                if (r.status_code in (403, 429, 439) or "firewall-container" in r.text) and pow_challenge:
-                    logger.info("Обнаружена PoW-защита Авито, решаем...")
-                    if self._solve_pow_challenge(pow_challenge):
-                        time.sleep(1.0)
-                        r = self.session.get(url, timeout=20, allow_redirects=True)
-                        logger.info(f"Повторный запрос после PoW: статус {r.status_code}")
+                pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
+                if (r.status_code in (403, 429, 439) or "firewall-container" in r.text):
+                    if not pow_challenge:
+                        logger.info("Обновляем сессию и запрашиваем свежий PoW-челлендж через главную страницу avito.ru...")
+                        r_main = self.session.get("https://www.avito.ru", timeout=15, allow_redirects=True)
+                        pow_challenge = self.session.cookies.get("pow_challenge") or r_main.cookies.get("pow_challenge")
 
-                elif r.status_code in (403, 429):
-                    # Если получили 403/429 без челленджа, пробуем перепроверить сессию
-                    logger.info(f"Статус {r.status_code}, проверяем наличие PoW...")
-                    time.sleep(1.0)
-                    pow_challenge = r.cookies.get("pow_challenge") or self.session.cookies.get("pow_challenge")
                     if pow_challenge:
+                        logger.info("Обнаружена PoW-защита Авито, решаем...")
                         if self._solve_pow_challenge(pow_challenge):
                             time.sleep(1.0)
                             r = self.session.get(url, timeout=20, allow_redirects=True)
+                            logger.info(f"Повторный запрос после PoW: статус {r.status_code}")
 
                 if r.status_code == 200:
                     self.proxy_fail_count = 0  # Сбрасываем счетчик ошибок при успешном запросе
@@ -311,6 +315,8 @@ class AvitoParser:
                     return r.text
                 else:
                     logger.warning(f"Не удалось получить страницу {url}, статус {r.status_code}")
+                    if self.current_proxy and r.status_code in (403, 429):
+                        self._handle_proxy_error(Exception(f"Avito статус {r.status_code} на прокси"))
                     if attempt == 0 and r.status_code in (403, 429):
                         time.sleep(2.0)
                         continue
