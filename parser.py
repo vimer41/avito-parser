@@ -43,6 +43,10 @@ class AvitoItem:
     delivery: Optional[str] = None
     condition: Optional[str] = None
     timestamp: Optional[int] = None
+    is_reserved: bool = False
+    is_promotion: bool = False
+    views_total: Optional[int] = None
+    views_today: Optional[int] = None
 
 
 class AvitoParser:
@@ -287,6 +291,44 @@ class AvitoParser:
         except Exception as e:
             logger.warning(f"🌐 {human}: сетевая ошибка — {str(e)[:120]}")
             return None
+
+    def fetch_item_details(self, item_id: str | int) -> Optional[dict]:
+        """
+        Загружает карточку лота через легковесный эндпоинт Mobile API (m.avito.ru):
+        - точное количество просмотров (всего и за сегодня)
+        - полное развернутое описание лота
+        """
+        try:
+            url = f"https://m.avito.ru/api/1/card/items/{item_id}"
+            headers = {
+                "accept": "application/json, text/plain, */*",
+                "referer": "https://m.avito.ru/",
+                "user-agent": (
+                    "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Mobile Safari/537.36"
+                ),
+            }
+            r = self.session.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                payload = r.json()
+                if isinstance(payload, dict):
+                    mobile = payload.get("success", {}).get("mobile", {})
+                    stats = mobile.get("stats", {}) or {}
+                    views = stats.get("views", {}) or {}
+                    total_views = views.get("total")
+                    today_views = views.get("today")
+                    full_desc = mobile.get("description")
+                    return {
+                        "total_views": total_views,
+                        "today_views": today_views,
+                        "full_description": full_desc.strip() if isinstance(full_desc, str) else None,
+                    }
+            return None
+        except Exception as e:
+            logger.debug(f"Ошибка получения деталей лота {item_id}: {e}")
+            return None
+
 
     @staticmethod
     def extract_search_title(html: str, fallback_url: str) -> str:
@@ -598,6 +640,18 @@ class AvitoParser:
                     else:
                         date_info = f"{diff_sec // 3600} ч. назад"
 
+                # Резерв и Авито Доставка
+                is_reserved = bool(it.get("isReserved"))
+
+                # Продвижение (VAS / Promotion)
+                is_promotion = bool(it.get("isPromotion") or it.get("isReMapPromotion") or it.get("vip"))
+                if not is_promotion:
+                    for step in date_steps:
+                        vas = (step.get("payload") or {}).get("vas") or []
+                        if any(isinstance(v, dict) and (v.get("title") == "Продвинуто" or v.get("name") in ("vas", "xl", "highlight")) for v in vas):
+                            is_promotion = True
+                            break
+
                 results.append(AvitoItem(
                     item_id=item_id,
                     title=title,
@@ -611,7 +665,9 @@ class AvitoParser:
                     seller_name=seller_name,
                     delivery=delivery,
                     condition=None,
-                    timestamp=exact_ts
+                    timestamp=exact_ts,
+                    is_reserved=is_reserved,
+                    is_promotion=is_promotion
                 ))
 
             return results
@@ -720,6 +776,14 @@ class AvitoParser:
                 # 9. Доставка и состояние
                 delivery, condition = cls._extract_delivery_and_condition(it)
 
+                is_reserved = False
+                if it.find(string=re.compile(r"забронирован|в резерве", re.I)):
+                    is_reserved = True
+
+                is_promotion = False
+                if it.find(class_=lambda c: c and any(x in c for x in ["items-vip", "witcher", "vas", "promotion", "highlight"])):
+                    is_promotion = True
+
                 results.append(AvitoItem(
                     item_id=item_id,
                     title=title,
@@ -732,7 +796,9 @@ class AvitoParser:
                     seller=seller,
                     seller_name=seller_name,
                     delivery=delivery,
-                    condition=condition
+                    condition=condition,
+                    is_reserved=is_reserved,
+                    is_promotion=is_promotion
                 ))
 
             except Exception as e:

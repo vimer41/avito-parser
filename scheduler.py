@@ -70,8 +70,16 @@ def build_notification_text(item: AvitoItem, search_title: str) -> str:
     clean_price = html.escape(item.price)
     clean_search = search_title.replace("\xa0", " ").strip()
 
+    # Бейджи статуса объявления (резерв / продвижение)
+    badges = []
+    if getattr(item, "is_reserved", False):
+        badges.append("🔒 <b>В РЕЗЕРВЕ</b>")
+    if getattr(item, "is_promotion", False):
+        badges.append("⚡️ <b>ПРОДВИНУТО</b>")
+    badge_header = f" [{ ' · '.join(badges) }]" if badges else ""
+
     lines = [
-        "⚡️ <b>НОВЫЙ ЛОТ НА АВИТО</b>",
+        f"⚡️ <b>НОВЫЙ ЛОТ НА АВИТО</b>{badge_header}",
         f"🏷 <b>{clean_price}</b> · <b>{clean_title}</b>",
         "────────────────────"
     ]
@@ -94,6 +102,11 @@ def build_notification_text(item: AvitoItem, search_title: str) -> str:
     if details:
         lines.append(f"📦 <b>Детали:</b> {' · '.join(details)}")
 
+    # Просмотры (если подгружены)
+    if getattr(item, "views_total", None) is not None:
+        today_str = f" (+{item.views_today} сегодня)" if getattr(item, "views_today", None) is not None else ""
+        lines.append(f"👁 <b>Просмотры:</b> {item.views_total}{today_str}")
+
     # Продавец
     if item.seller:
         lines.append(f"👤 <b>Продавец:</b> {html.escape(item.seller)}")
@@ -101,6 +114,7 @@ def build_notification_text(item: AvitoItem, search_title: str) -> str:
     # Время
     if item.date:
         lines.append(f"🕒 <b>Опубликовано:</b> {html.escape(item.date)}")
+
 
     # Описание
     if item.description:

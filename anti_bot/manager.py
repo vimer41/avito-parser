@@ -61,6 +61,8 @@ GEETEST_BASE_URL = "https://gcaptcha4.geevisit.com"
 GEETEST_CAPTCHA_ID = "2d9c743cf7d63dbc9db578a608196bcd"
 
 GEEKED_TEST_ROOT = Path(__file__).resolve().parent / "GeekedTest"
+if str(GEEKED_TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(GEEKED_TEST_ROOT))
 
 
 def get_browser_user_agent() -> str:
