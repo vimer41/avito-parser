@@ -45,7 +45,7 @@ async def init_db():
             pass
 
         try:
-            await db.execute("ALTER TABLE searches ADD COLUMN min_discount_percent INTEGER DEFAULT 5;")
+            await db.execute("ALTER TABLE searches ADD COLUMN min_discount_percent INTEGER DEFAULT 0;")
         except Exception:
             pass
 
@@ -68,7 +68,7 @@ async def init_db():
                 stop_words TEXT DEFAULT '[]',
                 template TEXT,
                 is_active INTEGER DEFAULT 1,
-                min_discount_percent INTEGER DEFAULT 5,
+                min_discount_percent INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
             );

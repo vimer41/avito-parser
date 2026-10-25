@@ -7,8 +7,9 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
+import config
 import database
-from config import MAX_SEARCHES_PER_USER
+from config import MAX_SEARCHES_PER_USER, ADMIN_IDS
 from parser import AvitoParser
 from logger_setup import log_user_event
 
@@ -19,6 +20,7 @@ router = Router()
 class SearchStates(StatesGroup):
     waiting_for_url = State()
     waiting_for_stop_word = State()
+    waiting_for_custom_discount = State()
 
 
 # ── Добавление радара ──────────────────────────────────────────────────
@@ -237,14 +239,18 @@ async def show_searches(event, state: FSMContext):
         is_active = bool(s["is_active"])
         status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
         stops_count = len(s["stop_words"])
-        disc_val = s.get("min_discount_percent") if s.get("min_discount_percent") is not None else 5
-        disc_str = f"-{disc_val}%" if disc_val > 0 else "Выкл"
-        disc_btn_label = f"📉 Скидки: {disc_str} 💎"
+        disc_val = s.get("min_discount_percent") or 0
+        if disc_val > 0:
+            disc_info = f"<b>-{disc_val}%</b> 🟢"
+            disc_btn_label = f"📉 Алерт на скидки: от -{disc_val}% 💎 ⚙️"
+        else:
+            disc_info = "<code>Выключено</code> ⚪️"
+            disc_btn_label = "📉 Отслеживать скидки продавцов 💎"
 
         card_text = (
             f"╭─ 🎯 <b>Радар #{i}: {title}</b>\n"
             f"│ 📡 <b>Статус:</b> {status_icon}\n"
-            f"│ 📉 <b>Алерт на скидку:</b> <code>{disc_str}</code> 💎\n"
+            f"│ 📉 <b>Скидки:</b> {disc_info}\n"
             f"╰ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>"
         )
 
@@ -252,14 +258,14 @@ async def show_searches(event, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{s_id}"),
+                InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{s_id}")
+            ],
+            [
                 InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{s_id}")
             ],
             [
-                InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{s_id}"),
+                InlineKeyboardButton(text="↗️ Открыть на Авито", url=s["url"]),
                 InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{s_id}")
-            ],
-            [
-                InlineKeyboardButton(text="↗️ Открыть выдачу на Авито", url=s["url"])
             ]
         ])
 
@@ -290,14 +296,18 @@ async def cb_toggle_search(call: CallbackQuery):
     is_active = bool(s["is_active"])
     status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
     stops_count = len(s["stop_words"])
-    disc_val = s.get("min_discount_percent") if s.get("min_discount_percent") is not None else 5
-    disc_str = f"-{disc_val}%" if disc_val > 0 else "Выкл"
-    disc_btn_label = f"📉 Скидки: {disc_str} 💎"
+    disc_val = s.get("min_discount_percent") or 0
+    if disc_val > 0:
+        disc_info = f"<b>-{disc_val}%</b> 🟢"
+        disc_btn_label = f"📉 Алерт на скидки: от -{disc_val}% 💎 ⚙️"
+    else:
+        disc_info = "<code>Выключено</code> ⚪️"
+        disc_btn_label = "📉 Отслеживать скидки продавцов 💎"
 
     card_text = (
         f"╭─ 🎯 <b>Радар: {title}</b>\n"
         f"│ 📡 <b>Статус:</b> {status_icon}\n"
-        f"│ 📉 <b>Алерт на скидку:</b> <code>{disc_str}</code> 💎\n"
+        f"│ 📉 <b>Скидки:</b> {disc_info}\n"
         f"╰ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>"
     )
 
@@ -305,14 +315,14 @@ async def cb_toggle_search(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{search_id}"),
+            InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}")
+        ],
+        [
             InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{search_id}")
         ],
         [
-            InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}"),
+            InlineKeyboardButton(text="↗️ Открыть на Авито", url=s["url"]),
             InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{search_id}")
-        ],
-        [
-            InlineKeyboardButton(text="↗️ Открыть выдачу на Авито", url=s["url"])
         ]
     ])
 
@@ -344,7 +354,7 @@ async def cb_set_discount_menu(call: CallbackQuery):
         await call.answer("Радар не найден", show_alert=True)
         return
 
-    cur_disc = s.get("min_discount_percent") if s.get("min_discount_percent") is not None else 5
+    cur_disc = s.get("min_discount_percent") or 0
     cur_label = f"-{cur_disc}%" if cur_disc > 0 else "Выключено"
 
     text = (
@@ -352,13 +362,13 @@ async def cb_set_discount_menu(call: CallbackQuery):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Радар: <b>{html.escape(s['title'])}</b>\n"
         f"Текущий порог: <b>{cur_label}</b>\n\n"
-        f"Выберите, от какого процента снижения цены присылать мгновенное уведомление в Telegram:\n"
-        f"<i>(Если продавец скинет цену на этот процент или более — бот сразу пришлёт алерт)</i>"
+        f"Выберите процент скидки для мгновенного уведомления или введите свой собственный:\n"
+        f"<i>(Как только продавец скинет цену на этот процент или более — бот сразу пришлёт пуш)</i>"
     )
 
     options = [
         ("5%", 5), ("10%", 10), ("15%", 15),
-        ("20%", 20), ("30%", 30), ("❌ Выключить", 0)
+        ("20%", 20), ("30%", 30), ("50%", 50)
     ]
     buttons = []
     row = []
@@ -371,6 +381,8 @@ async def cb_set_discount_menu(call: CallbackQuery):
     if row:
         buttons.append(row)
 
+    buttons.append([InlineKeyboardButton(text="✏️ Ввести свой процент...", callback_data=f"custom_discount:{search_id}")])
+    buttons.append([InlineKeyboardButton(text="❌ Отключить отслеживание", callback_data=f"save_discount:{search_id}:0")])
     buttons.append([InlineKeyboardButton(text="« Назад к радарам", callback_data="list_searches")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -389,10 +401,78 @@ async def cb_save_discount(call: CallbackQuery):
     user_id = call.from_user.id
 
     await database.update_search_discount_percent(search_id, user_id, val)
-    status_text = f"скидки от -{val}%" if val > 0 else "скидки выключены"
+    status_text = f"скидки от -{val}%" if val > 0 else "отслеживание скидок отключено"
     log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Настройка скидки", f"Радар #{search_id} -> {status_text}", status="OK")
     await call.answer(f"✅ Сохранено: {status_text}!")
     await show_searches(call)
+
+
+@router.callback_query(F.data.startswith("custom_discount:"))
+async def cb_prompt_custom_discount(call: CallbackQuery, state: FSMContext):
+    search_id = int(call.data.split(":")[1])
+    await state.set_state(SearchStates.waiting_for_custom_discount)
+    await state.update_data(discount_search_id=search_id)
+
+    text = (
+        "✍️ <b>ВВЕДИТЕ ЖЕЛАЕМЫЙ ПРОЦЕНТ СКИДКИ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Отправьте в чат число от <b>1</b> до <b>99</b> "
+        "(например: <code>7</code>, <code>12</code>, <code>25</code> или <code>40</code>).\n\n"
+        "<i>Бот пришлёт уведомление, как только продавец скинет цену на указанный процент!</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="list_searches")]
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@router.message(SearchStates.waiting_for_custom_discount)
+async def process_custom_discount_input(message: Message, state: FSMContext):
+    raw_val = message.text.strip().replace("%", "")
+    menu_buttons = {
+        "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
+        "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
+        "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
+        "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
+        "📖 Инструкция", "❓ Помощь", "Инструкция",
+        "👑 Админ-панель", "👑 Админка",
+        "❌ Отмена", "Отмена"
+    }
+    if message.text.strip() in menu_buttons or message.text.strip().startswith("/"):
+        await state.clear()
+        if message.text.strip() in {"📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары"}:
+            return await show_searches(message, state)
+        return
+
+    if not raw_val.isdigit():
+        await message.answer(
+            "⚠️ <b>Пожалуйста, введите целое число от 1 до 99</b> (например: <code>7</code> или <code>15</code>):",
+            parse_mode="HTML"
+        )
+        return
+
+    percent = int(raw_val)
+    if percent < 1 or percent > 99:
+        await message.answer(
+            "⚠️ <b>Процент должен быть в диапазоне от 1% до 99%!</b> Попробуйте ещё раз:",
+            parse_mode="HTML"
+        )
+        return
+
+    data = await state.get_data()
+    search_id = data.get("discount_search_id")
+    await state.clear()
+
+    if search_id:
+        await database.update_search_discount_percent(search_id, message.from_user.id, percent)
+        log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Настройка скидки", f"Радар #{search_id} -> свой порог: {percent}%", status="OK")
+        await message.answer(f"✅ <b>Отлично! Алерт установлен на снижение цены от -{percent}%!</b>", parse_mode="HTML")
+
+    await show_searches(message, state)
 
 
 # ── Удаление поиска ────────────────────────────────────────────────────

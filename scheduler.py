@@ -125,6 +125,11 @@ def build_notification_text(
     if details:
         lines.append(f"📦 <b>Детали:</b> {' · '.join(details)}")
 
+    # Преимущества и бейджи (Скидка на доставку, 14 дней на возврат, Торг и т.д.)
+    if getattr(item, "badges", None):
+        clean_badges = [html.escape(b) for b in item.badges[:3]]
+        lines.append(f"🛡 <b>Преимущества:</b> {' · '.join(clean_badges)}")
+
     # Просмотры (если подгружены)
     if getattr(item, "views_total", None) is not None:
         today_str = f" (+{item.views_today} сегодня)" if getattr(item, "views_today", None) is not None else ""

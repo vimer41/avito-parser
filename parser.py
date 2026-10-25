@@ -51,6 +51,7 @@ class AvitoItem:
     was_lowered: bool = False
     string_without_discount: Optional[str] = None
     discount_percent: Optional[int] = None
+    badges: Optional[List[str]] = None
 
 
 class AvitoParser:
@@ -686,6 +687,34 @@ class AvitoParser:
                             is_promotion = True
                             break
 
+                # Преимущества и бейджи (скидка на доставку, 14 дней на возврат, торг и т.д.)
+                badges_list = []
+                raw_badges = it.get("badges") or []
+                if isinstance(raw_badges, list):
+                    for b in raw_badges:
+                        if isinstance(b, dict):
+                            t = b.get("title") or b.get("text") or b.get("description")
+                            if t and isinstance(t, str) and t.strip():
+                                badges_list.append(t.strip())
+                        elif isinstance(b, str) and b.strip():
+                            badges_list.append(b.strip())
+
+                for step in (iva.get("BadgeStep") or []):
+                    payload = step.get("payload") or {}
+                    t = payload.get("text") or payload.get("title")
+                    if t and t not in badges_list:
+                        badges_list.append(t)
+
+                for step in (iva.get("TrustStep") or []):
+                    payload = step.get("payload") or {}
+                    t = payload.get("text") or payload.get("title")
+                    if t and t not in badges_list:
+                        badges_list.append(t)
+
+                if it.get("hasBargain") or it.get("bargain"):
+                    if "Торг уместен" not in badges_list:
+                        badges_list.append("Торг уместен")
+
                 results.append(AvitoItem(
                     item_id=item_id,
                     title=title,
@@ -705,7 +734,8 @@ class AvitoParser:
                     raw_price=raw_price,
                     was_lowered=was_lowered,
                     string_without_discount=string_without_discount,
-                    discount_percent=discount_percent
+                    discount_percent=discount_percent,
+                    badges=badges_list if badges_list else None
                 ))
 
             return results
