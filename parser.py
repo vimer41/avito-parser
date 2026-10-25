@@ -520,11 +520,11 @@ class AvitoParser:
             candidates: List[str] = []
 
             # Быстрый путь: блок состояния страницы всегда начинается с {"i18n" внутри <script>
-            start = html.find('>{"i18n"')
+            start = html.find('{"i18n"')
             if start != -1:
                 end = html.find("</script>", start)
                 if end != -1:
-                    candidates.append(html[start + 1:end])
+                    candidates.append(html[start:end])
 
             # Запасной путь: перебор всех script-тегов
             if not candidates:
@@ -611,7 +611,7 @@ class AvitoParser:
                 description = None
                 desc_steps = iva.get("DescriptionStep") or []
                 if desc_steps and isinstance(desc_steps, list):
-                    description = desc_steps[0].get("payload", {}).get("description")
+                    description = (desc_steps[0].get("payload") or {}).get("description")
 
                 # Продавец и рейтинг
                 seller = None
@@ -620,7 +620,7 @@ class AvitoParser:
                 for step in user_steps:
                     payload = step.get("payload") or {}
                     if "profile" in payload:
-                        prof_title = payload.get("profile", {}).get("title")
+                        prof_title = (payload.get("profile") or {}).get("title")
                         if prof_title:
                             seller_name = prof_title.strip()
                         rating_data = payload.get("rating") or {}
@@ -645,45 +645,50 @@ class AvitoParser:
                 # Доставка
                 delivery = None
                 for step in iva.get("GeoStep") or []:
-                    if step.get("componentData", {}).get("component") == "delivery":
-                        deliv_text = step.get("payload", {}).get("text")
+                    if (step.get("componentData") or {}).get("component") == "delivery":
+                        deliv_text = (step.get("payload") or {}).get("text")
                         if deliv_text:
                             delivery = f"Авито {deliv_text}" if not deliv_text.lower().startswith("авито") else deliv_text
                         break
                 if not delivery:
                     for step in iva.get("PriceStep") or []:
-                        if step.get("componentData", {}).get("component") == "delivery":
+                        if (step.get("componentData") or {}).get("component") == "delivery":
                             delivery = "Авито Доставка"
                             break
 
                 # Адрес (выбираем максимально подробный адрес: улица, метро, город)
                 address = None
-                if it.get("geo", {}).get("formattedAddress"):
-                    address = it["geo"]["formattedAddress"]
-                elif it.get("coords", {}).get("address_user"):
-                    address = it["coords"]["address_user"]
-                elif (it.get("addressDetailed") or {}).get("locationName"):
-                    address = it["addressDetailed"]["locationName"]
-                elif it.get("location", {}).get("name"):
-                    address = it["location"]["name"]
-                elif it.get("gallery", {}).get("imageAlt"):
-                    alt = it["gallery"]["imageAlt"]
-                    if "," in alt:
+                geo = it.get("geo") or {}
+                coords = it.get("coords") or {}
+                addr_det = it.get("addressDetailed") or {}
+                loc = it.get("location") or {}
+                gallery = it.get("gallery") or {}
+                if geo.get("formattedAddress"):
+                    address = geo["formattedAddress"]
+                elif coords.get("address_user"):
+                    address = coords["address_user"]
+                elif addr_det.get("locationName"):
+                    address = addr_det["locationName"]
+                elif loc.get("name"):
+                    address = loc["name"]
+                elif gallery.get("imageAlt"):
+                    alt = gallery["imageAlt"]
+                    if alt and "," in alt:
                         address = alt.split(",")[-1].strip()
 
-                # Дата в читаемом виде
+                # Дата в читаемом виде: ПРИОРИТЕТ ТОЧНОМУ TIMESTAMP!
                 date_info = "Только что"
                 date_steps = iva.get("DateInfoStep") or []
-                if date_steps:
-                    date_info = date_steps[0].get("payload", {}).get("relative") or "Только что"
-                elif exact_ts:
-                    diff_sec = int(time.time() - exact_ts)
+                if exact_ts:
+                    diff_sec = max(0, int(time.time() - exact_ts))
                     if diff_sec < 60:
                         date_info = f"{diff_sec} сек. назад"
                     elif diff_sec < 3600:
                         date_info = f"{diff_sec // 60} мин. назад"
                     else:
                         date_info = f"{diff_sec // 3600} ч. назад"
+                elif date_steps:
+                    date_info = (date_steps[0].get("payload") or {}).get("relative") or "Только что"
 
                 # Резерв и Авито Доставка
                 is_reserved = bool(it.get("isReserved"))
