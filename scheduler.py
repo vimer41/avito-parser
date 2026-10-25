@@ -94,7 +94,9 @@ async def get_item_lock(item_id: str) -> asyncio.Lock:
         lock = ITEM_LOCKS.get(item_id)
         if lock is None:
             if len(ITEM_LOCKS) >= 3000:
-                for k in list(ITEM_LOCKS.keys())[:1000]:
+                # Безопасная ротация: удаляем только неактивные (разблокированные) локи
+                unlocked_keys = [k for k, l in ITEM_LOCKS.items() if not l.locked()]
+                for k in unlocked_keys[:1000]:
                     ITEM_LOCKS.pop(k, None)
             lock = asyncio.Lock()
             ITEM_LOCKS[item_id] = lock
@@ -603,6 +605,11 @@ async def process_url_group(
             radar_id = radar["id"]
             user_id = radar["user_id"]
             search_title = radar["title"]
+
+            # 🛡 Защита от фантомного спама: проверяем, что радар не был удален во время скачивания
+            if not await database.is_search_active(radar_id):
+                continue
+
             stop_words = radar.get("stop_words", [])
             user_str = get_user_display_name(radar)
             source_tag = f"{fetch_ms} мс" if idx == 0 else "⚡ кэш запроса"
@@ -967,7 +974,9 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
                         if old_url not in existing_keys:
                             url_next_check.pop(old_url, None)
                             url_intervals.pop(old_url, None)
-                            in_flight_urls.discard(old_url)
+                            # Примечание: in_flight_urls.discard(old_url) НЕ вызывается здесь,
+                            # чтобы избежать race condition при повторном добавлении того же URL,
+                            # пока воркер еще выполняет сетевой запрос. Флаг снимает только сам воркер!
 
                     url_radars_map.clear()
                     url_radars_map.update(new_groups)
@@ -1038,18 +1047,22 @@ async def notification_worker(bot: Bot, parser: AvitoParser, worker_id: int = 1)
         try:
             task: NotificationTask = await NOTIFICATION_QUEUE.get()
             try:
-                await send_ad_to_user(
-                    bot=bot,
-                    parser=parser,
-                    user_id=task.user_id,
-                    search_id=task.radar_id,
-                    search_title=task.search_title,
-                    it=task.item,
-                    user_label=task.user_label,
-                    is_price_drop=task.is_price_drop,
-                    old_price=task.old_price,
-                    drop_percent=task.drop_percent
-                )
+                # 🛡 Контрольная проверка: если радар был удален пока задача стояла в Outbox очереди
+                if not await database.is_search_active(task.radar_id):
+                    logger.debug(f"[Outbox #{worker_id}] Радар #{task.radar_id} удален, отмена отправки лота #{task.item.item_id}")
+                else:
+                    await send_ad_to_user(
+                        bot=bot,
+                        parser=parser,
+                        user_id=task.user_id,
+                        search_id=task.radar_id,
+                        search_title=task.search_title,
+                        it=task.item,
+                        user_label=task.user_label,
+                        is_price_drop=task.is_price_drop,
+                        old_price=task.old_price,
+                        drop_percent=task.drop_percent
+                    )
             except TelegramForbiddenError:
                 logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{task.user_id} заблокировал бота. Отключаем его радары.")
                 await database.deactivate_user_searches(task.user_id)

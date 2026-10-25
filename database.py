@@ -337,12 +337,26 @@ async def toggle_search_active(search_id: int, user_id: int) -> Optional[bool]:
         return bool(new_status)
 
 
+async def is_search_active(search_id: int) -> bool:
+    """Проверяет, существует ли радар и активен ли он в базе данных."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM searches WHERE id = ? AND is_active = 1", (search_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
+
+
 async def delete_search(search_id: int, user_id: int) -> bool:
+    """
+    Удаляет радар пользователя и связанные просмотренные лоты.
+    Удаление seen_items выполняется ТОЛЬКО если радар действительно принадлежал пользователю.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("DELETE FROM searches WHERE id = ? AND user_id = ?", (search_id, user_id))
-        await db.execute("DELETE FROM seen_items WHERE search_id = ?", (search_id,))
-        await db.commit()
-        return cursor.rowcount > 0
+        if cursor.rowcount > 0:
+            await db.execute("DELETE FROM seen_items WHERE search_id = ?", (search_id,))
+            await db.commit()
+            return True
+        return False
 
 
 async def add_stop_word_to_search(search_id: int, word: str) -> bool:
@@ -564,7 +578,7 @@ async def update_search_discount_percent(search_id: int, user_id: int, percent: 
 async def cleanup_old_seen_items(days: int = 5) -> int:
     """
     Очистка старых объявлений из БД для оптимизации памяти и размера базы.
-    Удаляет записи старше указанного количества дней и сжимает базу.
+    Удаляет записи старше указанного количества дней и сиротские записи удаленных радаров, сжимает базу.
     """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -573,10 +587,18 @@ async def cleanup_old_seen_items(days: int = 5) -> int:
                 (days,)
             )
             deleted_count = cursor.rowcount
+
+            # Очищаем возможные сиротские записи от удаленных радаров
+            orphan_cursor = await db.execute(
+                "DELETE FROM seen_items WHERE search_id NOT IN (SELECT id FROM searches)"
+            )
+            orphans_deleted = orphan_cursor.rowcount
+            deleted_count += orphans_deleted
+
             await db.commit()
             if deleted_count > 0:
                 await db.execute("PRAGMA incremental_vacuum;")
-                logger.info(f"Очистка БД: удалено {deleted_count} устаревших записей seen_items")
+                logger.info(f"Очистка БД: удалено {deleted_count} записей seen_items (из них сирот: {orphans_deleted})")
             return deleted_count
     except Exception as e:
         logger.error(f"Ошибка при очистке устаревших записей БД: {e}")

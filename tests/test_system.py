@@ -119,6 +119,72 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(searches_after), 0)
 
 
+    async def test_radar_deletion_atomicity_and_active_check(self):
+        """Проверка атомарности delete_search и метода is_search_active."""
+        user1 = 1001
+        user2 = 1002
+        await database.get_or_create_user(user1, "u1", "User One")
+        await database.get_or_create_user(user2, "u2", "User Two")
+
+        search1_id = await database.add_search(user1, "PlayStation 5", "https://avito.ru/ps5", 0)
+        self.assertTrue(await database.is_search_active(search1_id))
+
+        # Добавляем лоты в seen_items для search1
+        await database.mark_items_seen_bulk(search1_id, [("item_1", 30000), ("item_2", 35000)])
+        seen_before = await database.get_seen_items_with_prices(search1_id)
+        self.assertEqual(len(seen_before), 2)
+
+        # Попытка чужого пользователя (user2) удалить радар user1: должно вернуть False и НЕ трогать seen_items
+        deleted_by_other = await database.delete_search(search1_id, user2)
+        self.assertFalse(deleted_by_other)
+        seen_after_attempt = await database.get_seen_items_with_prices(search1_id)
+        self.assertEqual(len(seen_after_attempt), 2)
+        self.assertTrue(await database.is_search_active(search1_id))
+
+        # Удаление владельцем (user1): должно вернуть True, стереть радар и его seen_items
+        deleted_by_owner = await database.delete_search(search1_id, user1)
+        self.assertTrue(deleted_by_owner)
+        self.assertFalse(await database.is_search_active(search1_id))
+        seen_after_delete = await database.get_seen_items_with_prices(search1_id)
+        self.assertEqual(len(seen_after_delete), 0)
+
+    async def test_cleanup_orphaned_seen_items(self):
+        """Проверка очистки сиротских записей seen_items при отсутствии радара."""
+        # Вставляем искусственные сиротские записи для несуществующего search_id = 99999
+        await database.mark_items_seen_bulk(99999, [("orphan_1", 1000), ("orphan_2", 2000)])
+        orphans_before = await database.get_seen_items_with_prices(99999)
+        self.assertEqual(len(orphans_before), 2)
+
+        # Вызываем регулярную очистку БД
+        deleted_total = await database.cleanup_old_seen_items(days=5)
+        self.assertGreaterEqual(deleted_total, 2)
+
+        # Сироты должны быть удалены
+        orphans_after = await database.get_seen_items_with_prices(99999)
+        self.assertEqual(len(orphans_after), 0)
+
+    async def test_item_lock_rotation_preserves_locked(self):
+        """Проверка, что ротация ITEM_LOCKS не удаляет активные (захваченные) мьютексы."""
+        from scheduler import ITEM_LOCKS, get_item_lock
+
+        # Создаем лок и захватываем его
+        held_lock = await get_item_lock("active_item_in_progress")
+        await held_lock.acquire()
+        self.assertTrue(held_lock.locked())
+
+        try:
+            # Заполняем словарь фейковыми локами до лимита 3000
+            for i in range(3005):
+                await get_item_lock(f"idle_item_{i}")
+
+            # Проверяем, что активный лок остался на месте и не был перезаписан
+            same_held_lock = await get_item_lock("active_item_in_progress")
+            self.assertIs(same_held_lock, held_lock)
+            self.assertTrue(same_held_lock.locked())
+        finally:
+            held_lock.release()
+
+
 if __name__ == "__main__":
     unittest.main()
 
