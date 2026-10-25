@@ -10,6 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 import database
 from config import MAX_SEARCHES_PER_USER
 from parser import AvitoParser
+from logger_setup import log_user_event
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -86,6 +87,7 @@ async def process_avito_url(message: Message, state: FSMContext):
 
     # Проверяем, что ссылка действительно с avito.ru
     if "avito.ru" not in raw_url.lower():
+        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка: ссылка не с avito.ru («{raw_url[:80]}»)", status="WARN")
         await message.answer(
             "⚠️ <b>Ссылка должна быть с сайта avito.ru!</b>\n\n"
             "Пример корректной ссылки:\n"
@@ -101,6 +103,7 @@ async def process_avito_url(message: Message, state: FSMContext):
 
     # Проверяем, не на одно ли объявление ссылка
     if "/item/" in raw_url or re.search(r"_\d{8,}", raw_url):
+        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", "Ошибка: ссылка на объявление (/item/), а не на поиск", status="WARN")
         await message.answer(
             "⚠️ <b>Это ссылка на конкретное объявление, а не на каталог!</b>\n\n"
             "Чтобы радар ловил все новые предложения, отправьте ссылку со <b>страницы поиска / каталога</b>.",
@@ -111,6 +114,7 @@ async def process_avito_url(message: Message, state: FSMContext):
     # Проверяем лимит поисков
     current_count = await database.count_user_searches(user_id)
     if current_count >= MAX_SEARCHES_PER_USER:
+        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка: лимит {MAX_SEARCHES_PER_USER} исчерпан", status="WARN")
         await message.answer(
             f"⚠️ <b>Достигнут лимит радаров ({MAX_SEARCHES_PER_USER})!</b>\n\n"
             "Удалите ненужный радар в меню <b>📁 Мои радары</b>, чтобы освободить слот.",
@@ -123,6 +127,7 @@ async def process_avito_url(message: Message, state: FSMContext):
     try:
         normalized_url = AvitoParser.normalize_url(raw_url)
     except Exception as e:
+        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка синтаксиса ссылки: {e}", status="WARN")
         await message.answer(f"❌ Ошибка в ссылке: {e}\nУбедитесь, что ссылка ведёт на avito.ru.")
         return
 
@@ -136,6 +141,7 @@ async def process_avito_url(message: Message, state: FSMContext):
     html_content = await asyncio.to_thread(parser.fetch_page, normalized_url)
 
     if not html_content:
+        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Калибровка радара", f"Ошибка: Авито не вернул HTML («{normalized_url[:80]}»)", status="ERROR")
         await status_msg.edit_text(
             "❌ <b>Не удалось подключиться к странице Авито.</b>\n\n"
             "Возможно, ссылка недействительна или сработала защита сайта. Попробуйте еще раз через минуту.",
@@ -154,6 +160,7 @@ async def process_avito_url(message: Message, state: FSMContext):
     if item_ids:
         await database.mark_items_seen_bulk(search_id, item_ids)
 
+    log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Радар создан", f"Радар #{search_id} «{search_title}» (лотов: {len(items)})", status="OK")
     logger.info(f"🎯 [РАДАР] Пользователь ID:{user_id} создал радар #{search_id}: «{search_title}» ({len(items)} базовых лотов проиндексировано)")
 
     await state.clear()
@@ -263,6 +270,7 @@ async def cb_toggle_search(call: CallbackQuery):
         return
 
     status_str = "возобновлён 🟢" if new_status else "приостановлен ⏸"
+    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Статус радара", f"Радар #{search_id} -> {status_str}", status="OK")
     logger.info(f"⏯ [РАДАР] Пользователь ID:{call.from_user.id} переключил статус радара #{search_id} -> {status_str}")
     await call.answer(f"Радар {status_str}!")
 
@@ -324,6 +332,7 @@ async def cb_delete_search(call: CallbackQuery):
 async def cb_confirm_delete(call: CallbackQuery):
     search_id = int(call.data.split(":")[1])
     await database.delete_search(search_id, call.from_user.id)
+    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Удаление радара", f"Удален радар #{search_id}", status="OK")
     logger.info(f"🗑 [РАДАР] Пользователь ID:{call.from_user.id} удалил радар #{search_id}")
     await call.message.edit_text("🗑 <b>Радар успешно удалён!</b>", parse_mode="HTML")
     await call.answer("Удалено")
@@ -462,6 +471,7 @@ async def process_stop_word_input(message: Message, state: FSMContext):
             added.append(w)
 
     await state.clear()
+    log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Добавление стоп-слов", f"Добавлены слова: {added} к радару #{search_id}", status="OK")
     logger.info(f"🛡 [СТОП-СЛОВА] Пользователь ID:{message.from_user.id} добавил к радару #{search_id}: {added}")
 
     added_str = ", ".join(f"«{html.escape(w)}»" for w in added)
@@ -483,6 +493,7 @@ async def cb_remove_stop_word(call: CallbackQuery):
     word = parts[2]
 
     await database.remove_stop_word_from_search(search_id, word)
+    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Удаление стоп-слова", f"Удалено «{word}» из радара #{search_id}", status="OK")
     logger.info(f"🛡 [СТОП-СЛОВА] Пользователь ID:{call.from_user.id} удалил «{word}» из радара #{search_id}")
     await call.answer(f"Слово «{word}» удалено")
     await cb_manage_stops(call)

@@ -7,11 +7,19 @@ from aiogram.types import TelegramObject, Message, CallbackQuery, InlineKeyboard
 import config
 import database
 
+from logger_setup import log_user_event
+
 logger = logging.getLogger(__name__)
 
 
 class ActionLoggingMiddleware(BaseMiddleware):
-    """Логирует каждое действие пользователя (сообщения, команды, нажатия на инлайн-кнопки)."""
+    """
+    Детально логирует каждое действие пользователя в logs/user_actions.log:
+    - Текстовые сообщения и команды
+    - Нажатия на инлайн-кнопки
+    - Текущее состояние FSM-машины (на каком этапе находился пользователь)
+    - Ошибки выполнения хэндлеров для данного пользователя
+    """
     async def __call__(
         self,
         handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
@@ -19,14 +27,49 @@ class ActionLoggingMiddleware(BaseMiddleware):
         data: Dict[str, Any]
     ) -> Any:
         user = data.get("event_from_user")
-        user_info = f"ID: {user.id} (@{user.username or 'нет'}, {user.first_name or ''})" if user else "ID: Unknown"
+        if not user:
+            return await handler(event, data)
+
+        state = data.get("state")
+        current_state = None
+        if state:
+            try:
+                current_state = await state.get_state()
+            except Exception:
+                pass
 
         if isinstance(event, Message) and event.text:
-            logger.info(f"👤 [USER] {user_info} ──▶ Сообщение: «{event.text}»")
+            log_user_event(
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                action=f"Сообщение: «{event.text[:100]}»",
+                status="MSG",
+                fsm_state=current_state
+            )
         elif isinstance(event, CallbackQuery) and event.data:
-            logger.info(f"🔘 [КНОПКА] {user_info} ──▶ Нажата инлайн-кнопка: «{event.data}»")
+            log_user_event(
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                action=f"Нажата кнопка: «{event.data}»",
+                status="CLICK",
+                fsm_state=current_state
+            )
 
-        return await handler(event, data)
+        try:
+            return await handler(event, data)
+        except Exception as e:
+            log_user_event(
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                action="СБОЙ ПРИ ОБРАБОТКЕ СОБЫТИЯ",
+                details=f"Ошибка: {str(e)[:150]}",
+                status="ERROR",
+                fsm_state=current_state
+            )
+            raise
 
 
 class AccessControlMiddleware(BaseMiddleware):

@@ -24,19 +24,9 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Настройка чистого логирования с автоматической ротацией
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        RotatingFileHandler("bot.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
-    ]
-)
-# Отключаем шумные технические логи aiogram
-logging.getLogger("aiogram.event").setLevel(logging.WARNING)
-logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
+# Настройка многофайлового логирования (user_actions.log, parser.log, errors.log, bot.log)
+from logger_setup import setup_logging
+setup_logging()
 logger = logging.getLogger("bot")
 
 

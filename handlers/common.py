@@ -17,6 +17,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 import config
 import database
+from logger_setup import log_user_event
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -205,6 +206,7 @@ async def cmd_profile(event):
 @router.callback_query(F.data == "activate_trial_btn")
 async def cb_activate_trial(call: CallbackQuery):
     res = await database.activate_trial(call.from_user.id)
+    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Активация триала", res["message"], status="OK" if res["success"] else "WARN")
     if res["success"]:
         await call.answer("🎉 Пробный период 24 часа успешно активирован!", show_alert=True)
         await cmd_profile(call)
@@ -283,6 +285,7 @@ async def cb_select_tariff(call: CallbackQuery):
         }
     }
     selected = tariffs.get(tariff_key, tariffs["standart"])
+    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Выбор тарифа", f"Тариф {selected['name']} ({selected['price']})", status="INFO")
     is_adm = config.is_admin(call.from_user.id)
 
     if is_adm:
@@ -430,6 +433,7 @@ async def cb_ban_seller(call: CallbackQuery):
 
     user_id = call.from_user.id
     await database.add_blocked_seller(user_id, seller_name)
+    log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Блокировка продавца", f"Продавец «{seller_name}» добавлен в ЧС", status="OK")
     logger.info(f"🚷 [ЧЕРНЫЙ СПИСОК] Пользователь ID:{user_id} заблокировал продавца «{seller_name}»")
 
     await call.answer(
