@@ -1,4 +1,4 @@
-name: Deploy to VPS
+name: CI/CD Pipeline & Automated Deploy
 
 on:
   push:
@@ -8,9 +8,41 @@ on:
   workflow_dispatch:
 
 jobs:
-  deploy:
-    name: Deploy to Production VPS
+  test:
+    name: 🧪 Automated Tests & Quality Check
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check code syntax & compilation
+        run: |
+          python -m py_compile config.py database.py middlewares.py parser.py scheduler.py logger_setup.py bot.py handlers/*.py
+
+      - name: Run Unit Tests Suite
+        env:
+          BOT_TOKEN: "1234567890:MOCK_TOKEN_FOR_CI_CD"
+          ADMIN_ID: "986832959"
+          ADMIN_IDS: "986832959,455386428"
+        run: |
+          python -m unittest discover -s tests -p "test_*.py"
+
+  deploy:
+    name: 🚀 Automated Deploy to VPS
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/feature/json-api' || github.ref == 'refs/heads/main'
     steps:
       - name: SSH and deploy bot
         uses: appleboy/ssh-action@master
@@ -38,8 +70,9 @@ jobs:
               pip install --no-cache-dir -r requirements.txt
               systemctl restart avito-bot
               echo "✅ Бот успешно обновлен и перезапущен!"
-              systemctl status avito-bot --no-pager -n 5
+              systemctl is-active --quiet avito-bot && echo "🟢 Статус сервиса: ACTIVE"
             else
               echo "⚠️ Директория проекта не найдена (/opt/avito_parser_bot или /opt/avito-bot)!"
               exit 1
             fi
+
