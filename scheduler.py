@@ -211,12 +211,12 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
         # Выполняем 1 сетевой запрос к Авито на всю группу радаров с этим URL
         html_content = await asyncio.to_thread(parser.fetch_page, clean_url)
         if not html_content:
-            return
+            return False
 
         items = parser.parse_items(html_content)
         if not items:
             logger.info(f"📡 [ПАРСЕР] По URL «{clean_url[:60]}...»: страница получена, лотов в каталоге не найдено")
-            return
+            return True
 
         # ⚡️ ПРИОРИТЕТНАЯ ДОСТАВКА ЛОТОВ:
         # 0: Админы и PRO-пользователи (получают уведомления мгновенно первыми)
@@ -304,9 +304,11 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
 
         global LAST_SCAN_TIMESTAMP
         LAST_SCAN_TIMESTAMP = time.time()
+        return True
 
     except Exception as e:
         logger.error(f"❌ [ГРУППА URL] Ошибка при обработке URL «{clean_url[:60]}...»: {e}", exc_info=True)
+        return False
 
 
 async def monitoring_worker(bot: Bot):
@@ -317,6 +319,9 @@ async def monitoring_worker(bot: Bot):
     logger.info("🚀 Запуск фонового сервиса мониторинга Авито...")
     parser = AvitoParser()
     cycle_count = 0
+    consecutive_failures = 0
+    alert_sent = False
+    FAILURE_THRESHOLD = 5
 
     while True:
         try:
@@ -334,10 +339,52 @@ async def monitoring_worker(bot: Bot):
                 logger.info(f"🌐 [МОНИТОРИНГ] Уникальных URL-запросов к Авито: {len(url_groups)} (радаров в базе: {len(active_searches)})")
 
                 # 2. Делаем ровно 1 запрос к Авито на каждый уникальный URL
+                success_count = 0
+                fail_count = 0
                 for clean_url, radars_for_url in url_groups.items():
-                    await process_url_group(bot, parser, clean_url, radars_for_url)
+                    ok = await process_url_group(bot, parser, clean_url, radars_for_url)
+                    if ok:
+                        success_count += 1
+                    else:
+                        fail_count += 1
                     # Пауза между запросами к разным ссылкам для распределения нагрузки
                     await asyncio.sleep(random.uniform(3.0, 5.0))
+
+                # 🛡 Анализ здоровья мониторинга и защита от сбоев
+                if success_count == 0 and fail_count > 0:
+                    consecutive_failures += 1
+                    logger.warning(
+                        f"⚠️ [СБОЙ МОНИТОРИНГА] Ни один радар не смог обновиться (сбой #{consecutive_failures}/{FAILURE_THRESHOLD} подряд)..."
+                    )
+                    if consecutive_failures >= FAILURE_THRESHOLD and not alert_sent:
+                        alert_sent = True
+                        current_p = parser.current_proxy or "Прямое соединение (без прокси)"
+                        alert_msg = (
+                            f"🚨 <b>ВНИМАНИЕ: Сбой мониторинга Авито!</b>\n\n"
+                            f"Мониторинг не может получить данные уже <b>{consecutive_failures} кругов подряд</b> (~{consecutive_failures} мин).\n"
+                            f"❌ Все запросы к Авито завершились ошибкой (403, 429 или таймаут).\n\n"
+                            f"🌐 <i>Текущий прокси:</i> <code>{html.escape(current_p)}</code>\n"
+                            f"🛠 <i>Рекомендация:</i> Проверьте прокси-сервер или перезапустите бота."
+                        )
+                        for aid in config.ADMIN_IDS:
+                            try:
+                                await bot.send_message(chat_id=aid, text=alert_msg, parse_mode="HTML")
+                            except Exception as alert_err:
+                                logger.error(f"Не удалось отправить алерт админу {aid}: {alert_err}")
+                elif success_count > 0:
+                    if alert_sent:
+                        alert_sent = False
+                        recovery_msg = (
+                            f"✅ <b>Связь с Авито восстановлена!</b>\n\n"
+                            f"Мониторинг снова успешно получает данные (успешных запросов: {success_count}). "
+                            f"Бот работает в штатном режиме."
+                        )
+                        for aid in config.ADMIN_IDS:
+                            try:
+                                await bot.send_message(chat_id=aid, text=recovery_msg, parse_mode="HTML")
+                            except Exception as rec_err:
+                                logger.error(f"Не удалось отправить уведомление о восстановлении {aid}: {rec_err}")
+                    consecutive_failures = 0
             else:
                 logger.info("ℹ️ [МОНИТОРИНГ] Нет активных радаров для сканирования.")
 
