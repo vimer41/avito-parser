@@ -47,6 +47,10 @@ class AvitoItem:
     is_promotion: bool = False
     views_total: Optional[int] = None
     views_today: Optional[int] = None
+    raw_price: Optional[int] = None
+    was_lowered: bool = False
+    string_without_discount: Optional[str] = None
+    discount_percent: Optional[int] = None
 
 
 class AvitoParser:
@@ -551,12 +555,22 @@ class AvitoParser:
 
                 # Цена
                 price_det = it.get("priceDetailed") or {}
-                price = price_det.get("fullString")
-                if not price and price_det.get("value") is not None:
+                raw_price = None
+                if price_det.get("value") is not None:
                     try:
-                        price = f"{int(price_det.get('value')):,} ₽".replace(",", " ")
+                        raw_price = int(price_det.get("value"))
                     except Exception:
-                        price = f"{price_det.get('value')} ₽"
+                        pass
+                was_lowered = bool(price_det.get("wasLowered"))
+                string_without_discount = price_det.get("stringWithoutDiscount")
+                discount_percent = price_det.get("discountPercent")
+
+                price = price_det.get("fullString")
+                if not price and raw_price is not None:
+                    try:
+                        price = f"{raw_price:,} ₽".replace(",", " ")
+                    except Exception:
+                        price = f"{raw_price} ₽"
                 if not price:
                     price = "Цена не указана"
 
@@ -631,11 +645,14 @@ class AvitoParser:
                             delivery = "Авито Доставка"
                             break
 
-                # Адрес
+                # Адрес (выбираем максимально подробный адрес: улица, метро, город)
                 address = None
-                addr_det = it.get("addressDetailed") or {}
-                if addr_det.get("locationName"):
-                    address = addr_det["locationName"]
+                if it.get("geo", {}).get("formattedAddress"):
+                    address = it["geo"]["formattedAddress"]
+                elif it.get("coords", {}).get("address_user"):
+                    address = it["coords"]["address_user"]
+                elif (it.get("addressDetailed") or {}).get("locationName"):
+                    address = it["addressDetailed"]["locationName"]
                 elif it.get("location", {}).get("name"):
                     address = it["location"]["name"]
                 elif it.get("gallery", {}).get("imageAlt"):
@@ -684,7 +701,11 @@ class AvitoParser:
                     condition=None,
                     timestamp=exact_ts,
                     is_reserved=is_reserved,
-                    is_promotion=is_promotion
+                    is_promotion=is_promotion,
+                    raw_price=raw_price,
+                    was_lowered=was_lowered,
+                    string_without_discount=string_without_discount,
+                    discount_percent=discount_percent
                 ))
 
             return results

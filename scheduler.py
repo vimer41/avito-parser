@@ -29,6 +29,9 @@ class NotificationTask:
     search_title: str
     item: AvitoItem
     user_label: str = ""
+    is_price_drop: bool = False
+    old_price: Optional[int] = None
+    drop_percent: Optional[int] = None
 
 # ── 2. Кэш Telegram file_id для отправленных фото (экономит 100% повторных скачиваний) ──
 PHOTO_FILE_ID_CACHE: Dict[str, str] = {}
@@ -64,7 +67,13 @@ def get_last_scan_info() -> str:
 
 
 
-def build_notification_text(item: AvitoItem, search_title: str) -> str:
+def build_notification_text(
+    item: AvitoItem,
+    search_title: str,
+    is_price_drop: bool = False,
+    old_price: Optional[int] = None,
+    drop_percent: Optional[int] = None
+) -> str:
     """Форматирует стильный и чистый текст карточки товара."""
     clean_title = html.escape(item.title)
     clean_price = html.escape(item.price)
@@ -78,20 +87,34 @@ def build_notification_text(item: AvitoItem, search_title: str) -> str:
         badges.append("⚡️ <b>ПРОДВИНУТО</b>")
     badge_header = f" [{ ' · '.join(badges) }]" if badges else ""
 
-    lines = [
-        f"⚡️ <b>НОВЫЙ ЛОТ НА АВИТО</b>{badge_header}",
-        f"🏷 <b>{clean_price}</b> · <b>{clean_title}</b>",
-        "────────────────────"
-    ]
+    if is_price_drop:
+        diff_rub = (old_price - item.raw_price) if (old_price and item.raw_price) else 0
+        diff_str = f" · выгода {diff_rub:,} ₽".replace(",", " ") if diff_rub > 0 else ""
+        old_price_str = f"{old_price:,} ₽".replace(",", " ") if old_price else ""
+        lines = [
+            f"📉 <b>СНИЖЕНИЕ ЦЕНЫ НА АВИТО! [-{drop_percent}%]</b>{badge_header}",
+            f"🏷 <b>{clean_price}</b> (было <s>{old_price_str}</s>{diff_str})",
+            f"📦 <b>{clean_title}</b>",
+            "────────────────────"
+        ]
+    else:
+        discount_badge = ""
+        if getattr(item, "was_lowered", False) and getattr(item, "discount_percent", None):
+            discount_badge = f" 🏷 <i>(-{item.discount_percent}%)</i>"
+        lines = [
+            f"⚡️ <b>НОВЫЙ ЛОТ НА АВИТО</b>{badge_header}",
+            f"🏷 <b>{clean_price}</b>{discount_badge} · <b>{clean_title}</b>",
+            "────────────────────"
+        ]
 
-    # Локация
+    # Локация / Адрес
     address = item.address
     if not address:
         m = re.search(r"в\s+([А-Яа-яЁё\s\-]+)$", clean_search)
         if m:
             address = m.group(1).strip()
     if address:
-        lines.append(f"📍 <b>Локация:</b> {html.escape(address)}")
+        lines.append(f"📍 <b>Адрес:</b> {html.escape(address)}")
 
     # Состояние и доставка
     details = []
@@ -233,7 +256,10 @@ async def send_ad_to_user(
     search_id: int,
     search_title: str,
     it: AvitoItem,
-    user_label: str = ""
+    user_label: str = "",
+    is_price_drop: bool = False,
+    old_price: Optional[int] = None,
+    drop_percent: Optional[int] = None
 ) -> bool:
     """
     Отправляет уведомление пользователю (фото или текст).
@@ -241,9 +267,15 @@ async def send_ad_to_user(
     2. Скачивает фото через семафор (ограничение параллельных загрузок в RAM).
     3. Сохраняет полученный telegram file_id для остальных пользователей.
     """
-    caption = build_notification_text(it, search_title)
+    caption = build_notification_text(
+        it, search_title,
+        is_price_drop=is_price_drop,
+        old_price=old_price,
+        drop_percent=drop_percent
+    )
     keyboard = build_notification_keyboard(it.url, search_id, has_seller=bool(it.seller_name))
     owner_str = f" [{user_label}]" if user_label else f" ID:{user_id}"
+    delivery_tag = f"СНИЖЕНИЕ ЦЕНЫ (-{drop_percent}%)" if is_price_drop else "Доставлено"
 
     # 1. Проверяем кэш telegram file_id (мгновенная доставка без повторного скачивания)
     cached_fid = get_cached_photo_file_id(it.item_id)
@@ -256,7 +288,7 @@ async def send_ad_to_user(
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
-            logger.info(f"     ⚡️ [Радар #{search_id}{owner_str}] Доставлено (file_id кэш): {it.price} · «{it.title[:35]}»")
+            logger.info(f"     ⚡️ [Радар #{search_id}{owner_str}] {delivery_tag} (file_id кэш): {it.price} · «{it.title[:35]}»")
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
             raise
@@ -286,7 +318,7 @@ async def send_ad_to_user(
                 )
                 if sent_msg.photo:
                     set_cached_photo_file_id(it.item_id, sent_msg.photo[-1].file_id)
-                logger.info(f"     🚀 [Радар #{search_id}{owner_str}] Доставлено (с фото): {it.price} · «{it.title[:35]}»")
+                logger.info(f"     🚀 [Радар #{search_id}{owner_str}] {delivery_tag} (с фото): {it.price} · «{it.title[:35]}»")
                 return True
             except (TelegramForbiddenError, TelegramRetryAfter):
                 raise
@@ -386,15 +418,55 @@ async def process_url_group(
             # Получаем актуальный черный список продавцов пользователя
             blocked_sellers = await database.get_blocked_sellers(user_id)
 
-            seen_ids = await database.get_seen_item_ids_for_search(radar_id)
-            new_items = [it for it in items if it.item_id not in seen_ids]
+            seen_dict = await database.get_seen_items_with_prices(radar_id)
+            new_items = [it for it in items if it.item_id not in seen_dict]
+
+            # 📉 Проверка снижения цены (Price Drop Alert) для PRO-тарифа и администраторов
+            user_plan = (radar.get("tariff_plan") or "").lower()
+            is_pro = (user_id in config.ADMIN_IDS or user_plan == "pro")
+            min_drop = int(radar.get("min_discount_percent") if radar.get("min_discount_percent") is not None else 5)
+
+            if is_pro and min_drop > 0:
+                for it in items:
+                    if it.item_id in seen_dict and it.raw_price:
+                        old_p = seen_dict[it.item_id]
+                        new_p = it.raw_price
+                        # Если цена действительно снизилась
+                        if old_p > 0 and new_p < old_p:
+                            drop_pct = round(((old_p - new_p) / old_p) * 100)
+                            if drop_pct >= min_drop:
+                                # Проверяем стоп-слова
+                                if is_stop_word_matched(it, stop_words):
+                                    continue
+                                # Проверяем ЧС продавцов
+                                if it.seller_name and it.seller_name.lower().strip() in blocked_sellers:
+                                    continue
+
+                                logger.info(
+                                    f"  {w_tag}📉 [СНИЖЕНИЕ ЦЕНЫ] Радар #{radar_id} [{user_str}] «{search_title}»: "
+                                    f"«{it.title[:30]}» {old_p:,} -> {new_p:,} ₽ (-{drop_pct}%, порог {min_drop}%)"
+                                )
+                                # Фиксируем новую цену в БД, чтобы не слать повторно
+                                await database.update_seen_item_price(radar_id, it.item_id, new_p)
+                                seen_dict[it.item_id] = new_p
+
+                                await NOTIFICATION_QUEUE.put(NotificationTask(
+                                    user_id=user_id,
+                                    radar_id=radar_id,
+                                    search_title=search_title,
+                                    item=it,
+                                    user_label=user_str,
+                                    is_price_drop=True,
+                                    old_price=old_p,
+                                    drop_percent=drop_pct
+                                ))
 
             if not new_items:
                 logger.info(f"  {w_tag}🔹 Радар #{radar_id} [{user_str}] «{search_title}»: проверено {len(items)} лотов [{source_tag}] (новых нет)")
                 continue
 
-            # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ, чтобы они не всплывали повторно
-            await database.mark_items_seen_bulk(radar_id, [it.item_id for it in new_items])
+            # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ с ценой, чтобы они не всплывали повторно
+            await database.mark_items_seen_bulk(radar_id, [(it.item_id, it.raw_price or 0) for it in new_items])
 
             # 1. Отбираем только действительно свежие объявления (до 10 минут)
             fresh_items = [it for it in new_items if is_ad_fresh_enough(it.date, getattr(it, "timestamp", None))]
@@ -643,7 +715,10 @@ async def notification_worker(bot: Bot, parser: AvitoParser):
                     search_id=task.radar_id,
                     search_title=task.search_title,
                     it=task.item,
-                    user_label=task.user_label
+                    user_label=task.user_label,
+                    is_price_drop=task.is_price_drop,
+                    old_price=task.old_price,
+                    drop_percent=task.drop_percent
                 )
             except TelegramForbiddenError:
                 logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{task.user_id} заблокировал бота. Отключаем его радары.")

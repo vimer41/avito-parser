@@ -44,6 +44,16 @@ async def init_db():
         except Exception:
             pass
 
+        try:
+            await db.execute("ALTER TABLE searches ADD COLUMN min_discount_percent INTEGER DEFAULT 5;")
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE seen_items ADD COLUMN last_price INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
         # Администраторы всегда имеют полный доступ
         for aid in ADMIN_IDS:
             await db.execute("UPDATE users SET is_allowed = 1, tariff_plan = 'pro' WHERE user_id = ?", (aid,))
@@ -58,6 +68,7 @@ async def init_db():
                 stop_words TEXT DEFAULT '[]',
                 template TEXT,
                 is_active INTEGER DEFAULT 1,
+                min_discount_percent INTEGER DEFAULT 5,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
             );
@@ -67,6 +78,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS seen_items (
                 search_id INTEGER NOT NULL,
                 item_id TEXT NOT NULL,
+                last_price INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (search_id, item_id),
                 FOREIGN KEY (search_id) REFERENCES searches (id) ON DELETE CASCADE
@@ -347,6 +359,17 @@ async def remove_blocked_seller_by_id(user_id: int, block_id: int) -> bool:
 
 
 
+async def get_seen_items_with_prices(search_id: int) -> Dict[str, int]:
+    """Возвращает словарь {item_id: last_price} всех просмотренных объявлений в данном радаре."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT item_id, COALESCE(last_price, 0) FROM seen_items WHERE search_id = ?",
+            (search_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return {str(r[0]): int(r[1] or 0) for r in rows}
+
+
 async def get_seen_item_ids_for_search(search_id: int) -> set:
     """Возвращает множество всех ID объявлений, уже просмотренных в данном радаре."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -367,25 +390,63 @@ async def is_item_seen(search_id: int, item_id: str) -> bool:
             return await cursor.fetchone() is not None
 
 
-async def mark_item_seen(search_id: int, item_id: str):
+async def mark_item_seen(search_id: int, item_id: str, price: int = 0):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO seen_items (search_id, item_id) VALUES (?, ?)",
-            (search_id, str(item_id))
+            """
+            INSERT INTO seen_items (search_id, item_id, last_price) VALUES (?, ?, ?)
+            ON CONFLICT(search_id, item_id) DO UPDATE SET last_price = excluded.last_price
+            """,
+            (search_id, str(item_id), int(price or 0))
         )
         await db.commit()
 
 
-async def mark_items_seen_bulk(search_id: int, item_ids: List[str]):
-    if not item_ids:
+async def mark_items_seen_bulk(search_id: int, items_data: list):
+    """
+    Массовая запись просмотренных объявлений.
+    Принимает либо список item_id (str), либо список кортежей (item_id, price).
+    """
+    if not items_data:
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        records = [(search_id, str(iid)) for iid in item_ids]
+        records = []
+        for entry in items_data:
+            if isinstance(entry, (tuple, list)):
+                iid, price = entry[0], entry[1]
+            else:
+                iid, price = entry, 0
+            records.append((search_id, str(iid), int(price or 0)))
+
         await db.executemany(
-            "INSERT OR IGNORE INTO seen_items (search_id, item_id) VALUES (?, ?)",
+            """
+            INSERT INTO seen_items (search_id, item_id, last_price) VALUES (?, ?, ?)
+            ON CONFLICT(search_id, item_id) DO UPDATE SET last_price = excluded.last_price
+            """,
             records
         )
         await db.commit()
+
+
+async def update_seen_item_price(search_id: int, item_id: str, new_price: int):
+    """Обновляет зафиксированную цену объявления после срабатывания алерта о скидке."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE seen_items SET last_price = ? WHERE search_id = ? AND item_id = ?",
+            (int(new_price or 0), search_id, str(item_id))
+        )
+        await db.commit()
+
+
+async def update_search_discount_percent(search_id: int, user_id: int, percent: int) -> bool:
+    """Обновляет порог скидки (в процентах) для отслеживания снижения цены в радаре."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE searches SET min_discount_percent = ? WHERE id = ? AND user_id = ?",
+            (percent, search_id, user_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def cleanup_old_seen_items(days: int = 5) -> int:

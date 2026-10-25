@@ -237,9 +237,14 @@ async def show_searches(event, state: FSMContext):
         is_active = bool(s["is_active"])
         status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
         stops_count = len(s["stop_words"])
+        disc_val = s.get("min_discount_percent") if s.get("min_discount_percent") is not None else 5
+        disc_str = f"-{disc_val}%" if disc_val > 0 else "Выкл"
+        disc_btn_label = f"📉 Скидки: {disc_str} 💎"
+
         card_text = (
             f"╭─ 🎯 <b>Радар #{i}: {title}</b>\n"
             f"│ 📡 <b>Статус:</b> {status_icon}\n"
+            f"│ 📉 <b>Алерт на скидку:</b> <code>{disc_str}</code> 💎\n"
             f"╰ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>"
         )
 
@@ -247,11 +252,14 @@ async def show_searches(event, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{s_id}"),
-                InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{s_id}")
+                InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{s_id}")
             ],
             [
-                InlineKeyboardButton(text="↗️ На Авито", url=s["url"]),
+                InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{s_id}"),
                 InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{s_id}")
+            ],
+            [
+                InlineKeyboardButton(text="↗️ Открыть выдачу на Авито", url=s["url"])
             ]
         ])
 
@@ -282,9 +290,14 @@ async def cb_toggle_search(call: CallbackQuery):
     is_active = bool(s["is_active"])
     status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
     stops_count = len(s["stop_words"])
+    disc_val = s.get("min_discount_percent") if s.get("min_discount_percent") is not None else 5
+    disc_str = f"-{disc_val}%" if disc_val > 0 else "Выкл"
+    disc_btn_label = f"📉 Скидки: {disc_str} 💎"
+
     card_text = (
         f"╭─ 🎯 <b>Радар: {title}</b>\n"
         f"│ 📡 <b>Статус:</b> {status_icon}\n"
+        f"│ 📉 <b>Алерт на скидку:</b> <code>{disc_str}</code> 💎\n"
         f"╰ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>"
     )
 
@@ -292,11 +305,14 @@ async def cb_toggle_search(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{search_id}"),
-            InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}")
+            InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{search_id}")
         ],
         [
-            InlineKeyboardButton(text="↗️ На Авито", url=s["url"]),
+            InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}"),
             InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{search_id}")
+        ],
+        [
+            InlineKeyboardButton(text="↗️ Открыть выдачу на Авито", url=s["url"])
         ]
     ])
 
@@ -304,6 +320,79 @@ async def cb_toggle_search(call: CallbackQuery):
         await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         pass
+
+
+# ── Настройка скидки для PRO (Price Drop Alert) ─────────────────────────
+
+@router.callback_query(F.data.startswith("set_discount:"))
+async def cb_set_discount_menu(call: CallbackQuery):
+    search_id = int(call.data.split(":")[1])
+    user_id = call.from_user.id
+    user = await database.get_or_create_user(user_id)
+    is_pro = (user_id in config.ADMIN_IDS or (user.get("tariff_plan") or "").lower() == "pro")
+
+    if not is_pro:
+        await call.answer(
+            "🔒 Отслеживание снижения цен доступно только на тарифе PRO!\n\n"
+            "Оформите подписку PRO в меню «Мой профиль», чтобы бот моментально ловил скидки перекупов.",
+            show_alert=True
+        )
+        return
+
+    s = await database.get_search(search_id)
+    if not s or s.get("user_id") != user_id:
+        await call.answer("Радар не найден", show_alert=True)
+        return
+
+    cur_disc = s.get("min_discount_percent") if s.get("min_discount_percent") is not None else 5
+    cur_label = f"-{cur_disc}%" if cur_disc > 0 else "Выключено"
+
+    text = (
+        f"📉 <b>ОТСЛЕЖИВАНИЕ СНИЖЕНИЯ ЦЕНЫ</b> 💎\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Радар: <b>{html.escape(s['title'])}</b>\n"
+        f"Текущий порог: <b>{cur_label}</b>\n\n"
+        f"Выберите, от какого процента снижения цены присылать мгновенное уведомление в Telegram:\n"
+        f"<i>(Если продавец скинет цену на этот процент или более — бот сразу пришлёт алерт)</i>"
+    )
+
+    options = [
+        ("5%", 5), ("10%", 10), ("15%", 15),
+        ("20%", 20), ("30%", 30), ("❌ Выключить", 0)
+    ]
+    buttons = []
+    row = []
+    for label, val in options:
+        btn_mark = " ✓" if cur_disc == val else ""
+        row.append(InlineKeyboardButton(text=f"{label}{btn_mark}", callback_data=f"save_discount:{search_id}:{val}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton(text="« Назад к радарам", callback_data="list_searches")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("save_discount:"))
+async def cb_save_discount(call: CallbackQuery):
+    parts = call.data.split(":")
+    search_id = int(parts[1])
+    val = int(parts[2])
+    user_id = call.from_user.id
+
+    await database.update_search_discount_percent(search_id, user_id, val)
+    status_text = f"скидки от -{val}%" if val > 0 else "скидки выключены"
+    log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Настройка скидки", f"Радар #{search_id} -> {status_text}", status="OK")
+    await call.answer(f"✅ Сохранено: {status_text}!")
+    await show_searches(call)
 
 
 # ── Удаление поиска ────────────────────────────────────────────────────
