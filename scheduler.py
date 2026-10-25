@@ -87,18 +87,13 @@ def build_notification_text(item: AvitoItem, search_title: str) -> str:
     return "\n".join(lines)
 
 
-def build_notification_keyboard(item_url: str, search_id: int) -> InlineKeyboardMarkup:
-    """Стильные инлайн-кнопки под карточкой товара."""
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="↗️ Открыть на Авито", url=item_url),
-            InlineKeyboardButton(text="📋 Скопировать отклик", callback_data=f"copy_msg:{search_id}")
-        ],
-        [
-            InlineKeyboardButton(text="🛡 В стоп-слова", callback_data=f"add_stop_from_item:{search_id}")
-        ]
-    ])
-    return kb
+def build_notification_keyboard(item_url: str, search_id: int, has_seller: bool = True) -> InlineKeyboardMarkup:
+    """Инлайн-кнопки под карточкой товара."""
+    row1 = [InlineKeyboardButton(text="↗️ Открыть на Авито", url=item_url)]
+    row2 = [InlineKeyboardButton(text="🛡 Стоп-слово", callback_data=f"add_stop_from_item:{search_id}")]
+    if has_seller:
+        row2.append(InlineKeyboardButton(text="🚷 Забанить продавца", callback_data=f"ban_seller:{search_id}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
 
 
 
@@ -149,7 +144,7 @@ async def send_ad_to_user(
     Возвращает False, если пользователь заблокировал бота (для прерывания цикла отправки).
     """
     caption = build_notification_text(it, search_title)
-    keyboard = build_notification_keyboard(it.url, search_id)
+    keyboard = build_notification_keyboard(it.url, search_id, has_seller=bool(it.seller_name))
 
     try:
         photo_file: Optional[BufferedInputFile] = None
@@ -208,7 +203,8 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
     Обрабатывает один уникальный URL выдачи Авито:
     - Делает ровно 1 HTTP-запрос к Авито
     - Парсит органическую выдачу (топ-25)
-    - Раздает результаты всем радарам, следящим за этой ссылкой
+    - Сортирует пользователей по приоритету тарифов (PRO и админы получают первыми)
+    - Раздает результаты с фильтрацией по стоп-словам и ЧС продавцов
     - Сразу запоминает новые ID в базе для каждого радара
     """
     try:
@@ -222,6 +218,21 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             logger.info(f"📡 [ПАРСЕР] По URL «{clean_url[:60]}...»: страница получена, лотов в каталоге не найдено")
             return
 
+        # ⚡️ ПРИОРИТЕТНАЯ ДОСТАВКА ЛОТОВ:
+        # 0: Админы и PRO-пользователи (получают уведомления мгновенно первыми)
+        # 1: Standart тариф
+        # 2: Остальные
+        def get_radar_priority(r):
+            uid = r.get("user_id")
+            plan = (r.get("tariff_plan") or "").lower()
+            if uid in config.ADMIN_IDS or plan == "pro":
+                return 0
+            if plan == "standart":
+                return 1
+            return 2
+
+        radars_for_url.sort(key=get_radar_priority)
+
         # Раздаем полученные объявления каждому радару, подписанному на этот URL
         for radar in radars_for_url:
             radar_id = radar["id"]
@@ -229,11 +240,14 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             search_title = radar["title"]
             stop_words = radar.get("stop_words", [])
 
+            # Получаем актуальный черный список продавцов пользователя
+            blocked_sellers = await database.get_blocked_sellers(user_id)
+
             seen_ids = await database.get_seen_item_ids_for_search(radar_id)
             new_items = [it for it in items if it.item_id not in seen_ids]
 
             logger.info(
-                f"📡 [РАДАР #{radar_id}] «{search_title}» (User: {user_id}): "
+                f"📡 [РАДАР #{radar_id}] «{search_title}» (User: {user_id}, Тариф: {radar.get('tariff_plan', 'standart')}): "
                 f"в выдаче {len(items)} лотов, новых для отправки: {len(new_items)}"
             )
 
@@ -255,16 +269,26 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
 
             # Отправляем в хронологическом порядке (снизу вверх)
             for it in reversed(new_items):
+                # 1. Проверяем свежесть
                 if not is_ad_fresh_enough(it.date):
                     logger.info(
                         f"⏳ [РАДАР #{radar_id}] Объявление #{it.item_id} пропущено как старое (дата: '{it.date}')"
                     )
                     continue
 
+                # 2. Проверяем стоп-слова
                 matched_stop = is_stop_word_matched(it, stop_words)
                 if matched_stop:
                     logger.info(
                         f"🛡 [РАДАР #{radar_id}] Объявление #{it.item_id} отсеяно по стоп-слову «{matched_stop}»"
+                    )
+                    continue
+
+                # 3. Проверяем черный список продавцов
+                if it.seller_name and it.seller_name.lower().strip() in blocked_sellers:
+                    logger.info(
+                        f"🚷 [РАДАР #{radar_id}] Объявление #{it.item_id} отсеяно: "
+                        f"продавец «{it.seller_name}» в черном списке пользователя ID:{user_id}"
                     )
                     continue
 

@@ -25,6 +25,7 @@ class AvitoItem:
     date: Optional[str] = None
     description: Optional[str] = None
     seller: Optional[str] = None
+    seller_name: Optional[str] = None
     delivery: Optional[str] = None
     condition: Optional[str] = None
 
@@ -239,9 +240,9 @@ class AvitoParser:
         return parts[-1] if parts else "Поиск Авито"
 
     @staticmethod
-    def _clean_seller_info(seller_elem) -> Optional[str]:
+    def _clean_seller_info(seller_elem) -> Tuple[Optional[str], Optional[str]]:
         if not seller_elem:
-            return None
+            return None, None
         full_text = seller_elem.get_text(separator=" ", strip=True)
 
         name = None
@@ -264,17 +265,21 @@ class AvitoParser:
         if not name or len(name) < 2:
             name = "Продавец"
 
+        pure_name = name if name != "Продавец" else None
+
         rating_match = re.search(r"([1-5][,\.]\d)", full_text)
         rating = rating_match.group(1).replace(".", ",") if rating_match else None
 
         reviews_match = re.search(r"(\d+[\s\d]*\s*отзыв(?:а|ов)?)", full_text)
         reviews = reviews_match.group(1).strip() if reviews_match else None
 
+        full_str = name
         if rating and reviews:
-            return f"{name} · ⭐ {rating} ({reviews})"
+            full_str = f"{name} · ⭐ {rating} ({reviews})"
         elif rating:
-            return f"{name} · ⭐ {rating}"
-        return name
+            full_str = f"{name} · ⭐ {rating}"
+
+        return full_str, pure_name
 
     @staticmethod
     def _clean_description(desc_elem, date_str: Optional[str] = None) -> Optional[str]:
@@ -449,7 +454,7 @@ class AvitoParser:
                     it.find(class_=lambda x: x and ("sellerInfo-" in x or "iva-item-sellerInfo" in x or "userInfoStep-" in x)) or
                     it.find(attrs={"data-marker": "item-line/company"})
                 )
-                seller = cls._clean_seller_info(seller_elem)
+                seller, seller_name = cls._clean_seller_info(seller_elem)
 
                 # 9. Доставка и состояние
                 delivery, condition = cls._extract_delivery_and_condition(it)
@@ -464,6 +469,7 @@ class AvitoParser:
                     date=date,
                     description=description,
                     seller=seller,
+                    seller_name=seller_name,
                     delivery=delivery,
                     condition=condition
                 ))

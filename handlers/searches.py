@@ -18,7 +18,6 @@ router = Router()
 class SearchStates(StatesGroup):
     waiting_for_url = State()
     waiting_for_stop_word = State()
-    waiting_for_template = State()
 
 
 # ── Добавление радара ──────────────────────────────────────────────────
@@ -231,13 +230,10 @@ async def show_searches(event, state: FSMContext):
         is_active = bool(s["is_active"])
         status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
         stops_count = len(s["stop_words"])
-        tmpl_status = "индивидуальный" if s["template"] else "общий"
-
         card_text = (
             f"╭─ 🎯 <b>Радар #{i}: {title}</b>\n"
             f"│ 📡 <b>Статус:</b> {status_icon}\n"
-            f"│ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>\n"
-            f"╰ 💬 <b>Отклик:</b> <i>{tmpl_status}</i>"
+            f"╰ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>"
         )
 
         toggle_btn_text = "⏸ На паузу" if is_active else "▶️ Запустить"
@@ -247,10 +243,7 @@ async def show_searches(event, state: FSMContext):
                 InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{s_id}")
             ],
             [
-                InlineKeyboardButton(text="💬 Текст отклика", callback_data=f"manage_tmpl:{s_id}"),
-                InlineKeyboardButton(text="↗️ На Авито", url=s["url"])
-            ],
-            [
+                InlineKeyboardButton(text="↗️ На Авито", url=s["url"]),
                 InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{s_id}")
             ]
         ])
@@ -281,13 +274,10 @@ async def cb_toggle_search(call: CallbackQuery):
     is_active = bool(s["is_active"])
     status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
     stops_count = len(s["stop_words"])
-    tmpl_status = "индивидуальный" if s["template"] else "общий"
-
     card_text = (
         f"╭─ 🎯 <b>Радар: {title}</b>\n"
         f"│ 📡 <b>Статус:</b> {status_icon}\n"
-        f"│ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>\n"
-        f"╰ 💬 <b>Отклик:</b> <i>{tmpl_status}</i>"
+        f"╰ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>"
     )
 
     toggle_btn_text = "⏸ На паузу" if is_active else "▶️ Запустить"
@@ -297,10 +287,7 @@ async def cb_toggle_search(call: CallbackQuery):
             InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}")
         ],
         [
-            InlineKeyboardButton(text="💬 Текст отклика", callback_data=f"manage_tmpl:{search_id}"),
-            InlineKeyboardButton(text="↗️ На Авито", url=s["url"])
-        ],
-        [
+            InlineKeyboardButton(text="↗️ На Авито", url=s["url"]),
             InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{search_id}")
         ]
     ])
@@ -501,121 +488,4 @@ async def cb_remove_stop_word(call: CallbackQuery):
     await cb_manage_stops(call)
 
 
-# ── Управление шаблоном сообщения для конкретного радара ─────────────
 
-@router.callback_query(F.data.startswith("manage_tmpl:"))
-async def cb_manage_tmpl(call: CallbackQuery):
-    search_id = int(call.data.split(":")[1])
-    s = await database.get_search(search_id)
-    if not s:
-        await call.answer("Радар не найден", show_alert=True)
-        return
-
-    user = await database.get_or_create_user(call.from_user.id)
-    default_tmpl = user.get("default_template") or database.DEFAULT_SELLER_MESSAGE
-    current_tmpl = s.get("template") or f"{default_tmpl} (общий профиля)"
-
-    text = (
-        f"💬 <b>ШАБЛОН ОТКЛИКА ДЛЯ РАДАРА</b>\n"
-        f"🎯 Радар: <b>{html.escape(s['title'])}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<code>{html.escape(current_tmpl)}</code>\n\n"
-        "Этот текст будет копироваться по кнопке <b>«📋 Скопировать отклик»</b> под каждым найденным товаром в этом радаре."
-    )
-
-    buttons = [
-        [InlineKeyboardButton(text="✏️ Задать свой текст", callback_data=f"set_tmpl:{search_id}")],
-    ]
-    if s.get("template"):
-        buttons.append([InlineKeyboardButton(text="🔄 Сбросить на общий профиля", callback_data=f"reset_tmpl:{search_id}")])
-
-    buttons.append([InlineKeyboardButton(text="📁 К списку радаров", callback_data="list_searches")])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("set_tmpl:"))
-async def cb_set_tmpl_prompt(call: CallbackQuery, state: FSMContext):
-    search_id = int(call.data.split(":")[1])
-    await state.set_state(SearchStates.waiting_for_template)
-    await state.update_data(search_id=search_id)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")]
-    ])
-    await call.message.answer(
-        "✍️ <b>Введите персональный текст сообщения продавцу для этого радара:</b>\n\n"
-        "<i>Пример:\n"
-        "Здравствуйте! Интересует данный лот. Готов забрать самовывозом прямо сейчас, оплата наличными.</i>",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-    await call.answer()
-
-
-@router.message(SearchStates.waiting_for_template)
-async def process_template_input(message: Message, state: FSMContext):
-    text = message.text.strip()
-    menu_buttons = {
-        "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
-        "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
-        "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
-        "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
-        "📖 Инструкция", "❓ Помощь", "Инструкция",
-        "👑 Админ-панель", "👑 Админка",
-        "❌ Отмена", "Отмена"
-    }
-    if text in menu_buttons or text.startswith("/"):
-        await state.clear()
-        if text in {"📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары"}:
-            return await show_searches(message, state)
-        return
-
-    data = await state.get_data()
-    search_id = data.get("search_id")
-
-    await database.update_search_template(search_id, message.from_user.id, text)
-    logger.info(f"💬 [ОТКЛИК] Пользователь ID:{message.from_user.id} обновил персональный отклик для радара #{search_id}")
-    await state.clear()
-
-
-    await message.answer(
-        "✅ <b>Индивидуальный отклик для радара сохранён!</b>\n\n"
-        f"<code>{html.escape(text)}</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📁 К списку радаров", callback_data="list_searches")]
-        ]),
-        parse_mode="HTML"
-    )
-
-
-@router.callback_query(F.data.startswith("reset_tmpl:"))
-async def cb_reset_tmpl(call: CallbackQuery):
-    search_id = int(call.data.split(":")[1])
-    await database.update_search_template(search_id, call.from_user.id, None)
-    await call.answer("Сброшено на общий шаблон")
-    await cb_manage_tmpl(call)
-
-
-# ── Кнопка «Скопировать сообщение» под уведомлением ────────────────────
-
-@router.callback_query(F.data.startswith("copy_msg:"))
-async def cb_copy_message(call: CallbackQuery):
-    search_id = int(call.data.split(":")[1])
-    s = await database.get_search(search_id)
-
-    tmpl = None
-    if s and s.get("template"):
-        tmpl = s["template"]
-    else:
-        user = await database.get_or_create_user(call.from_user.id)
-        tmpl = user.get("default_template") or database.DEFAULT_SELLER_MESSAGE
-
-    text = (
-        "📋 <b>Сообщение для продавца</b> (коснитесь текста для копирования):\n\n"
-        f"<code>{html.escape(tmpl)}</code>"
-    )
-    await call.message.answer(text, parse_mode="HTML")
-    await call.answer("Текст скопирован!")

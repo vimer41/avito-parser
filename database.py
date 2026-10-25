@@ -39,10 +39,14 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN trial_used INTEGER DEFAULT 0;")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN tariff_plan TEXT DEFAULT 'standart';")
+        except Exception:
+            pass
 
         # Администраторы всегда имеют полный доступ
         for aid in ADMIN_IDS:
-            await db.execute("UPDATE users SET is_allowed = 1 WHERE user_id = ?", (aid,))
+            await db.execute("UPDATE users SET is_allowed = 1, tariff_plan = 'pro' WHERE user_id = ?", (aid,))
 
 
         await db.execute("""
@@ -66,6 +70,17 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (search_id, item_id),
                 FOREIGN KEY (search_id) REFERENCES searches (id) ON DELETE CASCADE
+            );
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_sellers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                seller_name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, seller_name) ON CONFLICT IGNORE,
+                FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
             );
         """)
 
@@ -267,7 +282,7 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
         db.row_factory = aiosqlite.Row
         admin_placeholders = ",".join("?" for _ in ADMIN_IDS)
         query = f"""
-            SELECT s.*, u.default_template 
+            SELECT s.*, u.tariff_plan, u.subscription_until 
             FROM searches s 
             JOIN users u ON s.user_id = u.user_id 
             WHERE s.is_active = 1
@@ -283,6 +298,52 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
                 data["stop_words"] = json.loads(data["stop_words"]) if data["stop_words"] else []
                 results.append(data)
             return results
+
+
+async def add_blocked_seller(user_id: int, seller_name: str) -> bool:
+    name = seller_name.strip()
+    if not name or name.lower() in {"продавец", "пользователь", "авито", "компания", "частное лицо"}:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO blocked_sellers (user_id, seller_name) VALUES (?, ?)",
+            (user_id, name)
+        )
+        await db.commit()
+        return True
+
+
+async def get_blocked_sellers(user_id: int) -> set:
+    """Возвращает set имен продавцов в нижнем регистре для быстрого отсечения O(1)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT seller_name FROM blocked_sellers WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return {r[0].lower().strip() for r in rows}
+
+
+async def get_user_blocked_sellers_list(user_id: int) -> List[Dict[str, Any]]:
+    """Возвращает список заблокированных продавцов с ID для управления в профиле."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, seller_name, created_at FROM blocked_sellers WHERE user_id = ? ORDER BY id DESC",
+            (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def remove_blocked_seller_by_id(user_id: int, block_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM blocked_sellers WHERE id = ? AND user_id = ?",
+            (block_id, user_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 

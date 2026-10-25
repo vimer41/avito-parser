@@ -1,5 +1,6 @@
 import html
 import logging
+import re
 from typing import Optional
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
@@ -21,24 +22,12 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-
-class DefaultTemplateStates(StatesGroup):
-    waiting_for_template = State()
-
-
-PRESET_TEMPLATES = {
-    "cash": "Здравствуйте! Товар ещё продаётся? Готов забрать сегодня за наличные.",
-    "delivery": "Добрый день! Товар актуален? Оформите, пожалуйста, через Авито Доставку.",
-    "reserve": "Здравствуйте! Можно бронь до вечера? Точно заберу, без торга.",
-}
-
-
 def get_main_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
-    """Главная клавиатура бота с премиальным стилем."""
+    """Главная клавиатура бота."""
     kb = [
         [KeyboardButton(text="🎯 Добавить радар"), KeyboardButton(text="📁 Мои радары")],
-        [KeyboardButton(text="⚡️ Быстрый отклик"), KeyboardButton(text="👤 Мой профиль")],
-        [KeyboardButton(text="📖 Инструкция")]
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📖 Инструкция")],
+        [KeyboardButton(text="💬 Поддержка")]
     ]
     if user_id and config.is_admin(user_id):
         kb.append([KeyboardButton(text="👑 Админ-панель")])
@@ -72,10 +61,10 @@ async def cmd_start(event, state: FSMContext):
         f"Я отслеживаю новинки на <b>Авито в реальном времени</b> и присылаю "
         f"их за секунды до того, как их увидят перекупы и конкуренты.\n\n"
         f"🚀 <b>Ключевые преимущества:</b>\n"
+        f"• ⚡️ <b>Приоритетная доставка</b> — получение новых лотов раньше всех\n"
         f"• 📸 <b>Фотографии в HD</b> — 100% доставка без блокировок\n"
-        f"• ⚡️ <b>Только свежие лоты</b> — отсечение старых и поднятых объявлений\n"
-        f"• 🛡 <b>Фильтр стоп-слов</b> — защита от реплик, брака и мусора\n"
-        f"• 📋 <b>Быстрый отклик</b> — копирование приветствия продавцу в 1 клик\n\n"
+        f"• 🚷 <b>Чёрный список продавцов</b> — бан спам-магазинов в 1 клик\n"
+        f"• 🛡 <b>Фильтр стоп-слов</b> — защита от реплик, брака и мусора\n\n"
         f"💡 <b>Как запустить радар:</b>\n"
         f"Скопируйте ссылку с фильтрами с <code>avito.ru</code> и отправьте её сюда в чат!"
     )
@@ -86,7 +75,7 @@ async def cmd_start(event, state: FSMContext):
             InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")
         ],
         [
-            InlineKeyboardButton(text="⚡️ Быстрый отклик", callback_data="open_quick_response_menu"),
+            InlineKeyboardButton(text="💳 Тарифы", callback_data="open_subscription_menu"),
             InlineKeyboardButton(text="📖 Инструкция", callback_data="open_help_menu")
         ]
     ])
@@ -166,16 +155,17 @@ async def cmd_profile(event):
 
     from scheduler import get_last_scan_info
     scan_info = get_last_scan_info()
+    blocked_sellers_list = await database.get_user_blocked_sellers_list(user_id)
+    blocked_count = len(blocked_sellers_list)
 
     text = (
         "┌ 👤 <b>ЛИЧНЫЙ КАБИНЕТ</b>\n"
         f"├ 🆔 <b>Ваш ID:</b> <code>{user_id}</code>\n"
         f"├ ⚡️ <b>Статус:</b> {status_str}\n"
         f"├ 🎯 <b>Радары:</b> <b>{active_count}</b> акт. / <b>{searches_count}</b> всего (макс: {config.MAX_SEARCHES_PER_USER})\n"
+        f"├ 🚷 <b>Чёрный список:</b> <b>{blocked_count}</b> продавцов\n"
         f"├ 📡 <b>Проверка Авито:</b> <code>{scan_info}</code> 🟢\n"
-        f"└ 🔔 <b>Доставка лотов:</b> ⚡️ Мгновенно (с фото HD)\n\n"
-        "💬 <b>Текущий шаблон отклика:</b>\n"
-        f"<code>{html.escape(current_tmpl)}</code>"
+        f"└ 🔔 <b>Доставка лотов:</b> ⚡️ Мгновенно (с фото HD)"
     )
 
     buttons = []
@@ -197,7 +187,7 @@ async def cmd_profile(event):
         InlineKeyboardButton(text=f"📁 Мои радары ({searches_count})", callback_data="list_searches")
     ])
     buttons.append([
-        InlineKeyboardButton(text="✏️ Настроить отклик", callback_data="open_quick_response_menu"),
+        InlineKeyboardButton(text=f"🚷 Чёрный список ({blocked_count})", callback_data="manage_blacklist"),
         InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_profile")
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -245,13 +235,13 @@ async def cmd_subscription_menu(event):
         "⚡️ <b>Тариф «Standart»</b> — <b>250 ₽ / мес</b>\n"
         "├ 🎯 До <b>5</b> активных радаров\n"
         "├ 📡 Мониторинг раз в 60 секунд\n"
-        "├ 📸 Доставка с реальными фото товара в HD\n"
-        "└ ⚡️ Быстрый отклик продавцу в 1 клик\n\n"
+        "├ 🚷 Чёрный список продавцов (бан в 1 клик)\n"
+        "└ 📸 Доставка с реальными фото товара в HD\n\n"
         "🔥 <b>Тариф «PRO»</b> — <b>700 ₽ / мес</b>\n"
         "├ 🎯 До <b>15</b> активных радаров\n"
-        "├ 🚀 Приоритетная очередь сканирования\n"
-        "├ 🛡 Фильтрация по стоп-словам\n"
-        "└ 👑 Персональная поддержка\n\n"
+        "├ ⚡️ <b>Приоритет №1</b> (получают пуш первыми)\n"
+        "├ 🚷 Чёрный список продавцов (бан в 1 клик)\n"
+        "└ 🛡 Фильтрация по стоп-словам\n\n"
         "Выберите тариф для подключения:"
     )
 
@@ -326,123 +316,119 @@ async def cb_select_tariff(call: CallbackQuery):
 
 
 
-@router.message(F.text.in_({"⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию"}))
-@router.callback_query(F.data == "open_quick_response_menu")
-async def cmd_default_template(event, state: Optional[FSMContext] = None):
+# ── Служба поддержки (кнопка в меню) ──────────────────────────────────
+
+@router.message(F.text.in_({"💬 Поддержка", "Поддержка", "Помощь", "SOS"}))
+@router.callback_query(F.data == "open_support_stub")
+async def cmd_support(event, state: Optional[FSMContext] = None):
     if state:
         await state.clear()
     if isinstance(event, CallbackQuery):
         message = event.message
-        user_id = event.from_user.id
         await event.answer()
     else:
         message = event
-        user_id = message.from_user.id
-
-
-    user = await database.get_or_create_user(user_id)
-    current_tmpl = user.get("default_template") or database.DEFAULT_SELLER_MESSAGE
 
     text = (
-        "⚡️ <b>БЫСТРЫЙ ОТКЛИК ПРОДАВЦУ</b>\n"
+        "💬 <b>СЛУЖБА ПОДДЕРЖКИ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Этот текст будет автоматически прикреплен к кнопке <b>«📋 Скопировать отклик»</b> под каждым новым объявлением.\n\n"
-        "📌 <b>Текущее сообщение:</b>\n"
-        f"<code>{html.escape(current_tmpl)}</code>\n\n"
-        "Выберите готовый шаблон или задайте свой собственный:"
+        "Возникли сложности с добавлением ссылок, есть вопросы по тарифам или предложения по улучшению?\n\n"
+        "Свяжитесь со службой заботы, и мы оперативно поможем!\n\n"
+        "<i>(Раздел службы поддержки настраивается)</i>"
     )
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="💵 «Выкуп за наличные»", callback_data="set_preset:cash")
+            InlineKeyboardButton(text="👨‍💻 Написать в поддержку", callback_data="support_stub_click")
         ],
         [
-            InlineKeyboardButton(text="🚚 «Авито Доставка»", callback_data="set_preset:delivery")
-        ],
-        [
-            InlineKeyboardButton(text="🤝 «Бронь до вечера»", callback_data="set_preset:reserve")
-        ],
-        [
-            InlineKeyboardButton(text="✍️ Ввести свой текст вручную", callback_data="change_default_template")
-        ],
-        [
-            InlineKeyboardButton(text="👤 К профилю", callback_data="refresh_profile")
+            InlineKeyboardButton(text="👤 В профиль", callback_data="refresh_profile")
         ]
     ])
-
     if isinstance(event, CallbackQuery):
         try:
             await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
             return
         except Exception:
             pass
-
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-@router.callback_query(F.data.startswith("set_preset:"))
-async def cb_set_preset(call: CallbackQuery, state: FSMContext):
-    preset_key = call.data.split(":")[1]
-    new_text = PRESET_TEMPLATES.get(preset_key)
-    if not new_text:
-        await call.answer("Шаблон не найден", show_alert=True)
-        return
-
-    await database.update_user_default_template(call.from_user.id, new_text)
-    logger.info(f"💬 [ОТКЛИК] Пользователь ID:{call.from_user.id} установил пресет отклика «{preset_key}»")
-    await call.answer("✅ Шаблон успешно применен!")
-    # Повторно открываем меню с обновленным текстом
-    await cmd_default_template(call, state)
+@router.callback_query(F.data == "support_stub_click")
+async def cb_support_stub(call: CallbackQuery):
+    await call.answer("💬 Служба поддержки настраивается и скоро будет доступна!", show_alert=True)
 
 
-@router.callback_query(F.data == "change_default_template")
-async def cb_change_default_template(call: CallbackQuery, state: FSMContext):
-    await state.set_state(DefaultTemplateStates.waiting_for_template)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")]
-    ])
-    await call.message.answer(
-        "✍️ <b>Отправьте ваш текст сообщения продавцу:</b>\n\n"
-        "<i>Пример:\n"
-        "Здравствуйте! Товар ещё актуален? Готов приехать и забрать за наличные прямо сегодня.</i>",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
+# ── Чёрный список продавцов (Бан в 1 клик) ─────────────────────────────
+
+@router.callback_query(F.data == "manage_blacklist")
+async def cb_manage_blacklist(call: CallbackQuery):
+    user_id = call.from_user.id
+    blocked = await database.get_user_blocked_sellers_list(user_id)
+
+    if not blocked:
+        text = (
+            "🚷 <b>ЧЁРНЫЙ СПИСОК ПРОДАВЦОВ</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Ваш чёрный список пока пуст.\n\n"
+            "💡 <b>Как блокировать продавцов:</b>\n"
+            "Когда бот присылает объявление от спамера, перекупа или назойливого магазина, "
+            "просто нажмите кнопку <b>«🚷 Забанить продавца»</b> под карточкой лота. "
+            "Бот больше никогда не пришлёт от него ни одного объявления ни по одному радару!"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Назад в профиль", callback_data="refresh_profile")]
+        ])
+    else:
+        text = (
+            f"🚷 <b>ЧЁРНЫЙ СПИСОК ПРОДАВЦОВ ({len(blocked)})</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Объявления от этих продавцов автоматически блокируются до отправки:\n\n"
+            "<i>Нажмите на продавца, чтобы разблокировать его:</i>"
+        )
+        buttons = []
+        for b in blocked[:12]:
+            buttons.append([
+                InlineKeyboardButton(text=f"❌ {b['seller_name'][:25]}", callback_data=f"unban_seller:{b['id']}")
+            ])
+        buttons.append([InlineKeyboardButton(text="« Назад в профиль", callback_data="refresh_profile")])
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
 
-@router.message(DefaultTemplateStates.waiting_for_template)
-async def process_new_default_template(message: Message, state: FSMContext):
-    new_text = message.text.strip()
-    menu_buttons = {
-        "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
-        "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
-        "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
-        "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
-        "📖 Инструкция", "❓ Помощь", "Инструкция",
-        "👑 Админ-панель", "👑 Админка",
-        "❌ Отмена", "Отмена"
-    }
-    if new_text in menu_buttons or new_text.startswith("/"):
-        await state.clear()
+@router.callback_query(F.data.startswith("unban_seller:"))
+async def cb_unban_seller(call: CallbackQuery):
+    block_id = int(call.data.split(":")[1])
+    await database.remove_blocked_seller_by_id(call.from_user.id, block_id)
+    await call.answer("✅ Продавец разблокирован!", show_alert=True)
+    await cb_manage_blacklist(call)
+
+
+@router.callback_query(F.data.startswith("ban_seller:"))
+async def cb_ban_seller(call: CallbackQuery):
+    msg_text = call.message.caption or call.message.text or ""
+    seller_name = None
+
+    m = re.search(r"👤\s*<b>Продавец:</b>\s*([^·\n<]+)", msg_text)
+    if not m:
+        m = re.search(r"👤\s*Продавец:\s*([^·\n]+)", msg_text)
+
+    if m:
+        seller_name = m.group(1).strip()
+
+    if not seller_name or seller_name.lower() in {"продавец", "компания", "частное лицо"}:
+        await call.answer("Не удалось определить имя продавца для блокировки", show_alert=True)
         return
 
-    if not new_text or len(new_text) > 500:
-        await message.answer("⚠️ Текст шаблона должен быть от 1 до 500 символов. Попробуйте еще раз:")
-        return
+    user_id = call.from_user.id
+    await database.add_blocked_seller(user_id, seller_name)
+    logger.info(f"🚷 [ЧЕРНЫЙ СПИСОК] Пользователь ID:{user_id} заблокировал продавца «{seller_name}»")
 
-    await database.update_user_default_template(message.from_user.id, new_text)
-    logger.info(f"💬 [ОТКЛИК] Пользователь ID:{message.from_user.id} сохранил собственный общий отклик")
-    await state.clear()
-
-
-
-    text = (
-        "✅ <b>Шаблон отклика успешно сохранен!</b>\n\n"
-        f"<code>{html.escape(new_text)}</code>"
+    await call.answer(
+        f"🚷 Продавец «{seller_name}» добавлен в ваш Чёрный список!\nЛоты от него больше не будут приходить.",
+        show_alert=True
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡️ К настройке отклика", callback_data="open_quick_response_menu")],
-        [InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")]
-    ])
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
