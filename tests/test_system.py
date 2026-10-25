@@ -51,6 +51,11 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         trial_radars = await database.get_user_max_radars(trial_user_id)
         self.assertEqual(trial_radars, 2)
 
+        # Проверяем сводную статистику системы: и админ, и триал-пользователь должны быть учтены в allowed_users
+        stats = await database.get_system_stats()
+        self.assertEqual(stats["total_users"], 2)
+        self.assertEqual(stats["allowed_users"], 2)
+
     async def test_subscription_upgrade(self):
         """Проверка апгрейда до Standart (5 радаров) и PRO (15 радаров)."""
         user_id = 55667788

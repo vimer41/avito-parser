@@ -19,21 +19,17 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
 
-    target_user_id = int(call.data.split(":")[1])
+    parts = call.data.split(":")
+    target_user_id = int(parts[1])
+    is_panel = len(parts) > 2
+    page = int(parts[2]) if is_panel else 0
+
     await database.set_user_allowed(target_user_id, 1)
 
     user = await database.get_or_create_user(target_user_id)
     username_str = f"@{user['username']}" if user.get("username") else f"ID {target_user_id}"
 
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} одобрил доступ пользователю ID:{target_user_id} ({username_str})")
-
-    await call.message.edit_text(
-        f"✅ <b>Доступ успешно одобрен!</b>\n\n"
-        f"Пользователь: <b>{html.escape(user.get('first_name') or '')}</b> ({username_str}) теперь имеет полный доступ к мониторингу.",
-        parse_mode="HTML"
-    )
-    await call.answer("Доступ одобрен")
-
 
     # Уведомляем пользователя
     try:
@@ -51,6 +47,17 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
         )
     except Exception as e:
         logger.warning(f"Не удалось отправить уведомление пользователю {target_user_id}: {e}")
+
+    if is_panel:
+        await call.answer(f"Доступ для {username_str} одобрен!")
+        await cmd_admin_panel(call, page=page)
+    else:
+        await call.message.edit_text(
+            f"✅ <b>Доступ успешно одобрен!</b>\n\n"
+            f"Пользователь: <b>{html.escape(user.get('first_name') or '')}</b> ({username_str}) теперь имеет полный доступ к мониторингу.",
+            parse_mode="HTML"
+        )
+        await call.answer("Доступ одобрен")
 
 
 @router.callback_query(F.data.startswith("admin_reject:"))
@@ -135,15 +142,29 @@ async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
 
 # ── Панель администратора (/admin, /users, кнопка в меню) ─────────────
 
+USERS_PER_PAGE = 5
+
+
+@router.callback_query(F.data == "admin_noop")
+async def cb_admin_noop(call: CallbackQuery):
+    await call.answer()
+
+
 @router.message(F.text.in_({"👑 Админ-панель", "👑 Админка"}))
 @router.message(Command("admin"))
 @router.message(Command("users"))
 @router.callback_query(F.data == "admin_refresh")
-async def cmd_admin_panel(event):
+@router.callback_query(F.data.startswith("admin_page:"))
+async def cmd_admin_panel(event, page: int = 0):
     if isinstance(event, CallbackQuery):
         message = event.message
         user_id = event.from_user.id
-        await event.answer("Данные обновлены!")
+        if event.data.startswith("admin_page:"):
+            try:
+                page = int(event.data.split(":")[1])
+            except (ValueError, IndexError):
+                page = 0
+        await event.answer()
     else:
         message = event
         user_id = message.from_user.id
@@ -152,8 +173,21 @@ async def cmd_admin_panel(event):
         return
 
     stats = await database.get_system_stats()
-    users = await database.get_all_users()
+    all_users = await database.get_all_users()
+    total_users_count = len(all_users)
+    total_pages = max(1, (total_users_count + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
 
+    # Защита границ страниц
+    if page < 0:
+        page = 0
+    elif page >= total_pages:
+        page = total_pages - 1
+
+    start_idx = page * USERS_PER_PAGE
+    end_idx = start_idx + USERS_PER_PAGE
+    page_users = all_users[start_idx:end_idx]
+
+    page_info = f" (Стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
     text_lines = [
         "👑 <b>ПАНЕЛЬ УПРАВЛЕНИЯ СИСТЕМОЙ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -163,11 +197,11 @@ async def cmd_admin_panel(event):
         f"• 📦 Обработано лотов: <b>{stats['total_seen']}</b>\n"
         f"• 🛡 Защита: <b>TLS Chameleon / PoW Bypass</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👤 <b>Пользователи и права доступа:</b>\n"
+        f"👤 <b>Пользователи и права доступа{page_info}:</b>\n"
     ]
 
     buttons = []
-    for u in users:
+    for idx, u in enumerate(page_users, start=start_idx + 1):
         u_id = u["user_id"]
         is_adm = config.is_admin(u_id)
         is_allowed = bool(u.get("is_allowed"))
@@ -179,35 +213,56 @@ async def cmd_admin_panel(event):
         sub_until = u.get("subscription_until")
         sub_str = database.format_subscription_date(sub_until)
 
+        # Компактный лейбл для кнопок, чтобы верстка не разъезжалась на экранах телефонов
+        btn_tag = f"@{u['username']}" if u.get("username") else str(u_id)
+        if len(btn_tag) > 13:
+            btn_tag = btn_tag[:11] + ".."
+
         if is_adm:
-            text_lines.append(f"👑 <b>{fname}</b> ({uname}) — <i>Администратор</i>")
+            text_lines.append(f"{idx}. 👑 <b>{fname}</b> ({uname}) — <i>Администратор</i>")
         elif has_access and not is_allowed and trial_used:
-            text_lines.append(f"🎁 <b>{fname}</b> ({uname}) — <i>[Триал 24ч · 2 радара] {sub_str}</i>")
+            text_lines.append(f"{idx}. 🎁 <b>{fname}</b> ({uname}) — <i>[Триал 24ч · 2 радара] {sub_str}</i>")
             buttons.append([
-                InlineKeyboardButton(text=f"🚫 Блок {uname}", callback_data=f"admin_revoke:{u_id}"),
-                InlineKeyboardButton(text=f"🗑 Удалить {uname}", callback_data=f"admin_purge_user:{u_id}")
+                InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke:{u_id}:{page}"),
+                InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")
             ])
         elif has_access or is_allowed:
             plan = (u.get("tariff_plan") or "standart").upper()
-            text_lines.append(f"🟢 <b>{fname}</b> ({uname}) — <i>[{plan}] {sub_str}</i>")
+            text_lines.append(f"{idx}. 🟢 <b>{fname}</b> ({uname}) — <i>[{plan}] {sub_str}</i>")
             buttons.append([
-                InlineKeyboardButton(text=f"🚫 Блок {uname}", callback_data=f"admin_revoke:{u_id}"),
-                InlineKeyboardButton(text=f"🗑 Удалить {uname}", callback_data=f"admin_purge_user:{u_id}")
+                InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke:{u_id}:{page}"),
+                InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")
             ])
         else:
-            text_lines.append(f"🔴 <b>{fname}</b> ({uname}) — <i>Истёк доступ ({sub_str})</i>")
+            text_lines.append(f"{idx}. 🔴 <b>{fname}</b> ({uname}) — <i>Истёк доступ ({sub_str})</i>")
             buttons.append([
-                InlineKeyboardButton(text=f"✅ Разрешить {uname}", callback_data=f"admin_approve:{u_id}"),
-                InlineKeyboardButton(text=f"🗑 Удалить {uname}", callback_data=f"admin_purge_user:{u_id}")
+                InlineKeyboardButton(text=f"✅ Одобрить {btn_tag}", callback_data=f"admin_approve:{u_id}:{page}"),
+                InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")
             ])
 
+    # Панель постраничной навигации (только если пользователей > 5)
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin_page:{page - 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton(text="⏹", callback_data="admin_noop"))
+
+        nav_buttons.append(InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="admin_noop"))
+
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin_page:{page + 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton(text="⏹", callback_data="admin_noop"))
+
+        buttons.append(nav_buttons)
 
     buttons.append([
         InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup"),
         InlineKeyboardButton(text="📋 Скачать логи", callback_data="admin_logs_menu")
     ])
     buttons.append([
-        InlineKeyboardButton(text="🔄 Обновить список", callback_data="admin_refresh")
+        InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"admin_page:{page}")
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -216,7 +271,9 @@ async def cmd_admin_panel(event):
         try:
             await message.edit_text(full_text, reply_markup=kb, parse_mode="HTML")
             return
-        except Exception:
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
             pass
 
     await message.answer(full_text, reply_markup=kb, parse_mode="HTML")
@@ -228,11 +285,14 @@ async def cb_admin_revoke(call: CallbackQuery):
         await call.answer("У вас нет прав", show_alert=True)
         return
 
-    target_user_id = int(call.data.split(":")[1])
+    parts = call.data.split(":")
+    target_user_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+
     await database.set_user_allowed(target_user_id, 0)
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} отозвал доступ у пользователя ID:{target_user_id}")
     await call.answer("Доступ отозван")
-    await cmd_admin_panel(call)
+    await cmd_admin_panel(call, page=page)
 
 
 @router.callback_query(F.data.startswith("admin_purge_user:"))
@@ -241,11 +301,14 @@ async def cb_admin_purge_user(call: CallbackQuery):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
 
-    target_user_id = call.data.split(":")[1]
+    parts = call.data.split(":")
+    target_user_id = parts[1]
+    page = int(parts[2]) if len(parts) > 2 else 0
+
     res = await database.purge_user_by_pattern(target_user_id)
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} стер пользователя ID:{target_user_id}: {res['message']}")
     await call.answer(res["message"][:200], show_alert=True)
-    await cmd_admin_panel(call)
+    await cmd_admin_panel(call, page=page)
 
 
 @router.message(Command("delete_user"))

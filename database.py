@@ -611,7 +611,14 @@ async def get_system_stats() -> Dict[str, int]:
         async with db.execute("SELECT COUNT(*) FROM users") as cur:
             row = await cur.fetchone()
             total_users = row[0] if row else 0
-        async with db.execute("SELECT COUNT(*) FROM users WHERE is_allowed = 1") as cur:
+        admin_placeholders = ",".join("?" for _ in ADMIN_IDS)
+        query_allowed = f"""
+            SELECT COUNT(*) FROM users 
+            WHERE user_id IN ({admin_placeholders}) 
+               OR is_allowed = 1 
+               OR subscription_until > datetime('now')
+        """
+        async with db.execute(query_allowed, ADMIN_IDS) as cur:
             row = await cur.fetchone()
             allowed_users = row[0] if row else 0
         async with db.execute("SELECT COUNT(*) FROM searches") as cur:
