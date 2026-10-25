@@ -14,7 +14,7 @@ import database
 from logging.handlers import RotatingFileHandler
 from handlers import main_router
 from middlewares import AccessControlMiddleware, ActionLoggingMiddleware
-from scheduler import monitoring_worker
+from scheduler import monitoring_worker, start_background_services
 
 # Принудительная поддержка UTF-8 в консоли Windows (для эмодзи)
 if sys.platform == "win32":
@@ -105,8 +105,8 @@ async def main():
     # Удаляем вебхуки перед началом поллинга
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # Запуск фонового мониторинга поисков Авито
-    worker_task = asyncio.create_task(monitoring_worker(bot))
+    # Запуск фоновых сервисов мониторинга и очереди уведомлений под супервизором
+    background_tasks = start_background_services(bot)
 
     logger.info("Бот успешно запущен и готов к работе!")
 
@@ -114,11 +114,9 @@ async def main():
         await dp.start_polling(bot)
     finally:
         logger.info("Завершение работы бота...")
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
         await bot.session.close()
         if web_runner:
             await web_runner.cleanup()

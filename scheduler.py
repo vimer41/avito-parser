@@ -6,6 +6,7 @@ import random
 import re
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Optional, List, Dict
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -19,6 +20,34 @@ from parser import AvitoParser, AvitoItem
 logger = logging.getLogger(__name__)
 
 LAST_SCAN_TIMESTAMP = 0
+
+# ── 1. Задача для очереди доставки (Outbox Task) ──────────────────────────
+@dataclass
+class NotificationTask:
+    user_id: int
+    radar_id: int
+    search_title: str
+    item: AvitoItem
+    user_label: str = ""
+
+# ── 2. Кэш Telegram file_id для отправленных фото (экономит 100% повторных скачиваний) ──
+PHOTO_FILE_ID_CACHE: Dict[str, str] = {}
+MAX_FILE_ID_CACHE = 3000
+
+def get_cached_photo_file_id(item_id: str) -> Optional[str]:
+    return PHOTO_FILE_ID_CACHE.get(item_id)
+
+def set_cached_photo_file_id(item_id: str, file_id: str):
+    if len(PHOTO_FILE_ID_CACHE) >= MAX_FILE_ID_CACHE:
+        for k in list(PHOTO_FILE_ID_CACHE.keys())[:500]:
+            PHOTO_FILE_ID_CACHE.pop(k, None)
+    PHOTO_FILE_ID_CACHE[item_id] = file_id
+
+# ── 3. Семафор ограничения параллельных сетевых загрузок фото (лимит RAM) ──
+IMAGE_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
+
+# ── 4. Асинхронная очередь доставки уведомлений (Outbox Queue) ───────────
+NOTIFICATION_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=3000)
 
 
 def get_last_scan_info() -> str:
@@ -164,33 +193,55 @@ async def send_ad_to_user(
 ) -> bool:
     """
     Отправляет уведомление пользователю (фото или текст).
-    Возвращает False, если пользователь заблокировал бота (для прерывания цикла отправки).
+    1. Сначала проверяет кэш telegram file_id для мгновенной отправки без скачивания.
+    2. Скачивает фото через семафор (ограничение параллельных загрузок в RAM).
+    3. Сохраняет полученный telegram file_id для остальных пользователей.
     """
     caption = build_notification_text(it, search_title)
     keyboard = build_notification_keyboard(it.url, search_id, has_seller=bool(it.seller_name))
     owner_str = f" [{user_label}]" if user_label else f" ID:{user_id}"
 
+    # 1. Проверяем кэш telegram file_id (мгновенная доставка без повторного скачивания)
+    cached_fid = get_cached_photo_file_id(it.item_id)
+    if cached_fid:
+        try:
+            await bot.send_photo(
+                chat_id=user_id,
+                photo=cached_fid,
+                caption=caption,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+            logger.info(f"     ⚡️ [Радар #{search_id}{owner_str}] Доставлено (file_id кэш): {it.price} · «{it.title[:35]}»")
+            return True
+        except (TelegramForbiddenError, TelegramRetryAfter):
+            raise
+        except Exception as cache_err:
+            logger.debug(f"file_id кэш сбой ({cache_err}), скачиваем картинку заново...")
+
     try:
         photo_file: Optional[BufferedInputFile] = None
         if it.image_url:
             try:
-                img_resp = await asyncio.to_thread(parser.session.get, it.image_url, timeout=8)
-                if img_resp.status_code == 200 and len(img_resp.content) > 500:
-                    photo_file = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
+                async with IMAGE_DOWNLOAD_SEMAPHORE:
+                    img_resp = await asyncio.to_thread(parser.session.get, it.image_url, timeout=8)
+                    if img_resp.status_code == 200 and len(img_resp.content) > 500:
+                        photo_file = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
             except Exception as dl_err:
                 logger.debug(f"Не удалось скачать фото #{it.item_id}: {dl_err}")
 
-        # Отправляем фото ТОЛЬКО если успешно скачали реальные байты в BufferedInputFile.
-        # Никогда не передаем сырой URL в Telegram, так как Telegram-сервер получит 403 от Avito CDN!
+        # Отправляем фото и сохраняем telegram file_id в кэш
         if photo_file:
             try:
-                await bot.send_photo(
+                sent_msg = await bot.send_photo(
                     chat_id=user_id,
                     photo=photo_file,
                     caption=caption,
                     reply_markup=keyboard,
                     parse_mode="HTML"
                 )
+                if sent_msg.photo:
+                    set_cached_photo_file_id(it.item_id, sent_msg.photo[-1].file_id)
                 logger.info(f"     🚀 [Радар #{search_id}{owner_str}] Доставлено (с фото): {it.price} · «{it.title[:35]}»")
                 return True
             except (TelegramForbiddenError, TelegramRetryAfter):
@@ -307,10 +358,14 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
                     logger.info(f"     🚷 Отсеян продавец «{it.seller_name}» из ЧС [{user_str}]")
                     continue
 
-                ok = await send_ad_to_user(bot, parser, user_id, radar_id, search_title, it, user_str)
-                if not ok:
-                    break
-                await asyncio.sleep(0.5)
+                # Помещаем задачу в асинхронную очередь Outbox (мониторинг не ждёт отправки!)
+                await NOTIFICATION_QUEUE.put(NotificationTask(
+                    user_id=user_id,
+                    radar_id=radar_id,
+                    search_title=search_title,
+                    item=it,
+                    user_label=user_str
+                ))
 
         global LAST_SCAN_TIMESTAMP
         LAST_SCAN_TIMESTAMP = time.time()
@@ -321,13 +376,14 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
         return False
 
 
-async def monitoring_worker(bot: Bot):
+async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
     """
     Главный бесконечный цикл фонового мониторинга поисков.
     Оптимизирован для 512 МБ RAM и минимального числа HTTP-запросов к Авито (дедупликация URL).
     """
     logger.info("🚀 Запуск фонового сервиса мониторинга Авито...")
-    parser = AvitoParser()
+    if parser is None:
+        parser = AvitoParser()
     cycle_count = 0
     consecutive_failures = 0
     alert_sent = False
@@ -428,6 +484,85 @@ async def monitoring_worker(bot: Bot):
                     pass
             gc.collect()
             await asyncio.sleep(10)
+
+
+async def notification_worker(bot: Bot, parser: AvitoParser):
+    """
+    Фоновый воркер асинхронной очереди уведомлений (Outbox Worker).
+    Отправляет уведомления в Telegram независимо от цикла сканирования радаров.
+    Соблюдает безопасный лимит скорости (~20 сообщений/сек) и обрабатывает ошибки Telegram.
+    """
+    logger.info("📬 Фоновый сервис очереди уведомлений Telegram запущен")
+    while True:
+        try:
+            task: NotificationTask = await NOTIFICATION_QUEUE.get()
+            try:
+                await send_ad_to_user(
+                    bot=bot,
+                    parser=parser,
+                    user_id=task.user_id,
+                    search_id=task.radar_id,
+                    search_title=task.search_title,
+                    it=task.item,
+                    user_label=task.user_label
+                )
+            except TelegramForbiddenError:
+                logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{task.user_id} заблокировал бота. Отключаем его радары.")
+                await database.deactivate_user_searches(task.user_id)
+            except TelegramRetryAfter as retry_err:
+                logger.warning(f"⏳ [FLOODWAIT] Telegram лимит: пауза {retry_err.retry_after} сек.")
+                await asyncio.sleep(retry_err.retry_after + 1)
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки уведомления для ID:{task.user_id}: {e}")
+            finally:
+                NOTIFICATION_QUEUE.task_done()
+                # Мягкое ограничение скорости: ~20 сообщений в секунду суммарно (50 мс)
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            logger.info("🛑 Сервис очереди уведомлений остановлен.")
+            break
+        except Exception as loop_err:
+            logger.error(f"Неожиданный сбой в notification_worker: {loop_err}")
+            await asyncio.sleep(1)
+
+
+async def supervised_monitoring_worker(bot: Bot, parser: AvitoParser):
+    """
+    Супервизор фонового мониторинга:
+    - Запускает бесконечный мониторинг;
+    - При любом непредвиденном падении отправляет алерт администраторам и перезапускает процесс.
+    """
+    while True:
+        try:
+            await monitoring_worker(bot, parser)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.critical(f"💥 [СУПЕРВИЗОР] Фатальное падение сервиса мониторинга: {e}", exc_info=True)
+            alert_text = (
+                f"🚨 <b>Критический сбой сервиса мониторинга!</b>\n\n"
+                f"<code>{html.escape(str(e)[:300])}</code>\n\n"
+                f"<i>Автоматический перезапуск мониторинга через 15 секунд...</i>"
+            )
+            for aid in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(chat_id=aid, text=alert_text, parse_mode="HTML")
+                except Exception:
+                    pass
+            await asyncio.sleep(15)
+
+
+def start_background_services(bot: Bot) -> List[asyncio.Task]:
+    """
+    Запускает все фоновые сервисы:
+    1. Очередь отправки уведомлений (notification_worker)
+    2. Мониторинг Авито под супервизором (supervised_monitoring_worker)
+    Возвращает список фоновых задач для управления их жизненным циклом.
+    """
+    shared_parser = AvitoParser()
+    notif_task = asyncio.create_task(notification_worker(bot, shared_parser))
+    monitor_task = asyncio.create_task(supervised_monitoring_worker(bot, shared_parser))
+    return [notif_task, monitor_task]
 
 
 
