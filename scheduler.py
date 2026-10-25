@@ -367,7 +367,7 @@ async def monitoring_worker(bot: Bot):
                     )
                     if consecutive_failures >= FAILURE_THRESHOLD and not alert_sent:
                         alert_sent = True
-                        current_p = parser.current_proxy or "Прямое соединение (без прокси)"
+                        current_p = getattr(parser, "current_proxy", None) or "Прямое соединение (без прокси)"
                         alert_msg = (
                             f"🚨 <b>ВНИМАНИЕ: Сбой мониторинга Авито!</b>\n\n"
                             f"Мониторинг не может получить данные уже <b>{consecutive_failures} кругов подряд</b> (~{consecutive_failures} мин).\n"

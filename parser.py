@@ -10,12 +10,15 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
-from config import PROXY_URL, DATA_DIR
+from config import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
 COOKIE_FILE = DATA_DIR / "avito_cookies.json"
-WORKING_PROXY_FILE = DATA_DIR / "working_proxy.txt"
+
+# Пауза при блокировке IP Авито: 1 → 2 → 4 → 8 → 15 мин (максимум)
+BLOCK_BASE_COOLDOWN = 60
+BLOCK_MAX_COOLDOWN = 15 * 60
 
 @dataclass
 class AvitoItem:
@@ -35,34 +38,41 @@ class AvitoItem:
 
 
 class AvitoParser:
-    _WORKING_PROXY_OVERRIDE: Optional[str] = None
-
-    def __init__(self, proxy: Optional[str] = PROXY_URL):
-        if AvitoParser._WORKING_PROXY_OVERRIDE:
-            self.proxy = AvitoParser._WORKING_PROXY_OVERRIDE
-        elif WORKING_PROXY_FILE.exists():
-            try:
-                saved = WORKING_PROXY_FILE.read_text("utf-8").strip()
-                if saved:
-                    AvitoParser._WORKING_PROXY_OVERRIDE = saved
-                    self.proxy = saved
-                else:
-                    self.proxy = proxy
-            except Exception:
-                self.proxy = proxy
-        else:
-            self.proxy = proxy
-
-        self.current_proxy = self.proxy
-        self.proxy_fail_count = 0
-        self.session = self._create_session(self.current_proxy)
+    def __init__(self):
+        self.session = self._create_session()
+        self._last_saved_cookies: dict = {}
         self._load_cookies()
 
-    def _create_session(self, proxy: Optional[str] = None) -> requests.Session:
-        proxies = None
-        if proxy:
-            proxies = {"http": proxy, "https": proxy}
+        self.current_proxy: Optional[str] = None
 
+        # Защита от бана: пока активна пауза, к Авито не отправляется ни одного запроса
+        self.blocked_until: float = 0.0
+        self.block_streak: int = 0
+
+        # Кэш SSR-редиректов Авито: исходный URL -> канонический URL (экономит 1 запрос на радар)
+        self._canonical_cache: dict = {}
+
+    # ─── Состояние блокировки ────────────────────────────────────────────
+    def is_blocked(self) -> bool:
+        return time.time() < self.blocked_until
+
+    def block_remaining(self) -> int:
+        return max(0, int(self.blocked_until - time.time()))
+
+    def _register_block(self, status: int):
+        self.block_streak += 1
+        cooldown = min(BLOCK_BASE_COOLDOWN * 2 ** (self.block_streak - 1), BLOCK_MAX_COOLDOWN)
+        self.blocked_until = time.time() + cooldown
+        logger.warning(
+            f"🛑 Авито ограничил доступ (статус {status}). "
+            f"Не трогаем Авито {cooldown // 60} мин, чтобы IP «остыл» (блок #{self.block_streak} подряд)"
+        )
+
+    @staticmethod
+    def _is_firewall(r) -> bool:
+        return r.status_code in (403, 429, 439) or "firewall-container" in r.text
+
+    def _create_session(self) -> requests.Session:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -75,20 +85,15 @@ class AvitoParser:
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
         }
-        session = requests.Session(
-            impersonate="chrome120",
-            proxies=proxies,
-            headers=headers,
-            timeout=20
-        )
-        return session
+        return requests.Session(impersonate="chrome120", headers=headers, timeout=20)
 
     def _save_cookies(self):
         """Сохраняет текущие валидные куки сессии на диск (исключая временный pow_challenge)."""
         try:
             cookie_dict = dict(self.session.cookies)
             cookie_dict.pop("pow_challenge", None)
-            if cookie_dict:
+            if cookie_dict and cookie_dict != self._last_saved_cookies:
+                self._last_saved_cookies = cookie_dict
                 COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
                 with open(COOKIE_FILE, "w", encoding="utf-8") as f:
                     json.dump(cookie_dict, f, ensure_ascii=False, indent=2)
@@ -112,57 +117,6 @@ class AvitoParser:
         except Exception as e:
             logger.warning(f"Ошибка загрузки кук из файла: {e}")
 
-    def _init_session(self, clear_cookies: bool = False):
-        """Пересоздание сессии. Если clear_cookies=False, куки сохраняются/подгружаются."""
-        try:
-            self.session.close()
-        except Exception:
-            pass
-        if clear_cookies and COOKIE_FILE.exists():
-            try:
-                COOKIE_FILE.unlink()
-                logger.info("Файл кук удален для полной очистки сессии.")
-            except Exception:
-                pass
-
-        self.session = self._create_session(self.current_proxy)
-        if not clear_cookies:
-            self._load_cookies()
-
-    def _handle_proxy_error(self, err: Exception):
-        """Обработка ошибок прокси: автоматический переход на socks5 или фолбэк на прямое соединение."""
-        self.proxy_fail_count += 1
-        err_str = str(err)
-        logger.warning(f"⚠️ Ошибка прокси (сбой #{self.proxy_fail_count}): {err_str[:120]}")
-
-        # Если HTTP-прокси упал с CONNECT tunnel failed (часто бывает на портах, где работает SOCKS5),
-        # пробуем переключиться на socks5://
-        if self.current_proxy and self.current_proxy.startswith("http://") and "CONNECT tunnel failed" in err_str:
-            logger.info("🔄 Прокси вернул ошибку CONNECT tunnel на HTTP. Автоматически переключаем на протокол SOCKS5...")
-            self.current_proxy = self.current_proxy.replace("http://", "socks5://", 1)
-            self.proxy = self.current_proxy
-            AvitoParser._WORKING_PROXY_OVERRIDE = self.current_proxy
-            try:
-                WORKING_PROXY_FILE.parent.mkdir(parents=True, exist_ok=True)
-                WORKING_PROXY_FILE.write_text(self.current_proxy, "utf-8")
-            except Exception:
-                pass
-            self.proxy_fail_count = 0
-            self._init_session(clear_cookies=False)
-            return
-
-        # Если 2 сбоя подряд — временный фолбэк на прямое соединение
-        if self.proxy_fail_count >= 2:
-            logger.warning("🚨 Прокси заблокирован Авито или недоступен! Включаем фолбэк на прямое подключение (без прокси).")
-            self.current_proxy = None
-            self.proxy = None
-            AvitoParser._WORKING_PROXY_OVERRIDE = None
-            try:
-                if WORKING_PROXY_FILE.exists():
-                    WORKING_PROXY_FILE.unlink()
-            except Exception:
-                pass
-            self._init_session(clear_cookies=False)
 
 
 
@@ -303,69 +257,68 @@ class AvitoParser:
 
     def fetch_page(self, url: str) -> Optional[str]:
         """
-        Загружает страницу Авито с автообходом защиты QRATOR / PoW, персистентными куками и фолбэком прокси.
+        Загружает страницу Авито (прямое соединение):
+        - при защите Qrator решает PoW один раз и повторяет запрос;
+        - если Авито всё равно блокирует — включает паузу (1→2→4→8→15 мин) и НЕ шлёт запросы,
+          чтобы не продлевать бан бесконечными повторами;
+        - кэширует SSR-редиректы Авито, чтобы не делать 2 запроса на каждый радар.
         """
-        for attempt in range(2):
-            try:
-                r = self.session.get(url, timeout=20, allow_redirects=True)
+        if self.is_blocked():
+            return None
 
-                # Проверяем, не попали ли мы на страницу блокировки /blocked
-                if "/blocked" in str(r.url):
-                    logger.warning(f"🚫 Редирект на страницу блокировки: {r.url}")
+        target = self._canonical_cache.get(url, url)
+        human = self._human_url(url)
 
-                # Если получили 403/429/439 или challenge
-                pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
-                if (r.status_code in (403, 429, 439) or "firewall-container" in r.text):
-                    if not pow_challenge:
-                        logger.info("Обновляем сессию и запрашиваем свежий PoW-челлендж через главную страницу avito.ru...")
-                        r_main = self.session.get("https://www.avito.ru", timeout=15, allow_redirects=True)
-                        pow_challenge = self.session.cookies.get("pow_challenge") or r_main.cookies.get("pow_challenge")
+        try:
+            r = self.session.get(target, timeout=20, allow_redirects=True)
 
-                    if pow_challenge:
-                        logger.info("Обнаружена PoW-защита Авито, решаем...")
-                        if self._solve_pow_challenge(pow_challenge):
-                            time.sleep(1.0)
-                            r = self.session.get(url, timeout=20, allow_redirects=True)
-                            logger.info(f"Повторный запрос после PoW: статус {r.status_code}")
+            if self._is_firewall(r):
+                challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
 
-                if r.status_code == 200:
-                    self.proxy_fail_count = 0  # Сбрасываем счетчик ошибок при успешном запросе
-                    self._save_cookies()       # Сохраняем свежие куки сессии
+                # Челлендж иногда выдаётся только на главной — пробуем один раз, если это первый блок
+                if not challenge and self.block_streak == 0:
+                    r_main = self.session.get("https://www.avito.ru", timeout=15, allow_redirects=True)
+                    challenge = self.session.cookies.get("pow_challenge") or r_main.cookies.get("pow_challenge")
 
-                    # Проверяем, не является ли страница внутренним SSR-редиректом Авито
-                    if '"isSuspenseRedirect":true' in r.text or ('"redirect":' in r.text and '"items"' not in r.text):
-                        m_redir = re.search(r'"redirect"\s*:\s*"([^"]+)"', r.text)
-                        if m_redir:
-                            redir_path = m_redir.group(1).replace(r"\u0026", "&")
-                            canonical_url = "https://www.avito.ru" + redir_path if redir_path.startswith("/") else redir_path
-                            logger.info(f"🔄 [АВИТО 301] Переход на канонический URL: {self._human_url(canonical_url)}")
-                            r_canon = self.session.get(canonical_url, timeout=20, allow_redirects=True)
-                            if r_canon.status_code == 200:
-                                return r_canon.text
+                if challenge:
+                    logger.info("🧩 Авито выдал PoW-проверку, решаем...")
+                    if self._solve_pow_challenge(challenge):
+                        time.sleep(1.0)
+                        r = self.session.get(target, timeout=20, allow_redirects=True)
 
-                    return r.text
-                else:
-                    logger.warning(f"Не удалось получить {self._human_url(url)} (статус {r.status_code})")
-                    if self.current_proxy and r.status_code in (403, 429):
-                        self._handle_proxy_error(Exception(f"Avito статус {r.status_code} на прокси"))
-                    if attempt == 0 and r.status_code in (403, 429):
-                        time.sleep(2.0)
-                        continue
+                if self._is_firewall(r):
+                    self._register_block(r.status_code)
                     return None
 
-            except Exception as e:
-                err_msg = str(e)
-                if "curl: (28)" in err_msg or "Proxy" in type(e).__name__ or "CONNECT tunnel" in err_msg or "ConnectionError" in type(e).__name__:
-                    self._handle_proxy_error(e)
-
-                if attempt == 0:
-                    logger.warning(f"Сбой подключения к {self._human_url(url)} ({e}), повтор через 2 сек...")
-                    time.sleep(2.0)
-                    self._init_session(clear_cookies=False)
-                    continue
-                logger.error(f"Ошибка запроса к {self._human_url(url)}: {e}")
+            if r.status_code != 200:
+                logger.warning(f"⚠️ {human}: Авито ответил статусом {r.status_code}")
                 return None
-        return None
+
+            # Успех — сбрасываем серию блокировок
+            if self.block_streak:
+                logger.info("✅ Доступ к Авито восстановлен")
+            self.block_streak = 0
+            self._save_cookies()
+            html = r.text
+
+            # Внутренний SSR-редирект Авито (ссылка устарела) — переходим и запоминаем канонический URL
+            if '"isSuspenseRedirect":true' in html:
+                m_redir = re.search(r'"redirect"\s*:\s*"([^"]+)"', html)
+                if m_redir:
+                    redir_path = m_redir.group(1).replace(r"\u0026", "&")
+                    canonical = "https://www.avito.ru" + redir_path if redir_path.startswith("/") else redir_path
+                    self._canonical_cache[url] = canonical
+                    logger.info(f"↪️ {human}: Авито сменил адрес выдачи, запомнили новый")
+                    r2 = self.session.get(canonical, timeout=20, allow_redirects=True)
+                    if r2.status_code == 200 and not self._is_firewall(r2):
+                        return r2.text
+                    return None
+
+            return html
+
+        except Exception as e:
+            logger.warning(f"🌐 {human}: сетевая ошибка — {str(e)[:120]}")
+            return None
 
     @staticmethod
     def extract_search_title(html: str, fallback_url: str) -> str:
@@ -521,21 +474,38 @@ class AvitoParser:
         Работает в 100 раз быстрее BeautifulSoup и отдает точный timestamp публикации в миллисекундах.
         """
         try:
-            scripts = re.findall(r'<script[^>]*>([\s\S]*?)</script>', html)
             catalog_items = None
+            candidates: List[str] = []
 
-            for s in scripts:
-                if '"catalog"' in s and '"items"' in s and len(s) > 10000:
-                    m = re.search(r'(\{[\s\S]*\})', s)
-                    if m:
-                        try:
-                            data = json.loads(m.group(1))
-                            items = data.get("loaderData", {}).get("data", {}).get("catalog", {}).get("items")
-                            if items and isinstance(items, list):
-                                catalog_items = items
-                                break
-                        except Exception:
-                            continue
+            # Быстрый путь: блок состояния страницы всегда начинается с {"i18n" внутри <script>
+            start = html.find('>{"i18n"')
+            if start != -1:
+                end = html.find("</script>", start)
+                if end != -1:
+                    candidates.append(html[start + 1:end])
+
+            # Запасной путь: перебор всех script-тегов
+            if not candidates:
+                candidates = [
+                    s for s in re.findall(r'<script[^>]*>([\s\S]*?)</script>', html)
+                    if '"catalog"' in s and '"items"' in s and len(s) > 10000
+                ]
+
+            for raw in candidates:
+                raw = raw.strip()
+                if not raw.startswith("{"):
+                    m = re.search(r'(\{[\s\S]*\})', raw)
+                    if not m:
+                        continue
+                    raw = m.group(1)
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+                items = data.get("loaderData", {}).get("data", {}).get("catalog", {}).get("items")
+                if items and isinstance(items, list):
+                    catalog_items = items
+                    break
 
             if not catalog_items:
                 return None
