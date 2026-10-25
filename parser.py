@@ -83,9 +83,10 @@ class AvitoParser:
         return session
 
     def _save_cookies(self):
-        """Сохраняет текущие валидные куки сессии на диск."""
+        """Сохраняет текущие валидные куки сессии на диск (исключая временный pow_challenge)."""
         try:
             cookie_dict = dict(self.session.cookies)
+            cookie_dict.pop("pow_challenge", None)
             if cookie_dict:
                 COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
                 with open(COOKIE_FILE, "w", encoding="utf-8") as f:
@@ -102,6 +103,7 @@ class AvitoParser:
             with open(COOKIE_FILE, "r", encoding="utf-8") as f:
                 cookie_dict = json.load(f)
             if isinstance(cookie_dict, dict) and cookie_dict:
+                cookie_dict.pop("pow_challenge", None)
                 for k, v in cookie_dict.items():
                     self.session.cookies.set(k, str(v), domain=".avito.ru", path="/")
                 logger.info(f"🍪 Загружено {len(cookie_dict)} сохранённых кук из {COOKIE_FILE.name}")
@@ -219,6 +221,10 @@ class AvitoParser:
             )
             if get_resp.status_code != 200:
                 logger.error(f"Ошибка получения pow challenge: {get_resp.status_code}")
+                try:
+                    self.session.cookies.pop("pow_challenge", None)
+                except Exception:
+                    pass
                 return False
 
             get_data = get_resp.json()
@@ -281,7 +287,7 @@ class AvitoParser:
                     logger.warning(f"🚫 Редирект на страницу блокировки: {r.url}")
 
                 # Если получили 403/429/439 или challenge
-                pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
+                pow_challenge = r.cookies.get("pow_challenge") or self.session.cookies.get("pow_challenge")
                 if (r.status_code in (403, 429, 439) or "firewall-container" in r.text) and pow_challenge:
                     logger.info("Обнаружена PoW-защита Авито, решаем...")
                     if self._solve_pow_challenge(pow_challenge):
@@ -293,7 +299,7 @@ class AvitoParser:
                     # Если получили 403/429 без челленджа, пробуем перепроверить сессию
                     logger.info(f"Статус {r.status_code}, проверяем наличие PoW...")
                     time.sleep(1.0)
-                    pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
+                    pow_challenge = r.cookies.get("pow_challenge") or self.session.cookies.get("pow_challenge")
                     if pow_challenge:
                         if self._solve_pow_challenge(pow_challenge):
                             time.sleep(1.0)

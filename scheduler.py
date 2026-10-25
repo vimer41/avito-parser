@@ -254,27 +254,32 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             if not new_items:
                 continue
 
-            # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ до фильтра свежести!
-            # Тогда даже если лоту '1 час назад', на следующем круге он уже будет в seen_ids
-            # и никогда повторно не всплывет в логах.
+            # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ, чтобы они не всплывали повторно
             await database.mark_items_seen_bulk(radar_id, [it.item_id for it in new_items])
 
-            # Защита от пачки при первом запуске или сдвиге выдачи
-            if len(new_items) > 5:
+            # 1. Отбираем только действительно свежие объявления (до 10 минут)
+            fresh_items = []
+            for it in new_items:
+                if is_ad_fresh_enough(it.date):
+                    fresh_items.append(it)
+                else:
+                    logger.info(
+                        f"⏳ [РАДАР #{radar_id}] Объявление #{it.item_id} пропущено как старое (дата: '{it.date}')"
+                    )
+
+            if not fresh_items:
+                continue
+
+            # Защита от пачки: если ДАЖЕ среди свежих объявлений их больше 5 штук одновременно
+            if len(fresh_items) > 5:
                 logger.info(
-                    f"📦 [РАДАР #{radar_id}] Обнаружена пачка из {len(new_items)} лотов. "
+                    f"📦 [РАДАР #{radar_id}] Обнаружена аномальная пачка из {len(fresh_items)} свежих лотов. "
                     f"Запоминаем без спама пользователю."
                 )
                 continue
 
             # Отправляем в хронологическом порядке (снизу вверх)
-            for it in reversed(new_items):
-                # 1. Проверяем свежесть
-                if not is_ad_fresh_enough(it.date):
-                    logger.info(
-                        f"⏳ [РАДАР #{radar_id}] Объявление #{it.item_id} пропущено как старое (дата: '{it.date}')"
-                    )
-                    continue
+            for it in reversed(fresh_items):
 
                 # 2. Проверяем стоп-слова
                 matched_stop = is_stop_word_matched(it, stop_words)
