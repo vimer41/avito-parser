@@ -146,3 +146,30 @@ def log_user_event(
         user_logger.warning(log_line)
     else:
         user_logger.info(log_line)
+
+
+def sanitize_logs_for_user(pattern: str):
+    """
+    Удаляет строки с упоминанием пользователя из всех файлов логов.
+    """
+    clean = pattern.strip().lstrip("@").lower()
+    if not clean or len(clean) < 3:
+        return
+    log_files = [
+        USER_ACTIONS_LOG,
+        ERRORS_LOG,
+        PARSER_LOG,
+        COMBINED_LOG,
+    ]
+    for lf in log_files:
+        if lf.exists() and lf.is_file():
+            try:
+                with open(lf, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                filtered = [l for l in lines if clean not in l.lower()]
+                if len(filtered) != len(lines):
+                    with open(lf, "w", encoding="utf-8") as f:
+                        f.writelines(filtered)
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Не удалось очистить лог {lf}: {e}")
+

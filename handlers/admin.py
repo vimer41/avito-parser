@@ -94,6 +94,7 @@ async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
 
     until = await database.grant_subscription(target_user_id, days=days, tariff_plan=plan)
     max_radars = await database.get_user_max_radars(target_user_id)
+    formatted_until = database.format_subscription_date(until)
 
     plan_title = "🔥 PRO" if plan == "pro" else "⚡️ STANDART"
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} выдал подписку {plan_title} на {days} дн. пользователю ID:{target_user_id}")
@@ -102,7 +103,7 @@ async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
         f"✅ <b>Подписка {plan_title} успешно выдана!</b>\n\n"
         f"👤 ID пользователя: <code>{target_user_id}</code>\n"
         f"📦 Тариф: <b>{plan_title}</b> (до {max_radars} радаров)\n"
-        f"📅 Активна до: <b>{str(until)[:16]}</b> ({days} дн.)",
+        f"📅 Срок действия: <b>{formatted_until}</b> ({days} дн.)",
         parse_mode="HTML"
     )
     await call.answer(f"Подписка {plan_title} активирована!")
@@ -111,7 +112,8 @@ async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
     try:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt")],
-            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")]
+            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")]
         ])
         await bot.send_message(
             chat_id=target_user_id,
@@ -119,7 +121,7 @@ async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
                 f"🎉 <b>Оплата подтверждена! Ваша подписка {plan_title} активирована!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 Доступно активных радаров: <b>{max_radars} шт.</b>\n"
-                f"📅 Срок действия: <b>до {str(until)[:16]}</b> ({days} дн.)\n\n"
+                f"📅 Срок действия: <b>{formatted_until}</b> ({days} дн.)\n\n"
                 f"Все ограничения сняты! Теперь бот моментально присылает новые лоты с Авито с реальными HD фото. "
                 f"Удачных и прибыльных покупок!"
             ),
@@ -128,6 +130,7 @@ async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
         )
     except Exception as e:
         logger.warning(f"Не удалось уведомить пользователя {target_user_id} об активации подписки: {e}")
+
 
 
 # ── Панель администратора (/admin, /users, кнопка в меню) ─────────────
@@ -174,11 +177,20 @@ async def cmd_admin_panel(event):
         if is_adm:
             text_lines.append(f"👑 <b>{fname}</b> ({uname}) — <i>Администратор</i>")
         elif is_allowed:
-            text_lines.append(f"🟢 <b>{fname}</b> ({uname}) — <i>Доступ разрешён</i>")
-            buttons.append([InlineKeyboardButton(text=f"🚫 Заблокировать {uname}", callback_data=f"admin_revoke:{u_id}")])
+            plan = (u.get("tariff_plan") or "standart").upper()
+            sub_str = database.format_subscription_date(u.get("subscription_until"))
+            text_lines.append(f"🟢 <b>{fname}</b> ({uname}) — <i>[{plan}] {sub_str}</i>")
+            buttons.append([
+                InlineKeyboardButton(text=f"🚫 Блок {uname}", callback_data=f"admin_revoke:{u_id}"),
+                InlineKeyboardButton(text=f"🗑 Удалить {uname}", callback_data=f"admin_purge_user:{u_id}")
+            ])
         else:
-            text_lines.append(f"🔴 <b>{fname}</b> ({uname}) — <i>Ограничен / Заблокирован</i>")
-            buttons.append([InlineKeyboardButton(text=f"✅ Разрешить {uname}", callback_data=f"admin_approve:{u_id}")])
+            sub_str = database.format_subscription_date(u.get("subscription_until"))
+            text_lines.append(f"🔴 <b>{fname}</b> ({uname}) — <i>Ограничен ({sub_str})</i>")
+            buttons.append([
+                InlineKeyboardButton(text=f"✅ Разрешить {uname}", callback_data=f"admin_approve:{u_id}"),
+                InlineKeyboardButton(text=f"🗑 Удалить {uname}", callback_data=f"admin_purge_user:{u_id}")
+            ])
 
     buttons.append([
         InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup"),
@@ -211,6 +223,44 @@ async def cb_admin_revoke(call: CallbackQuery):
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} отозвал доступ у пользователя ID:{target_user_id}")
     await call.answer("Доступ отозван")
     await cmd_admin_panel(call)
+
+
+@router.callback_query(F.data.startswith("admin_purge_user:"))
+async def cb_admin_purge_user(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+
+    target_user_id = call.data.split(":")[1]
+    res = await database.purge_user_by_pattern(target_user_id)
+    logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} стер пользователя ID:{target_user_id}: {res['message']}")
+    await call.answer(res["message"][:200], show_alert=True)
+    await cmd_admin_panel(call)
+
+
+@router.message(Command("delete_user"))
+@router.message(Command("purge_user"))
+async def cmd_purge_user(message: Message):
+    if not config.is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "⚠️ <b>Использование команды:</b>\n"
+            "<code>/delete_user @username</code> или <code>/delete_user 12345678</code>\n\n"
+            "<i>Полностью стирает пользователя, его радары, историю лотов и логи из системы.</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    pattern = parts[1].strip()
+    res = await database.purge_user_by_pattern(pattern)
+    if res["success"]:
+        await message.answer(f"✅ <b>Пользователь успешно удален из системы!</b>\n\n{html.escape(res['message'])}", parse_mode="HTML")
+    else:
+        await message.answer(f"⚠️ {html.escape(res['message'])}", parse_mode="HTML")
+
 
 
 # ── Выгрузка базы данных SQLite ────────────────────────────────────────

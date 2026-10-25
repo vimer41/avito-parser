@@ -89,6 +89,36 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         lock3 = await get_item_lock("item_200")
         self.assertIsNot(lock1, lock3)
 
+    def test_format_subscription_date_msk(self):
+        """Проверка корректной конвертации даты подписки из UTC в MSK (UTC+3) и расчета остатка."""
+        from datetime import datetime, timezone, timedelta
+        # Допустим, подписка действует до момента через 24 часа
+        target_utc = datetime.now(timezone.utc) + timedelta(hours=24)
+        raw_str = target_utc.strftime("%Y-%m-%d %H:%M:%S")
+        formatted = database.format_subscription_date(raw_str)
+        self.assertIn("(МСК)", formatted)
+        self.assertIn("осталось", formatted)
+
+    async def test_purge_user_by_pattern(self):
+        """Проверка полного удаления пользователя, радаров и данных из БД."""
+        u_id = 999888777
+        await database.get_or_create_user(u_id, "johnpeterson92", "John")
+        await database.add_search(u_id, "iPhone 15", "https://avito.ru/search", 0)
+        searches_before = await database.get_user_searches(u_id)
+        self.assertEqual(len(searches_before), 1)
+
+        # Вызываем удаление по username
+        res = await database.purge_user_by_pattern("johnpeterson92")
+        self.assertTrue(res["success"])
+        self.assertGreaterEqual(res["deleted"], 1)
+
+        # Проверяем, что пользователь и его радары полностью исчезли
+        user_check = await database.get_all_users()
+        self.assertFalse(any(u["user_id"] == u_id for u in user_check))
+        searches_after = await database.get_user_searches(u_id)
+        self.assertEqual(len(searches_after), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

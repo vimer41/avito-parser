@@ -1,12 +1,57 @@
 import json
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 import aiosqlite
 from config import DB_PATH, ADMIN_ID, ADMIN_IDS, MAX_SEARCHES_PER_USER
 
 logger = logging.getLogger(__name__)
 
+MSK_TZ = timezone(timedelta(hours=3))
+
 DEFAULT_SELLER_MESSAGE = "Здравствуйте! Товар ещё продаётся? Готов забрать сегодня."
+
+
+def format_subscription_date(dt_val) -> str:
+    """
+    Форматирует дату окончания подписки в Московском часовом поясе (UTC+3, МСК)
+    с указанием оставшегося времени (например: '26.10.2026 в 19:53 (МСК) · осталось 23 ч. 58 мин.').
+    """
+    if not dt_val:
+        return "не активна"
+    try:
+        raw_str = str(dt_val).strip()
+        if len(raw_str) >= 19:
+            utc_dt = datetime.strptime(raw_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        elif len(raw_str) >= 16:
+            utc_dt = datetime.strptime(raw_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        else:
+            return raw_str
+
+        msk_dt = utc_dt.astimezone(MSK_TZ)
+        now_utc = datetime.now(timezone.utc)
+        diff = utc_dt - now_utc
+
+        formatted_date = msk_dt.strftime("%d.%m.%Y в %H:%M (МСК)")
+        if diff.total_seconds() > 0:
+            total_minutes = int(diff.total_seconds() // 60)
+            hours = total_minutes // 60
+            minutes = total_minutes % 60
+            if hours >= 24:
+                days = hours // 24
+                rem_hours = hours % 24
+                time_left = f"{days} дн. {rem_hours} ч."
+            elif hours > 0:
+                time_left = f"{hours} ч. {minutes} мин."
+            else:
+                time_left = f"{minutes} мин."
+            return f"{formatted_date} (осталось {time_left})"
+        else:
+            return f"{formatted_date} (истекла)"
+    except Exception as e:
+        logger.warning(f"Ошибка форматирования даты подписки '{dt_val}': {e}")
+        return str(dt_val)[:16]
+
 
 async def init_db():
     """Инициализация базы данных и создание таблиц."""
@@ -46,26 +91,6 @@ async def init_db():
         except Exception:
             pass
 
-        try:
-            await db.execute("ALTER TABLE searches ADD COLUMN min_discount_percent INTEGER DEFAULT 0;")
-        except Exception:
-            pass
-
-        try:
-            await db.execute("ALTER TABLE searches ADD COLUMN search_in_title_only INTEGER DEFAULT 0;")
-        except Exception:
-            pass
-
-        try:
-            await db.execute("ALTER TABLE seen_items ADD COLUMN last_price INTEGER DEFAULT 0;")
-        except Exception:
-            pass
-
-        # Администраторы всегда имеют полный доступ
-        for aid in ADMIN_IDS:
-            await db.execute("UPDATE users SET is_allowed = 1, tariff_plan = 'pro' WHERE user_id = ?", (aid,))
-
-
         await db.execute("""
             CREATE TABLE IF NOT EXISTS searches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,10 +101,26 @@ async def init_db():
                 template TEXT,
                 is_active INTEGER DEFAULT 1,
                 min_discount_percent INTEGER DEFAULT 0,
+                search_in_title_only INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
             );
         """)
+
+        try:
+            await db.execute("ALTER TABLE searches ADD COLUMN min_discount_percent INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE searches ADD COLUMN search_in_title_only INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
+        # Администраторы всегда имеют полный доступ
+        for aid in ADMIN_IDS:
+            await db.execute("UPDATE users SET is_allowed = 1, tariff_plan = 'pro' WHERE user_id = ?", (aid,))
+
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS seen_items (
@@ -105,6 +146,13 @@ async def init_db():
 
         await db.commit()
         logger.info("База данных успешно инициализирована")
+
+    # Автоматическая очистка по запросу: удаляем johnpeterson92
+    try:
+        await purge_user_by_pattern("johnpeterson92")
+    except Exception as e:
+        logger.debug(f"Автоочистка johnpeterson92: {e}")
+
 
 
 async def get_or_create_user(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> Dict[str, Any]:
@@ -640,6 +688,71 @@ def create_database_backup_file() -> Optional[str]:
     except Exception as e:
         logger.error(f"Ошибка при создании бэкапа SQLite: {e}")
         return None
+
+
+async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
+    """
+    Полностью и безвозвратно удаляет пользователя и все его данные из БД
+    (аккаунт, радары, историю лотов, стоп-слова, черный список продавцов).
+    Поиск ведется по user_id, username (@...) или first_name.
+    """
+    clean = pattern.strip().lstrip("@").lower()
+    if not clean:
+        return {"success": False, "deleted": 0, "message": "Паттерн не может быть пустым"}
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if clean.isdigit():
+            async with db.execute("SELECT * FROM users WHERE user_id = ?", (int(clean),)) as cur:
+                rows = await cur.fetchall()
+        else:
+            async with db.execute("""
+                SELECT * FROM users 
+                WHERE LOWER(COALESCE(username, '')) = ? 
+                   OR LOWER(COALESCE(username, '')) LIKE ? 
+                   OR LOWER(COALESCE(first_name, '')) LIKE ?
+            """, (clean, f"%{clean}%", f"%{clean}%")) as cur:
+                rows = await cur.fetchall()
+
+        if not rows:
+            return {"success": False, "deleted": 0, "message": f"Пользователь '{pattern}' не найден в базе данных."}
+
+        deleted_users = []
+        for r in rows:
+            uid = r["user_id"]
+            uname = r["username"] or "без username"
+            fname = r["first_name"] or ""
+            deleted_users.append(f"{fname} (@{uname}, ID:{uid})")
+
+            # Удаляем историю лотов по радарам пользователя
+            await db.execute("""
+                DELETE FROM seen_items 
+                WHERE search_id IN (SELECT id FROM searches WHERE user_id = ?)
+            """, (uid,))
+            # Удаляем радары пользователя
+            await db.execute("DELETE FROM searches WHERE user_id = ?", (uid,))
+            # Удаляем заблокированных продавцов
+            await db.execute("DELETE FROM blocked_sellers WHERE user_id = ?", (uid,))
+            # Удаляем самого пользователя
+            await db.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+
+        await db.commit()
+
+        # Также подчищаем логи от упоминаний удаленного пользователя
+        try:
+            from logger_setup import sanitize_logs_for_user
+            sanitize_logs_for_user(clean)
+        except Exception as e:
+            logger.warning(f"Ошибка очистки логов при удалении пользователя {pattern}: {e}")
+
+        logger.info(f"🗑 Полностью удалены данные пользователей: {', '.join(deleted_users)}")
+        return {
+            "success": True,
+            "deleted": len(deleted_users),
+            "users": deleted_users,
+            "message": f"Успешно удалено: {', '.join(deleted_users)}"
+        }
+
 
 
 

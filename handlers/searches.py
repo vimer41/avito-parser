@@ -52,17 +52,32 @@ async def btn_add_search(event, state: FSMContext):
         [
             InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm"),
             InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")
+        ],
+        [
+            InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
         ]
     ])
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
-
 
 
 @router.callback_query(F.data == "cancel_fsm")
 async def cb_cancel_fsm(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text("❌ <b>Действие отменено.</b>", parse_mode="HTML")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
+        ]
+    ])
+    await call.message.edit_text("❌ <b>Действие отменено.</b>", reply_markup=kb, parse_mode="HTML")
     await call.answer()
+
 
 
 @router.message(F.text.regexp(r"(?i)avito\.ru"))
@@ -265,7 +280,8 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{search_id}")
         ],
         [
-            InlineKeyboardButton(text="« Назад ко всем радарам", callback_data="list_searches")
+            InlineKeyboardButton(text="« Назад ко всем радарам", callback_data="list_searches"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
         ]
     ])
     return card_text, kb
@@ -294,13 +310,15 @@ async def show_searches(event, state: Optional[FSMContext] = None):
             "Нажмите кнопку ниже или просто отправьте ссылку на поиск с Авито в этот чат!"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎯 Добавить первый радар", callback_data="add_search_prompt")]
+            [InlineKeyboardButton(text="🎯 Добавить первый радар", callback_data="add_search_prompt")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")]
         ])
         if isinstance(event, CallbackQuery):
             await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         else:
             await message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
+
 
     from scheduler import get_last_scan_info
     scan_info = get_last_scan_info()
@@ -347,6 +365,9 @@ async def show_searches(event, state: Optional[FSMContext] = None):
     buttons.append([
         InlineKeyboardButton(text="➕ Добавить радар", callback_data="add_search_prompt"),
         InlineKeyboardButton(text="🔄 Обновить", callback_data="list_searches")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -491,7 +512,10 @@ async def cb_all_discounts_menu(call: CallbackQuery):
         btn_text = f"#{i}. {short_title} [{disc_label}]"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"set_discount:{s_id}")])
 
-    buttons.append([InlineKeyboardButton(text="« Назад ко всем радарам", callback_data="list_searches")])
+    buttons.append([
+        InlineKeyboardButton(text="« Назад ко всем радарам", callback_data="list_searches"),
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
+    ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     try:

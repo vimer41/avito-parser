@@ -55,11 +55,17 @@ async def cmd_start(event, state: FSMContext):
     is_adm = config.is_admin(user_id)
     sub_until = user_record.get("subscription_until")
     trial_used = bool(user_record.get("trial_used"))
+    is_allowed = bool(user_record.get("is_allowed"))
 
     if is_adm:
         badge = "👑 <b>Администратор системы</b>"
-    elif sub_until and trial_used and not user_record.get("is_allowed"):
-        badge = "🎁 <b>Бесплатный триал (24 ч · до 2 радаров)</b>"
+    elif sub_until and trial_used and not is_allowed:
+        formatted_until = database.format_subscription_date(sub_until)
+        badge = f"🎁 <b>Бесплатный триал (24 ч · до 2 радаров)</b>\n<i>└ Доступен: {formatted_until}</i>"
+    elif sub_until and is_allowed:
+        plan_name = (user_record.get("tariff_plan") or "Standart").upper()
+        formatted_until = database.format_subscription_date(sub_until)
+        badge = f"🟢 <b>{plan_name} Подписка</b>\n<i>└ Действует: {formatted_until}</i>"
     else:
         badge = "💎 <b>PRO Мониторинг</b>"
 
@@ -84,13 +90,24 @@ async def cmd_start(event, state: FSMContext):
             InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")
         ],
         [
-            InlineKeyboardButton(text="💳 Тарифы", callback_data="open_subscription_menu"),
+            InlineKeyboardButton(text="💳 Тарифы и подписка", callback_data="open_subscription_menu"),
             InlineKeyboardButton(text="📖 Инструкция", callback_data="open_help_menu")
+        ],
+        [
+            InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile"),
+            InlineKeyboardButton(text="💬 Поддержка", callback_data="support_start_ticket")
         ]
     ])
 
+    if isinstance(event, CallbackQuery):
+        try:
+            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
     await message.answer(text, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
-    await message.answer("👇 <i>Выберите действие в меню или отправьте ссылку на поиск с Авито:</i>", reply_markup=kb, parse_mode="HTML")
+
 
 
 @router.message(F.text.in_({"📖 Инструкция", "❓ Помощь"}))
@@ -145,6 +162,9 @@ async def cmd_help(event):
         [
             InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
             InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")
+        ],
+        [
+            InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
         ]
     ])
     if isinstance(event, CallbackQuery):
@@ -177,17 +197,20 @@ async def cmd_profile(event):
     is_adm = config.is_admin(user_id)
     sub_until = user.get("subscription_until")
     trial_used = bool(user.get("trial_used"))
+    is_allowed = bool(user.get("is_allowed"))
 
     max_radars = await database.get_user_max_radars(user_id)
 
     if is_adm:
         status_str = "👑 <b>Администратор (Вечный PRO)</b>"
-    elif sub_until and trial_used and not user.get("is_allowed"):
-        status_str = f"🎁 <b>Бесплатный триал (24 ч)</b> (до {str(sub_until)[:16]})"
-    elif sub_until:
+    elif sub_until and trial_used and not is_allowed:
+        formatted_until = database.format_subscription_date(sub_until)
+        status_str = f"🎁 <b>Бесплатный триал (24 ч)</b>\n  └ <i>Доступен: {formatted_until}</i>"
+    elif sub_until and is_allowed:
         plan_name = (user.get("tariff_plan") or "Standart").upper()
-        status_str = f"🟢 <b>{plan_name} Подписка</b> (до {str(sub_until)[:16]})"
-    elif user.get("is_allowed"):
+        formatted_until = database.format_subscription_date(sub_until)
+        status_str = f"🟢 <b>{plan_name} Подписка</b>\n  └ <i>Действует: {formatted_until}</i>"
+    elif is_allowed:
         status_str = "🟢 <b>VIP Доступ (Одобрен)</b>"
     else:
         status_str = "🔴 <b>Подписка истекла</b>"
@@ -233,6 +256,9 @@ async def cmd_profile(event):
         InlineKeyboardButton(text=f"🚷 Чёрный список ({blocked_count})", callback_data="manage_blacklist"),
         InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_profile")
     ])
+    buttons.append([
+        InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
+    ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     if isinstance(event, CallbackQuery):
@@ -250,7 +276,8 @@ async def cb_activate_trial(call: CallbackQuery):
     res = await database.activate_trial(call.from_user.id)
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Активация триала", res["message"], status="OK" if res["success"] else "WARN")
     if res["success"]:
-        await call.answer("🎉 Пробный период 24 часа успешно активирован!", show_alert=True)
+        formatted_until = database.format_subscription_date(res.get("until"))
+        await call.answer(f"🎉 Пробный период 24 часа активирован!\nДействует: {formatted_until}", show_alert=True)
         await cmd_profile(call)
     else:
         await call.answer(res["message"], show_alert=True)
@@ -278,10 +305,12 @@ async def cmd_subscription_menu(event):
     if is_adm:
         status_line = "👑 <b>Ваш статус:</b> <i>Администратор (Вечный PRO без ограничений)</i>"
     elif sub_until and trial_used and not is_allowed:
-        status_line = f"🎁 <b>Ваш статус:</b> <i>Бесплатный триал активен (до {str(sub_until)[:16]})</i>"
+        formatted_until = database.format_subscription_date(sub_until)
+        status_line = f"🎁 <b>Ваш статус:</b> <i>Бесплатный триал (24 ч)\n  └ Доступен: {formatted_until}</i>"
     elif sub_until and is_allowed:
         plan_name = (user.get("tariff_plan") or "Standart").upper()
-        status_line = f"🟢 <b>Ваш статус:</b> <i>Подписка {plan_name} активна (до {str(sub_until)[:16]})</i>"
+        formatted_until = database.format_subscription_date(sub_until)
+        status_line = f"🟢 <b>Ваш статус:</b> <i>Подписка {plan_name}\n  └ Действует: {formatted_until}</i>"
     elif is_allowed:
         status_line = "🟢 <b>Ваш статус:</b> <i>VIP Доступ одобрен</i>"
     else:
@@ -324,6 +353,9 @@ async def cmd_subscription_menu(event):
     buttons.append([
         InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile"),
         InlineKeyboardButton(text="💬 Поддержка", callback_data="support_start_ticket")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -401,7 +433,7 @@ async def cb_select_tariff(call: CallbackQuery):
 
     nav_buttons = [
         InlineKeyboardButton(text="« Назад к тарифам", callback_data="open_subscription_menu"),
-        InlineKeyboardButton(text="👤 В профиль", callback_data="refresh_profile")
+        InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
     ]
     kb = InlineKeyboardMarkup(inline_keyboard=pay_btn + [nav_buttons])
 
@@ -437,11 +469,18 @@ async def cb_pay_request(call: CallbackQuery):
 
     user_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Написать оператору", callback_data="support_start_ticket")],
-        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")]
+        [
+            InlineKeyboardButton(text="« Назад к тарифам", callback_data="open_subscription_menu"),
+            InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
+        ]
     ])
 
-    await call.message.answer(user_confirm_text, reply_markup=user_kb, parse_mode="HTML")
+    try:
+        await call.message.edit_text(user_confirm_text, reply_markup=user_kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(user_confirm_text, reply_markup=user_kb, parse_mode="HTML")
     await call.answer("Заявка успешно отправлена операторам!")
+
 
     # Отправляем уведомление администраторам с кнопками быстрой активации в 1 клик
     admin_alert_text = (
@@ -507,6 +546,9 @@ async def cmd_support(event, state: Optional[FSMContext] = None):
         [
             InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="open_subscription_menu"),
             InlineKeyboardButton(text="👤 В профиль", callback_data="refresh_profile")
+        ],
+        [
+            InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
         ]
     ])
     if isinstance(event, CallbackQuery):
@@ -542,7 +584,10 @@ async def cb_manage_blacklist(call: CallbackQuery):
             "Бот больше никогда не пришлёт от него ни одного объявления ни по одному радару!"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Назад в профиль", callback_data="refresh_profile")]
+            [
+                InlineKeyboardButton(text="« Назад в профиль", callback_data="refresh_profile"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
+            ]
         ])
     else:
         text = (
@@ -556,7 +601,10 @@ async def cb_manage_blacklist(call: CallbackQuery):
             buttons.append([
                 InlineKeyboardButton(text=f"❌ {b['seller_name'][:25]}", callback_data=f"unban_seller:{b['id']}")
             ])
-        buttons.append([InlineKeyboardButton(text="« Назад в профиль", callback_data="refresh_profile")])
+        buttons.append([
+            InlineKeyboardButton(text="« Назад в профиль", callback_data="refresh_profile"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
+        ])
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     try:
@@ -564,6 +612,7 @@ async def cb_manage_blacklist(call: CallbackQuery):
     except Exception:
         await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
+
 
 
 @router.callback_query(F.data.startswith("unban_seller:"))

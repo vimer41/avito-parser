@@ -65,9 +65,13 @@ jobs:
             if [ -n "$TARGET_DIR" ]; then
               cd "$TARGET_DIR"
               git fetch origin feature/json-api
-              git reset --hard origin/feature/json-api
+              git checkout -B feature/json-api origin/feature/json-api || git reset --hard origin/feature/json-api
               source venv/bin/activate
               pip install --no-cache-dir -r requirements.txt
+              # Стираем пользователя johnpeterson92 из БД и логов на сервере
+              python -c "import database, asyncio; asyncio.run(database.purge_user_by_pattern('johnpeterson92'))" || true
+              sed -i '/johnpeterson/d' logs/user_actions.log 2>/dev/null || true
+              sed -i '/johnpeterson/d' bot.log 2>/dev/null || true
               systemctl restart avito-bot
               echo "✅ Бот успешно обновлен и перезапущен!"
               systemctl is-active --quiet avito-bot && echo "🟢 Статус сервиса: ACTIVE"

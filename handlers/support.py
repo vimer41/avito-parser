@@ -42,17 +42,25 @@ async def cb_support_start(call: CallbackQuery, state: FSMContext):
         "Администраторы получат сообщение и ответят вам прямо в этом боте.</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="support_cancel")]
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="support_cancel")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")]
     ])
-    await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
 
 @router.callback_query(F.data == "support_cancel")
 async def cb_support_cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text("❌ <b>Обращение в службу поддержки отменено.</b>", parse_mode="HTML")
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")]
+    ])
+    await call.message.edit_text("❌ <b>Обращение в службу поддержки отменено.</b>", reply_markup=cancel_kb, parse_mode="HTML")
     await call.answer()
+
 
 
 # ── 2. Пользователь: отправка сообщения в поддержку ─────────────────────

@@ -214,7 +214,7 @@ def build_notification_text(
         diff_str = f" · выгода {diff_rub:,} ₽".replace(",", " ") if diff_rub > 0 else ""
         old_price_str = f"{old_price:,} ₽".replace(",", " ") if old_price else ""
         header_lines = [
-            f"📉 <b>СНИЖЕНИЕ ЦЕНЫ НА АВИТО! [-{drop_percent}%]</b>{badge_header}",
+            f"📉 <b>СНИЖЕНИЕ ЦЕНЫ · AVITO RADAR [-{drop_percent}%]</b>{badge_header}",
             f"🏷 <b>{clean_price}</b> (было <s>{old_price_str}</s>{diff_str})",
             f"📦 <b>{clean_title}</b>",
             "────────────────────"
@@ -224,7 +224,7 @@ def build_notification_text(
         if getattr(item, "was_lowered", False) and getattr(item, "discount_percent", None):
             discount_badge = f" 🏷 <i>(-{item.discount_percent}%)</i>"
         header_lines = [
-            f"⚡️ <b>НОВЫЙ ЛОТ НА АВИТО</b>{badge_header}",
+            f"⚡️ <b>НОВЫЙ ЛОТ · AVITO RADAR</b>{badge_header}",
             f"🏷 <b>{clean_price}</b>{discount_badge} · <b>{clean_title}</b>",
             "────────────────────"
         ]
