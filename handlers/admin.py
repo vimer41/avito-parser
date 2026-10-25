@@ -174,23 +174,33 @@ async def cmd_admin_panel(event):
         uname = f"@{u['username']}" if u.get("username") else f"ID: {u_id}"
         fname = html.escape(u.get("first_name") or "Без имени")
 
+        has_access = await database.is_user_allowed(u_id)
+        trial_used = bool(u.get("trial_used"))
+        sub_until = u.get("subscription_until")
+        sub_str = database.format_subscription_date(sub_until)
+
         if is_adm:
             text_lines.append(f"👑 <b>{fname}</b> ({uname}) — <i>Администратор</i>")
-        elif is_allowed:
+        elif has_access and not is_allowed and trial_used:
+            text_lines.append(f"🎁 <b>{fname}</b> ({uname}) — <i>[Триал 24ч · 2 радара] {sub_str}</i>")
+            buttons.append([
+                InlineKeyboardButton(text=f"🚫 Блок {uname}", callback_data=f"admin_revoke:{u_id}"),
+                InlineKeyboardButton(text=f"🗑 Удалить {uname}", callback_data=f"admin_purge_user:{u_id}")
+            ])
+        elif has_access or is_allowed:
             plan = (u.get("tariff_plan") or "standart").upper()
-            sub_str = database.format_subscription_date(u.get("subscription_until"))
             text_lines.append(f"🟢 <b>{fname}</b> ({uname}) — <i>[{plan}] {sub_str}</i>")
             buttons.append([
                 InlineKeyboardButton(text=f"🚫 Блок {uname}", callback_data=f"admin_revoke:{u_id}"),
                 InlineKeyboardButton(text=f"🗑 Удалить {uname}", callback_data=f"admin_purge_user:{u_id}")
             ])
         else:
-            sub_str = database.format_subscription_date(u.get("subscription_until"))
-            text_lines.append(f"🔴 <b>{fname}</b> ({uname}) — <i>Ограничен ({sub_str})</i>")
+            text_lines.append(f"🔴 <b>{fname}</b> ({uname}) — <i>Истёк доступ ({sub_str})</i>")
             buttons.append([
                 InlineKeyboardButton(text=f"✅ Разрешить {uname}", callback_data=f"admin_approve:{u_id}"),
                 InlineKeyboardButton(text=f"🗑 Удалить {uname}", callback_data=f"admin_purge_user:{u_id}")
             ])
+
 
     buttons.append([
         InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup"),

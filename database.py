@@ -161,7 +161,20 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
+                # Если пользователь уже был в БД, но еще не получил триал и не одобрен
+                if not row["trial_used"] and row["subscription_until"] is None and not row["is_allowed"] and user_id not in ADMIN_IDS:
+                    await db.execute("""
+                        UPDATE users 
+                        SET trial_used = 1,
+                            subscription_until = datetime('now', '+1 day'),
+                            tariff_plan = 'standart'
+                        WHERE user_id = ?
+                    """, (user_id,))
+                    await db.commit()
+                    async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as c2:
+                        return dict(await c2.fetchone())
                 return dict(row)
+
 
         is_adm = user_id in ADMIN_IDS
         if is_adm:
