@@ -51,9 +51,17 @@ async def cmd_start(event, state: FSMContext):
     username = user.username
     first_name = user.first_name or "Пользователь"
 
-    await database.get_or_create_user(user_id, username, first_name)
+    user_record = await database.get_or_create_user(user_id, username, first_name)
     is_adm = config.is_admin(user_id)
-    badge = "👑 <b>Администратор системы</b>" if is_adm else "💎 <b>PRO Мониторинг</b>"
+    sub_until = user_record.get("subscription_until")
+    trial_used = bool(user_record.get("trial_used"))
+
+    if is_adm:
+        badge = "👑 <b>Администратор системы</b>"
+    elif sub_until and trial_used and not user_record.get("is_allowed"):
+        badge = "🎁 <b>Бесплатный триал (24 ч · до 2 радаров)</b>"
+    else:
+        badge = "💎 <b>PRO Мониторинг</b>"
 
     text = (
         f"⚡️ <b>AVITO RADAR</b> · <i>Умный перехват новых лотов</i>\n"
@@ -165,14 +173,19 @@ async def cmd_profile(event):
     sub_until = user.get("subscription_until")
     trial_used = bool(user.get("trial_used"))
 
+    max_radars = await database.get_user_max_radars(user_id)
+
     if is_adm:
         status_str = "👑 <b>Администратор (Вечный PRO)</b>"
+    elif sub_until and trial_used and not user.get("is_allowed"):
+        status_str = f"🎁 <b>Бесплатный триал (24 ч)</b> (до {str(sub_until)[:16]})"
     elif sub_until:
-        status_str = f"🟢 <b>PRO Подписка</b> (до {str(sub_until)[:16]})"
+        plan_name = (user.get("tariff_plan") or "Standart").upper()
+        status_str = f"🟢 <b>{plan_name} Подписка</b> (до {str(sub_until)[:16]})"
     elif user.get("is_allowed"):
         status_str = "🟢 <b>VIP Доступ (Одобрен)</b>"
     else:
-        status_str = "⚪️ <b>Базовый доступ</b>"
+        status_str = "🔴 <b>Подписка истекла</b>"
 
     from scheduler import get_last_scan_info
     scan_info = get_last_scan_info()
@@ -183,7 +196,7 @@ async def cmd_profile(event):
         "┌ 👤 <b>ЛИЧНЫЙ КАБИНЕТ</b>\n"
         f"├ 🆔 <b>Ваш ID:</b> <code>{user_id}</code>\n"
         f"├ ⚡️ <b>Статус:</b> {status_str}\n"
-        f"├ 🎯 <b>Радары:</b> <b>{active_count}</b> акт. / <b>{searches_count}</b> всего (макс: {config.MAX_SEARCHES_PER_USER})\n"
+        f"├ 🎯 <b>Радары:</b> <b>{active_count}</b> акт. / <b>{searches_count}</b> всего (макс: {max_radars})\n"
         f"├ 🚷 <b>Чёрный список:</b> <b>{blocked_count}</b> продавцов\n"
         f"├ 📡 <b>Проверка Авито:</b> <code>{scan_info}</code> 🟢\n"
         f"└ 🔔 <b>Доставка лотов:</b> ⚡️ Мгновенно (с фото HD)"

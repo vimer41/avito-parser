@@ -115,13 +115,18 @@ async def process_avito_url(message: Message, state: FSMContext):
         )
         return
 
-    # Проверяем лимит поисков
+    # Проверяем лимит поисков по тарифу
     current_count = await database.count_user_searches(user_id)
-    if current_count >= MAX_SEARCHES_PER_USER:
-        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка: лимит {MAX_SEARCHES_PER_USER} исчерпан", status="WARN")
+    max_radars = await database.get_user_max_radars(user_id)
+    if current_count >= max_radars:
+        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка: лимит {max_radars} исчерпан", status="WARN")
         await message.answer(
-            f"⚠️ <b>Достигнут лимит радаров ({MAX_SEARCHES_PER_USER})!</b>\n\n"
-            "Удалите ненужный радар в меню <b>📁 Мои радары</b>, чтобы освободить слот.",
+            f"⚠️ <b>Достигнут лимит активных радаров ({max_radars})!</b>\n\n"
+            "Удалите ненужный радар в меню <b>📁 Мои радары</b> или расширьте лимит в разделе <b>👤 Мой профиль</b>.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="open_subscription_menu")],
+                [InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")]
+            ]),
             parse_mode="HTML"
         )
         await state.clear()

@@ -2,7 +2,7 @@ import json
 import logging
 from typing import List, Optional, Dict, Any
 import aiosqlite
-from config import DB_PATH, ADMIN_ID, ADMIN_IDS
+from config import DB_PATH, ADMIN_ID, ADMIN_IDS, MAX_SEARCHES_PER_USER
 
 logger = logging.getLogger(__name__)
 
@@ -115,16 +115,49 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
             if row:
                 return dict(row)
 
-        is_allowed = 1 if user_id in ADMIN_IDS else 0
-        await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed) VALUES (?, ?, ?, ?, ?)",
-            (user_id, username, first_name, DEFAULT_SELLER_MESSAGE, is_allowed)
-        )
+        is_adm = user_id in ADMIN_IDS
+        if is_adm:
+            await db.execute(
+                "INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan) VALUES (?, ?, ?, ?, 1, 'pro')",
+                (user_id, username, first_name, DEFAULT_SELLER_MESSAGE)
+            )
+        else:
+            # Новым пользователям автоматически активируем 24-часовой бесплатный пробный период (тариф Standart, 2 радара)
+            await db.execute("""
+                INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan, trial_used, subscription_until)
+                VALUES (?, ?, ?, ?, 0, 'standart', 1, datetime('now', '+1 day'))
+            """, (user_id, username, first_name, DEFAULT_SELLER_MESSAGE))
         await db.commit()
 
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             return dict(row)
+
+
+async def get_user_max_radars(user_id: int) -> int:
+    """
+    Возвращает максимальное количество радаров для пользователя в зависимости от тарифа:
+    - Администратор: MAX_SEARCHES_PER_USER
+    - PRO (оплаченный или вечный): 15
+    - Standart (оплаченный): 5
+    - Бесплатный триал (новый пользователь): 2
+    """
+    if user_id in ADMIN_IDS:
+        return MAX_SEARCHES_PER_USER
+
+    user = await get_or_create_user(user_id)
+    plan = (user.get("tariff_plan") or "standart").lower()
+    is_allowed = bool(user.get("is_allowed"))
+    trial_used = bool(user.get("trial_used"))
+
+    if is_allowed or plan == "pro":
+        return 15 if plan == "pro" else 5
+
+    # Если бесплатный пробный период (новый пользователь без постоянного VIP)
+    if trial_used and not is_allowed:
+        return 2
+
+    return 5 if plan == "standart" else 2
 
 
 async def is_user_allowed(user_id: int) -> bool:

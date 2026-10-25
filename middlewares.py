@@ -87,9 +87,21 @@ class AccessControlMiddleware(BaseMiddleware):
         user_id = user.id
         bot: Bot = data.get("bot")
 
-        # 1. Если это админский callback_query (одобрение/отклонение), пропускаем для обработки
+        # 1. Разрешаем технические callback-запросы (админка, служба поддержки, меню тарифов)
         if isinstance(event, CallbackQuery) and event.data:
-            if event.data.startswith("admin_approve:") or event.data.startswith("admin_reject:") or event.data.startswith("admin_revoke:"):
+            allowed_callbacks = (
+                "admin_approve:", "admin_reject:", "admin_revoke:",
+                "support_reply:", "admin_reply_cancel",
+                "open_subscription_menu", "buy_tariff:", "support_start_ticket", "support_cancel"
+            )
+            if any(event.data.startswith(prefix) for prefix in allowed_callbacks):
+                return await handler(event, data)
+
+        # Разрешаем отправку сообщений, если пользователь пишет обращение в поддержку
+        state = data.get("state")
+        if state:
+            current_st = await state.get_state()
+            if current_st == "SupportStates:waiting_for_user_message":
                 return await handler(event, data)
 
         # 2. Проверяем наличие пользователя в БД
@@ -118,29 +130,43 @@ class AccessControlMiddleware(BaseMiddleware):
 
             return await handler(event, data)
 
-        # 4. Если доступ НЕ одобрен:
-        text_for_user = (
-            "🔒 <b>Доступ к боту ограничен</b>\n\n"
-            "Этот бот является приватным. Ваша заявка передана администраторам сервиса.\n"
-            "Как только доступ будет подтверждён — вы получите уведомление и сможете начать поиск!"
-        )
+        # 4. Если доступ НЕ одобрен (пробный период истёк или доступ закрыт):
+        trial_used = bool(user_record.get("trial_used"))
+        if trial_used:
+            text_for_user = (
+                "🔒 <b>Срок действия пробного периода завершился</b>\n\n"
+                "Ваш бесплатный 24-часовой доступ подошёл к концу. "
+                "Чтобы продолжить отслеживать новые лоты на Авито без ограничений, выберите подходящий тариф подписки "
+                "или свяжитесь со службой поддержки прямо в этом боте!"
+            )
+        else:
+            text_for_user = (
+                "🔒 <b>Доступ к боту ограничен</b>\n\n"
+                "Этот бот является приватным. Ваша заявка передана администраторам сервиса.\n"
+                "Как только доступ будет подтверждён — вы получите уведомление и сможете начать поиск!"
+            )
+
+        user_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="open_subscription_menu")],
+            [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="support_start_ticket")]
+        ])
 
         if isinstance(event, Message):
-            await event.answer(text_for_user, parse_mode="HTML")
+            await event.answer(text_for_user, reply_markup=user_kb, parse_mode="HTML")
         elif isinstance(event, CallbackQuery):
-            await event.answer("Доступ ограничен. Ожидайте подтверждения от администратора.", show_alert=True)
+            await event.answer("Срок действия доступа истёк. Выберите тариф или напишите в поддержку.", show_alert=True)
 
         # 5. Отправляем запрос администраторам
         user_msg = f"\n💬 <b>Сообщение:</b> <i>«{html.escape(event.text[:250])}»</i>" if (isinstance(event, Message) and event.text) else ""
         admin_text = (
-            "🔔 <b>Новый запрос на доступ к боту!</b>\n\n"
+            "🔔 <b>Пользователь с истёкшим доступом пишет в бот:</b>\n\n"
             f"👤 <b>Имя:</b> {html.escape(user.full_name)}\n"
             f"🔗 <b>Username:</b> @{user.username if user.username else 'нет'}\n"
             f"🆔 <b>ID:</b> <code>{user_id}</code>{user_msg}"
         )
         admin_kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Одобрить доступ", callback_data=f"admin_approve:{user_id}"),
+                InlineKeyboardButton(text="✅ Продлить доступ", callback_data=f"admin_approve:{user_id}"),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin_reject:{user_id}")
             ],
             [

@@ -23,14 +23,23 @@ jobs:
           script: |
             set -e
             echo "🚀 Начало автоматического деплоя Avito Radar..."
-            if [ -d "/opt/avito-bot" ]; then
-              cd /opt/avito-bot
-              git pull
+            TARGET_DIR=""
+            if [ -d "/opt/avito_parser_bot" ]; then
+              TARGET_DIR="/opt/avito_parser_bot"
+            elif [ -d "/opt/avito-bot" ]; then
+              TARGET_DIR="/opt/avito-bot"
+            fi
+
+            if [ -n "$TARGET_DIR" ]; then
+              cd "$TARGET_DIR"
+              git fetch origin feature/json-api
+              git reset --hard origin/feature/json-api
               source venv/bin/activate
               pip install --no-cache-dir -r requirements.txt
               systemctl restart avito-bot
               echo "✅ Бот успешно обновлен и перезапущен!"
-              systemctl status avito-bot --no-pager -n 10
+              systemctl status avito-bot --no-pager -n 5
             else
-              echo "⚠️ Директория /opt/avito-bot не найдена. Требуется первичная настройка."
+              echo "⚠️ Директория проекта не найдена (/opt/avito_parser_bot или /opt/avito-bot)!"
+              exit 1
             fi
