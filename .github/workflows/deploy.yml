@@ -1,0 +1,36 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+      - feature/json-api
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to Production VPS
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH and deploy bot
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            echo "🚀 Начало автоматического деплоя Avito Radar..."
+            if [ -d "/opt/avito-bot" ]; then
+              cd /opt/avito-bot
+              git pull
+              source venv/bin/activate
+              pip install --no-cache-dir -r requirements.txt
+              systemctl restart avito-bot
+              echo "✅ Бот успешно обновлен и перезапущен!"
+              systemctl status avito-bot --no-pager -n 10
+            else
+              echo "⚠️ Директория /opt/avito-bot не найдена. Требуется первичная настройка."
+            fi
