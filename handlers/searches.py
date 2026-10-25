@@ -181,8 +181,8 @@ async def process_avito_url(message: Message, state: FSMContext):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🚫 Стоп-слова", callback_data=f"manage_stops:{search_id}"),
-            InlineKeyboardButton(text="💬 Свой отклик", callback_data=f"manage_tmpl:{search_id}")
+            InlineKeyboardButton(text="📉 Алерт на скидки 💎", callback_data=f"set_discount:{search_id}"),
+            InlineKeyboardButton(text="🚫 Стоп-слова", callback_data=f"manage_stops:{search_id}")
         ],
         [
             InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches"),
@@ -223,11 +223,11 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     toggle_btn_text = "⏸ Поставить на паузу" if is_active else "▶️ Запустить радар"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{search_id}"),
-            InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}")
+            InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{search_id}")
         ],
         [
-            InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{search_id}")
+            InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{search_id}"),
+            InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}")
         ],
         [
             InlineKeyboardButton(text="↗️ Открыть на Авито", url=s["url"]),
@@ -311,6 +311,9 @@ async def show_searches(event, state: Optional[FSMContext] = None):
         buttons.append(row)
 
     buttons.append([
+        InlineKeyboardButton(text="📉 Настройка скидок (PRO) 💎", callback_data="all_discounts_menu")
+    ])
+    buttons.append([
         InlineKeyboardButton(text="➕ Добавить радар", callback_data="add_search_prompt"),
         InlineKeyboardButton(text="🔄 Обновить", callback_data="list_searches")
     ])
@@ -367,6 +370,59 @@ async def cb_toggle_search(call: CallbackQuery):
         await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     except Exception:
         pass
+
+
+# ── Быстрый выбор радара для скидки (PRO) ──────────────────────────────
+
+@router.callback_query(F.data == "all_discounts_menu")
+async def cb_all_discounts_menu(call: CallbackQuery):
+    user_id = call.from_user.id
+    user = await database.get_or_create_user(user_id)
+    is_pro = (user_id in config.ADMIN_IDS or (user.get("tariff_plan") or "").lower() == "pro")
+
+    if not is_pro:
+        await call.answer(
+            "🔒 Отслеживание снижения цен доступно только на тарифе PRO!\n\n"
+            "Оформите подписку PRO в меню «Мой профиль», чтобы бот моментально ловил скидки перекупов.",
+            show_alert=True
+        )
+        return
+
+    searches = await database.get_user_searches(user_id)
+    if not searches:
+        await call.answer("У вас пока нет активных радаров!", show_alert=True)
+        return
+
+    if len(searches) == 1:
+        call.data = f"set_discount:{searches[0]['id']}"
+        return await cb_set_discount_menu(call)
+
+    text = (
+        "📉 <b>НАСТРОЙКА АЛЕРТОВ НА СКИДКИ (PRO)</b> 💎\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Выберите радар, для которого хотите настроить порог скидки:\n\n"
+        "<i>(Как только продавец скинет цену на этот процент или более — "
+        "бот сразу пришлёт пуш с расчётом вашей выгоды!)</i>"
+    )
+
+    buttons = []
+    for i, s in enumerate(searches, 1):
+        s_id = s["id"]
+        raw_title = s["title"].strip()
+        short_title = (raw_title[:16] + "…") if len(raw_title) > 17 else raw_title
+        disc_val = s.get("min_discount_percent") or 0
+        disc_label = f"-{disc_val}% 🟢" if disc_val > 0 else "Выкл ⚪️"
+        btn_text = f"#{i}. {short_title} [{disc_label}]"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"set_discount:{s_id}")])
+
+    buttons.append([InlineKeyboardButton(text="« Назад ко всем радарам", callback_data="list_searches")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
 
 
 # ── Настройка скидки для PRO (Price Drop Alert) ─────────────────────────
