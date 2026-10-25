@@ -8,6 +8,8 @@ load_dotenv(BASE_DIR / ".env")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 MAX_SEARCHES_PER_USER = int(os.getenv("MAX_SEARCHES_PER_USER", "10"))
+# Количество параллельных воркеров мониторинга (по умолчанию 3)
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "3"))
 def parse_proxy(raw_proxy: str | None) -> str | None:
     """
     Нормализует прокси в стандартный RFC-формат (http://LOGIN:PASS@IP:PORT).

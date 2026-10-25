@@ -22,3 +22,12 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Cookies & Local Sessions
+avito_cookies.json
+*.session
+
+# Local Documentation & Guides
+DEPLOY_AND_MONETIZATION_GUIDE.md
+deploy_*.md
+DEPLOY_*.md

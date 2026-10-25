@@ -7,7 +7,7 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
@@ -317,7 +317,24 @@ async def send_ad_to_user(
         return True
 
 
-async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radars_for_url: List[dict]):
+class ParserPool:
+    """Пул независимых сессий парсера для параллельного выполнения запросов без коллизий."""
+    def __init__(self, size: int, proxy_url: Optional[str] = None):
+        self.parsers: List[AvitoParser] = [
+            AvitoParser(proxy=proxy_url) for _ in range(max(1, size))
+        ]
+
+    def get_parser(self, index: int) -> AvitoParser:
+        return self.parsers[index % len(self.parsers)]
+
+
+async def process_url_group(
+    bot: Bot,
+    parser: AvitoParser,
+    clean_url: str,
+    radars_for_url: List[dict],
+    worker_id: int = 1
+):
     """
     Обрабатывает один уникальный URL выдачи Авито:
     - Делает ровно 1 HTTP-запрос к Авито
@@ -336,8 +353,10 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             return False
 
         items = parser.parse_items(html_content)
+        w_tag = f"[W{worker_id}] " if config.MAX_CONCURRENT_WORKERS > 1 else ""
+
         if not items:
-            logger.info(f"📡 [ПАРСЕР] По URL «{clean_url[:60]}...»: страница получена за {fetch_ms} мс, лотов в каталоге не найдено")
+            logger.info(f"📡 {w_tag}[ПАРСЕР] По URL «{clean_url[:60]}...»: страница получена за {fetch_ms} мс, лотов в каталоге не найдено")
             return True
 
         # ⚡️ ПРИОРИТЕТНАЯ ДОСТАВКА ЛОТОВ:
@@ -371,7 +390,7 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             new_items = [it for it in items if it.item_id not in seen_ids]
 
             if not new_items:
-                logger.info(f"  🔹 Радар #{radar_id} [{user_str}] «{search_title}»: проверено {len(items)} лотов [{source_tag}] (новых нет)")
+                logger.info(f"  {w_tag}🔹 Радар #{radar_id} [{user_str}] «{search_title}»: проверено {len(items)} лотов [{source_tag}] (новых нет)")
                 continue
 
             # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ, чтобы они не всплывали повторно
@@ -387,7 +406,7 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
                     age_summary += f", и ещё {len(new_items) - 2}"
                 items_label = plural_form(len(new_items), "лот", "лота", "лотов")
                 logger.info(
-                    f"  🔹 Радар #{radar_id} [{user_str}] «{search_title}»: {items_label} в ротации [{source_tag}] "
+                    f"  {w_tag}🔹 Радар #{radar_id} [{user_str}] «{search_title}»: {items_label} в ротации [{source_tag}] "
                     f"(отсеян как старый: {age_summary}; порог 15 мин)"
                 )
                 continue
@@ -396,12 +415,12 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             if len(fresh_items) > 5:
                 fresh_label = plural_form(len(fresh_items), "свежий лот", "свежих лота", "свежих лотов")
                 logger.info(
-                    f"  📦 Радар #{radar_id} [{user_str}] «{search_title}»: пачка из {fresh_label} (сохранено в базу без спама)"
+                    f"  {w_tag}📦 Радар #{radar_id} [{user_str}] «{search_title}»: пачка из {fresh_label} (сохранено в базу без спама)"
                 )
                 continue
 
             fresh_label = plural_form(len(fresh_items), "СВЕЖИЙ ЛОТ", "СВЕЖИХ ЛОТА", "СВЕЖИХ ЛОТОВ")
-            logger.info(f"  🔥 Радар #{radar_id} [{user_str}] «{search_title}»: НАЙДЕНО {len(fresh_items)} {fresh_label}!")
+            logger.info(f"  {w_tag}🔥 Радар #{radar_id} [{user_str}] «{search_title}»: НАЙДЕНО {len(fresh_items)} {fresh_label}!")
 
             # Отправляем в хронологическом порядке (снизу вверх)
             for it in reversed(fresh_items):
@@ -438,10 +457,15 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
     """
     Главный бесконечный цикл фонового мониторинга поисков.
     Оптимизирован для 512 МБ RAM и минимального числа HTTP-запросов к Авито (дедупликация URL).
+    Использует пул параллельных асинхронных воркеров для масштабирования на сотни и тысячи ссылок.
     """
-    logger.info("🚀 Запуск фонового сервиса мониторинга Авито...")
-    if parser is None:
-        parser = AvitoParser()
+    pool_size = max(1, config.MAX_CONCURRENT_WORKERS)
+    # По требованию пользователя работаем напрямую (без прокси)
+    parser_pool = ParserPool(pool_size, proxy_url=None)
+    if parser is not None and parser_pool.parsers:
+        parser_pool.parsers[0] = parser
+
+    logger.info(f"🚀 Запуск фонового сервиса мониторинга Авито (Worker Pool: {pool_size} воркеров)...")
     cycle_count = 0
     consecutive_failures = 0
     alert_sent = False
@@ -462,19 +486,59 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
 
                 radars_label = plural_form(len(active_searches), "радар", "радара", "радаров")
                 urls_label = plural_form(len(url_groups), "ссылка Авито", "ссылки Авито", "ссылок Авито")
-                logger.info(f"🔄 [КРУГ #{cycle_count}] Запуск проверки: {radars_label} ({urls_label})...")
+                num_workers = min(pool_size, len(url_groups))
+                workers_label = plural_form(num_workers, "воркер", "воркера", "воркеров")
 
-                # 2. Делаем ровно 1 запрос к Авито на каждый уникальный URL
-                success_count = 0
-                fail_count = 0
+                logger.info(
+                    f"🔄 [КРУГ #{cycle_count}] Запуск проверки: {radars_label} ({urls_label}) | "
+                    f"Параллельных потоков: {workers_label}..."
+                )
+
+                # 2. Очередь задач для параллельных воркеров
+                task_queue: asyncio.Queue = asyncio.Queue()
                 for clean_url, radars_for_url in url_groups.items():
-                    ok = await process_url_group(bot, parser, clean_url, radars_for_url)
-                    if ok:
-                        success_count += 1
-                    else:
-                        fail_count += 1
-                    # Пауза между запросами к разным ссылкам для распределения нагрузки
-                    await asyncio.sleep(random.uniform(2.5, 4.0))
+                    await task_queue.put((clean_url, radars_for_url))
+
+                async def worker_task(worker_id: int) -> Tuple[int, int]:
+                    w_parser = parser_pool.get_parser(worker_id - 1)
+                    w_success = 0
+                    w_fail = 0
+
+                    # Начальный сдвиг старта между воркерами на одном IP для исключения одновременных сетевых пиков
+                    if worker_id > 1:
+                        await asyncio.sleep((worker_id - 1) * 1.5)
+
+                    while not task_queue.empty():
+                        # Если парсер находится в кулдауне из-за 429/403, ждем его завершения
+                        while w_parser.is_blocked():
+                            wait_s = min(w_parser.block_remaining(), 5)
+                            if wait_s <= 0:
+                                break
+                            await asyncio.sleep(wait_s)
+
+                        try:
+                            clean_url, radars_for_url = task_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+
+                        ok = await process_url_group(bot, w_parser, clean_url, radars_for_url, worker_id=worker_id)
+                        if ok:
+                            w_success += 1
+                        else:
+                            w_fail += 1
+
+                        task_queue.task_done()
+                        # Безопасная пауза между запросами конкретного воркера
+                        await asyncio.sleep(random.uniform(2.0, 3.5))
+
+                    return w_success, w_fail
+
+                # Запуск параллельных воркеров
+                worker_coroutines = [worker_task(w_id) for w_id in range(1, num_workers + 1)]
+                worker_results = await asyncio.gather(*worker_coroutines)
+
+                success_count = sum(r[0] for r in worker_results)
+                fail_count = sum(r[1] for r in worker_results)
 
                 # 🛡 Анализ здоровья мониторинга и защита от сбоев
                 if success_count == 0 and fail_count > 0:
@@ -484,7 +548,7 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
                     )
                     if consecutive_failures >= FAILURE_THRESHOLD and not alert_sent:
                         alert_sent = True
-                        current_p = getattr(parser, "current_proxy", None) or "Прямое соединение (без прокси)"
+                        current_p = config.PROXY_URL or "Прямое соединение (без прокси)"
                         alert_msg = (
                             f"🚨 <b>ВНИМАНИЕ: Сбой мониторинга Авито!</b>\n\n"
                             f"Мониторинг не может получить данные уже <b>{consecutive_failures} кругов подряд</b> (~{consecutive_failures} мин).\n"

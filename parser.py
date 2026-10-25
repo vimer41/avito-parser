@@ -50,12 +50,11 @@ class AvitoItem:
 
 
 class AvitoParser:
-    def __init__(self):
+    def __init__(self, proxy: Optional[str] = None):
+        self.current_proxy: Optional[str] = proxy
         self.session = self._create_session()
         self._last_saved_cookies: dict = {}
         self._load_cookies()
-
-        self.current_proxy: Optional[str] = None
 
         # Защита от бана: пока активна пауза, к Авито не отправляется ни одного запроса
         self.blocked_until: float = 0.0
@@ -108,7 +107,8 @@ class AvitoParser:
             "Upgrade-Insecure-Requests": "1",
             "User-Agent": ua,
         }
-        return requests.Session(impersonate="firefox147", headers=headers, timeout=20)
+        proxies = {"http": self.current_proxy, "https": self.current_proxy} if self.current_proxy else None
+        return requests.Session(impersonate="firefox147", headers=headers, timeout=20, proxies=proxies)
 
     def _save_cookies(self):
         """Сохраняет текущие валидные куки сессии на диск (исключая временный pow_challenge)."""
