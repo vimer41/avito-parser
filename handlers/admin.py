@@ -131,8 +131,11 @@ async def cmd_admin_panel(event):
             buttons.append([InlineKeyboardButton(text=f"✅ Разрешить {uname}", callback_data=f"admin_approve:{u_id}")])
 
     buttons.append([
-        InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_refresh"),
-        InlineKeyboardButton(text="💾 Скачать бэкап БД", callback_data="admin_backup")
+        InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup"),
+        InlineKeyboardButton(text="📋 Скачать логи", callback_data="admin_logs_menu")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="🔄 Обновить список", callback_data="admin_refresh")
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -160,7 +163,10 @@ async def cb_admin_revoke(call: CallbackQuery):
     await cmd_admin_panel(call)
 
 
+# ── Выгрузка базы данных SQLite ────────────────────────────────────────
+
 @router.message(Command("backup"))
+@router.message(Command("db"))
 @router.callback_query(F.data == "admin_backup")
 async def cmd_admin_backup(event):
     user_id = event.from_user.id
@@ -169,7 +175,7 @@ async def cmd_admin_backup(event):
 
     if isinstance(event, CallbackQuery):
         message = event.message
-        await event.answer("Формирую бэкап...")
+        await event.answer("Формирую бэкап базы данных...")
     else:
         message = event
 
@@ -188,18 +194,210 @@ async def cmd_admin_backup(event):
         filename = os.path.basename(backup_path)
         file_to_send = BufferedInputFile(data, filename=filename)
 
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📋 Скачать логи", callback_data="admin_logs_menu"),
+                InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_refresh")
+            ]
+        ])
+
         await message.answer_document(
             document=file_to_send,
             caption=(
                 "💾 <b>Резервная копия базы данных SQLite (WAL-безопасная)</b>\n\n"
-                f"📦 Размер: <b>{len(data):,} байт</b>\n"
-                "Файл полностью консистентен и готов к восстановлению."
+                f"📦 Размер: <b>{len(data):,} байт</b> ({len(data) / 1024:.1f} KB)\n"
+                "Файл полностью консистентен и готов к восстановлению или анализу."
             ),
+            reply_markup=kb,
             parse_mode="HTML"
         )
         logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил бэкап базы данных ({filename})")
     finally:
         if os.path.exists(backup_path):
-            os.remove(backup_path)
+            try:
+                os.remove(backup_path)
+            except Exception:
+                pass
+
+
+# ── Выгрузка системных логов ──────────────────────────────────────────
+
+@router.message(Command("logs"))
+@router.message(Command("log"))
+@router.callback_query(F.data == "admin_logs_menu")
+async def cmd_admin_logs_menu(event):
+    user_id = event.from_user.id
+    if not config.is_admin(user_id):
+        return
+
+    if isinstance(event, CallbackQuery):
+        message = event.message
+        await event.answer()
+    else:
+        message = event
+
+    menu_text = (
+        "📋 <b>ВЫГРУЗКА ЛОГОВ СИСТЕМЫ AVITO RADAR</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Выберите файл для скачивания или выгрузите полный ZIP-архив:\n\n"
+        "• 📦 <b>Все логи (ZIP)</b> — полный архив всех лог-файлов проекта\n"
+        "• 📄 <b>bot.log</b> — общий консольный лог (все события)\n"
+        "• 👥 <b>user_actions.log</b> — детальная хронология действий пользователей\n"
+        "• ⚠️ <b>errors.log</b> — журнал ошибок и исключений (WARNING / ERROR)\n"
+        "• 🕷 <b>parser.log</b> — сетевая активность парсера и мониторинга"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📦 Скачать ВСЕ логи (ZIP-архив)", callback_data="admin_log_get:all_zip")
+        ],
+        [
+            InlineKeyboardButton(text="📄 bot.log", callback_data="admin_log_get:bot"),
+            InlineKeyboardButton(text="👥 user_actions.log", callback_data="admin_log_get:user_actions")
+        ],
+        [
+            InlineKeyboardButton(text="⚠️ errors.log", callback_data="admin_log_get:errors"),
+            InlineKeyboardButton(text="🕷 parser.log", callback_data="admin_log_get:parser")
+        ],
+        [
+            InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup"),
+            InlineKeyboardButton(text="👑 В админку", callback_data="admin_refresh")
+        ]
+    ])
+
+    if isinstance(event, CallbackQuery):
+        try:
+            await message.edit_text(menu_text, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
+    await message.answer(menu_text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("admin_log_get:"))
+async def cb_admin_log_get(call: CallbackQuery):
+    user_id = call.from_user.id
+    if not config.is_admin(user_id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+
+    target = call.data.split(":")[1]
+    await call.answer("Формирую файл логов...")
+
+    import io
+    import os
+    import zipfile
+    from datetime import datetime
+    from pathlib import Path
+    from aiogram.types import BufferedInputFile
+
+    base_dir = config.BASE_DIR
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 1. Выгрузка ВСЕХ логов единым ZIP-архивом
+    if target == "all_zip":
+        zip_buffer = io.BytesIO()
+        total_raw_size = 0
+        files_count = 0
+
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Общий bot.log
+            bot_log = base_dir / "bot.log"
+            if bot_log.exists() and bot_log.is_file():
+                sz = bot_log.stat().st_size
+                if sz > 0:
+                    zf.write(bot_log, arcname="bot.log")
+                    total_raw_size += sz
+                    files_count += 1
+
+            # Файлы из папки logs/
+            logs_dir = base_dir / "logs"
+            if logs_dir.exists() and logs_dir.is_dir():
+                for p in logs_dir.glob("*.log*"):
+                    if p.is_file():
+                        sz = p.stat().st_size
+                        if sz > 0:
+                            zf.write(p, arcname=f"logs/{p.name}")
+                            total_raw_size += sz
+                            files_count += 1
+
+        if files_count == 0:
+            await call.message.answer("⚠️ Файлы логов в системе пока отсутствуют или пусты.")
+            return
+
+        zip_buffer.seek(0)
+        zip_bytes = zip_buffer.getvalue()
+        zip_filename = f"avito_radar_logs_{timestamp}.zip"
+        file_to_send = BufferedInputFile(zip_bytes, filename=zip_filename)
+
+        compression_pct = round((1 - len(zip_bytes) / max(total_raw_size, 1)) * 100)
+
+        await call.message.answer_document(
+            document=file_to_send,
+            caption=(
+                "📦 <b>Полный архив системных логов AVITO RADAR</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🗂 Файлов в архиве: <b>{files_count}</b>\n"
+                f"📊 Исходный размер: <b>{total_raw_size / 1024:.1f} KB</b>\n"
+                f"🗜 Размер архива: <b>{len(zip_bytes) / 1024:.1f} KB</b> (сжатие {compression_pct}%)\n"
+                f"📅 Дата выгрузки: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            ),
+            parse_mode="HTML"
+        )
+        logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил полный ZIP-архив логов ({zip_filename})")
+        return
+
+    # 2. Выгрузка конкретного файла логов
+    log_map = {
+        "bot": (base_dir / "bot.log", "📄 bot.log (общий консольный лог)"),
+        "user_actions": (base_dir / "logs" / "user_actions.log", "👥 user_actions.log (активность пользователей)"),
+        "errors": (base_dir / "logs" / "errors.log", "⚠️ errors.log (журнал ошибок и сбоев)"),
+        "parser": (base_dir / "logs" / "parser.log", "🕷 parser.log (лог парсера и запросов к Авито)"),
+    }
+
+    if target not in log_map:
+        await call.answer("Неизвестный тип лога", show_alert=True)
+        return
+
+    log_path, desc = log_map[target]
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        await call.message.answer(f"ℹ️ Файл <b>{log_path.name}</b> пока пуст или ещё не создан системой.", parse_mode="HTML")
+        return
+
+    raw_size = log_path.stat().st_size
+
+    # Если файл больше 40 МБ, сжимаем его в ZIP во избежание ограничений Telegram (50 MB)
+    if raw_size > 40 * 1024 * 1024:
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(log_path, arcname=log_path.name)
+        zip_buf.seek(0)
+        file_bytes = zip_buf.getvalue()
+        send_name = f"{log_path.stem}_{timestamp}.zip"
+        file_to_send = BufferedInputFile(file_bytes, filename=send_name)
+        caption = (
+            f"{desc}\n\n"
+            f"📦 <i>Файл сжат в ZIP из-за большого размера (>40 МБ)</i>\n"
+            f"📊 Исходный: <b>{raw_size / (1024*1024):.1f} MB</b> | Архив: <b>{len(file_bytes) / (1024*1024):.1f} MB</b>"
+        )
+    else:
+        with open(log_path, "rb") as f:
+            file_bytes = f.read()
+        send_name = f"{log_path.stem}_{timestamp}.log"
+        file_to_send = BufferedInputFile(file_bytes, filename=send_name)
+        caption = (
+            f"{desc}\n\n"
+            f"📦 Размер: <b>{raw_size / 1024:.1f} KB</b>\n"
+            f"📅 Выгружен: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+        )
+
+    await call.message.answer_document(
+        document=file_to_send,
+        caption=caption,
+        parse_mode="HTML"
+    )
+    logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил лог {send_name}")
+
 
 
