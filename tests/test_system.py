@@ -201,8 +201,8 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         
         # Скидки должны быть отключены по дефолту (0)
         self.assertEqual(search_data.get("min_discount_percent"), 0)
-        # Свежесть по умолчанию 60 минут
-        self.assertEqual(search_data.get("max_age_minutes"), 60)
+        # Свежесть по умолчанию 5 минут
+        self.assertEqual(search_data.get("max_age_minutes"), 5)
 
         # 2. Настраиваем индивидуальную свежесть (например 15 минут)
         updated = await database.update_search_max_age(s_id, user_id, 15)
@@ -217,7 +217,7 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(search_data3.get("min_discount_percent"), 10)
 
     def test_is_ad_fresh_enough_configurable(self):
-        """Проверка работы функции is_ad_fresh_enough с кастомными порогами max_age_minutes."""
+        """Проверка работы функции is_ad_fresh_enough с кастомными порогами max_age_minutes (1-30 мин, дефолт 5)."""
         import time
         from scheduler import is_ad_fresh_enough
         from handlers.searches import format_max_age_label
@@ -230,26 +230,28 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_ad_fresh_enough(None, timestamp=ts_20m_ago, max_age_minutes=30))
         # При лимите 10 минут — отсекается как старый
         self.assertFalse(is_ad_fresh_enough(None, timestamp=ts_20m_ago, max_age_minutes=10))
-        # При лимите 0 (без фильтра) — свежий
-        self.assertTrue(is_ad_fresh_enough(None, timestamp=ts_20m_ago, max_age_minutes=0))
+        # По дефолту (5 минут) — отсекается как старый
+        self.assertFalse(is_ad_fresh_enough(None, timestamp=ts_20m_ago))
 
         # 2. Тест по текстовой дате "25 минут назад"
         self.assertTrue(is_ad_fresh_enough("25 минут назад", max_age_minutes=30))
         self.assertFalse(is_ad_fresh_enough("25 минут назад", max_age_minutes=15))
+        self.assertFalse(is_ad_fresh_enough("25 минут назад")) # дефолт 5 мин
 
         # 3. "только что" или "50 секунд назад" — всегда свежие
-        self.assertTrue(is_ad_fresh_enough("только что", max_age_minutes=10))
-        self.assertTrue(is_ad_fresh_enough("45 секунд назад", max_age_minutes=10))
+        self.assertTrue(is_ad_fresh_enough("только что", max_age_minutes=5))
+        self.assertTrue(is_ad_fresh_enough("45 секунд назад", max_age_minutes=5))
 
-        # 4. "1 час назад" (от 45 до 60 мин)
-        self.assertTrue(is_ad_fresh_enough("1 час назад", max_age_minutes=60))
+        # 4. "1 час назад" (от 45 до 60 мин) — при лимите до 30 минут ГАРАНТИРОВАННО отсекается
         self.assertFalse(is_ad_fresh_enough("1 час назад", max_age_minutes=30))
+        self.assertFalse(is_ad_fresh_enough("2 часа назад", max_age_minutes=30))
 
-        # 5. Проверка форматирования меток
-        self.assertEqual(format_max_age_label(0), "Без ограничений ♾")
+        # 5. Проверка форматирования меток (максимум 30 минут)
+        self.assertEqual(format_max_age_label(0), "до 5 мин. ⚡️")
+        self.assertEqual(format_max_age_label(5), "до 5 мин. ⚡️")
         self.assertEqual(format_max_age_label(10), "до 10 мин. ⚡️")
-        self.assertEqual(format_max_age_label(60), "до 1 часа ⏳")
-        self.assertEqual(format_max_age_label(120), "до 2 часов ⌛️")
+        self.assertEqual(format_max_age_label(30), "до 30 мин. ⚡️")
+        self.assertEqual(format_max_age_label(60), "до 30 мин. ⚡️")
 
 
 if __name__ == "__main__":

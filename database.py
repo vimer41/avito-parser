@@ -102,7 +102,7 @@ async def init_db():
                 is_active INTEGER DEFAULT 1,
                 min_discount_percent INTEGER DEFAULT 0,
                 search_in_title_only INTEGER DEFAULT 0,
-                max_age_minutes INTEGER DEFAULT 60,
+                max_age_minutes INTEGER DEFAULT 5,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
             );
@@ -119,13 +119,16 @@ async def init_db():
             pass
 
         try:
-            await db.execute("ALTER TABLE searches ADD COLUMN max_age_minutes INTEGER DEFAULT 60;")
+            await db.execute("ALTER TABLE searches ADD COLUMN max_age_minutes INTEGER DEFAULT 5;")
         except Exception:
             pass
 
         # Отключаем отслеживание скидок по дефолту на всех радарах (0% = выключено),
         # скидки работают только если пользователь сам явно включает их в меню радара.
         await db.execute("UPDATE searches SET min_discount_percent = 0 WHERE min_discount_percent IS NULL OR min_discount_percent = 5;")
+
+        # По дефолту фильтр свежести на всех радарах до 5 минут (максимум 30 минут, без ограничений убрано)
+        await db.execute("UPDATE searches SET max_age_minutes = 5 WHERE max_age_minutes IS NULL OR max_age_minutes <= 0 OR max_age_minutes > 30;")
 
         # Администраторы всегда имеют полный доступ
         for aid in ADMIN_IDS:
@@ -276,7 +279,7 @@ async def update_user_default_template(user_id: int, template: str):
         await db.commit()
 
 
-async def add_search(user_id: int, title: str, url: str, search_in_title_only: int = 0, max_age_minutes: int = 60) -> int:
+async def add_search(user_id: int, title: str, url: str, search_in_title_only: int = 0, max_age_minutes: int = 5) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "INSERT INTO searches (user_id, title, url, stop_words, search_in_title_only, min_discount_percent, max_age_minutes) VALUES (?, ?, ?, ?, ?, 0, ?)",
@@ -288,11 +291,12 @@ async def add_search(user_id: int, title: str, url: str, search_in_title_only: i
 
 
 async def update_search_max_age(search_id: int, user_id: int, max_age_minutes: int) -> bool:
-    """Обновляет максимальный возраст объявлений (в минутах) для радара. 0 = без ограничений."""
+    """Обновляет максимальный возраст объявлений (в минутах) для радара. Ограничение от 1 до 30 минут."""
+    clamped_val = min(30, max(1, int(max_age_minutes)))
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "UPDATE searches SET max_age_minutes = ? WHERE id = ? AND user_id = ?",
-            (max_age_minutes, search_id, user_id)
+            (clamped_val, search_id, user_id)
         )
         await db.commit()
         return cursor.rowcount > 0

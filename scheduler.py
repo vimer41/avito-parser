@@ -332,20 +332,21 @@ def format_item_age(date_str: Optional[str], timestamp: Optional[int] = None) ->
 def is_ad_fresh_enough(
     date_str: Optional[str],
     timestamp: Optional[int] = None,
-    max_age_minutes: Optional[int] = 60
+    max_age_minutes: Optional[int] = 5
 ) -> bool:
     """
     Проверяет, действительно ли объявление актуальное/свежее согласно настройке радара (max_age_minutes),
-    отсекая старый спам из глубины каталога.
+    отсекая старый спам из глубины каталога. Лимит строго от 1 до 30 минут (по дефолту 5 мин).
 
-    Если max_age_minutes is None или <= 0 — фильтр свежести отключен (пропускаем любые объявления).
     1. Если есть точный timestamp из SSR JSON — вычисляет возраст лота с точностью до секунды.
     2. Если timestamp нет — парсит относительные фразы и время 'сегодня в HH:MM'.
     """
-    if max_age_minutes is None or max_age_minutes <= 0:
-        return True
+    if not max_age_minutes or max_age_minutes <= 0:
+        eff_max_age = 5
+    else:
+        eff_max_age = min(30, int(max_age_minutes))
 
-    threshold_seconds = max_age_minutes * 60
+    threshold_seconds = eff_max_age * 60
 
     if timestamp:
         age_seconds = max(0, int(time.time() - timestamp))
@@ -365,16 +366,12 @@ def is_ad_fresh_enough(
         m = re.search(r"(\d+)\s+минут", d)
         if m:
             mins = int(m.group(1))
-            return mins <= max_age_minutes
+            return mins <= eff_max_age
         return True
 
-    # "1 час назад" (Авито отображает это для лотов 1..59 мин или около часа)
-    if any(k in d for k in ["1 час назад", "час назад"]):
-        return max_age_minutes >= 60
-
-    # "2 часа назад"
-    if "2 часа назад" in d:
-        return max_age_minutes >= 120
+    # При лимите до 30 минут "час назад", "2 часа назад", "вчера" и т.д. ГАРАНТИРОВАННО отсекаются!
+    if any(k in d for k in ["час назад", "часа назад", "часов назад"]):
+        return False
 
     # "сегодня в 18:06" / "сегодня, 18:06"
     if "сегодня" in d:
@@ -386,11 +383,7 @@ def is_ad_fresh_enough(
             # Учитываем возможный рассинхрон часов / смену суток
             if diff_min < -60:
                 return True
-            return diff_min <= max_age_minutes
-        return True
-
-    # Если порог больше суток (например 1440+ минут), то "вчера" тоже подходит
-    if "вчера" in d and max_age_minutes >= 1440:
+            return diff_min <= eff_max_age
         return True
 
     # Все остальное: "вчера", "24 октября", "3 дня назад" и т.д. считаем старыми
@@ -706,12 +699,12 @@ async def process_url_group(
             if not new_items:
                 continue
 
-            # 1. Отбираем только действительно свежие объявления с учетом настройки max_age_minutes радара
-            max_age_min = radar.get("max_age_minutes")
-            if max_age_min is None:
-                max_age_min = 60
+            # 1. Отбираем только действительно свежие объявления с учетом настройки max_age_minutes радара (1..30 мин, дефолт 5)
+            max_age_raw = radar.get("max_age_minutes")
+            if not max_age_raw or int(max_age_raw) <= 0:
+                max_age_min = 5
             else:
-                max_age_min = int(max_age_min)
+                max_age_min = min(30, int(max_age_raw))
 
             fresh_items = [
                 it for it in new_items 

@@ -204,7 +204,7 @@ async def process_avito_url(message: Message, state: FSMContext):
     text = (
         "┌ 🎯 <b>РАДАР УСПЕШНО АКТИВИРОВАН!</b>\n"
         f"├ 📌 <b>Цель:</b> <b>{clean_title}</b>\n"
-        f"├ ⏱ <b>Свежесть лотов:</b> <b>до 1 часа ⏳</b>\n"
+        f"├ ⏱ <b>Свежесть лотов:</b> <b>до 5 мин. ⚡️</b>\n"
         f"├ 🔍 <b>Область выборки:</b> <b>{scope_icon}</b>\n"
         f"├ 📦 <b>Существующих объявлений:</b> <b>{len(items)}</b> (пропущены)\n"
         f"├ 📡 <b>Статус:</b> 🟢 Мониторинг 24/7 активен\n"
@@ -214,7 +214,7 @@ async def process_avito_url(message: Message, state: FSMContext):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="⏱ Свежесть: до 1 часа ⚙️", callback_data=f"set_age:{search_id}"),
+            InlineKeyboardButton(text="⏱ Свежесть: до 5 мин. ⚙️", callback_data=f"set_age:{search_id}"),
             InlineKeyboardButton(text=scope_btn, callback_data=f"toggle_title_scope:{search_id}")
         ],
         [
@@ -233,24 +233,12 @@ async def process_avito_url(message: Message, state: FSMContext):
 # ── Список радаров и компактное меню ────────────────────────────────────
 
 def format_max_age_label(max_age_minutes: Optional[int]) -> str:
-    """Форматирует человекочитаемое представление фильтра свежести."""
-    if max_age_minutes is None:
-        max_age_minutes = 60
-    if max_age_minutes <= 0:
-        return "Без ограничений ♾"
-    if max_age_minutes < 60:
-        return f"до {max_age_minutes} мин. ⚡️"
-    if max_age_minutes % 60 == 0:
-        hours = max_age_minutes // 60
-        if hours == 1:
-            return "до 1 часа ⏳"
-        elif hours in [2, 3, 4]:
-            return f"до {hours} часов ⌛️"
-        elif hours == 24:
-            return "до 24 часов 🗓"
-        else:
-            return f"до {hours} ч. ⌛️"
-    return f"до {max_age_minutes} мин. ⏱"
+    """Форматирует человекочитаемое представление фильтра свежести (от 1 до 30 минут)."""
+    if not max_age_minutes or max_age_minutes <= 0:
+        max_age_minutes = 5
+    elif max_age_minutes > 30:
+        max_age_minutes = 30
+    return f"до {max_age_minutes} мин. ⚡️"
 
 
 def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
@@ -277,10 +265,10 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         scope_btn_label = "🔍 Выборка: Название + описание 📄"
 
     max_age = s.get("max_age_minutes")
-    if max_age is None:
-        max_age = 60
-    else:
-        max_age = int(max_age)
+    if not max_age or max_age <= 0:
+        max_age = 5
+    elif max_age > 30:
+        max_age = 30
     age_label = format_max_age_label(max_age)
 
     card_text = (
@@ -727,10 +715,10 @@ async def cb_set_age_menu(call: CallbackQuery):
         return
 
     cur_age = s.get("max_age_minutes")
-    if cur_age is None:
-        cur_age = 60
-    else:
-        cur_age = int(cur_age)
+    if not cur_age or cur_age <= 0:
+        cur_age = 5
+    elif cur_age > 30:
+        cur_age = 30
 
     cur_label = format_max_age_label(cur_age)
 
@@ -739,17 +727,17 @@ async def cb_set_age_menu(call: CallbackQuery):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Радар: <b>{html.escape(s['title'])}</b>\n"
         f"Текущий фильтр: <b>{cur_label}</b>\n\n"
-        f"Выберите, сколько времени назад объявление должно быть выложено на Авито:\n"
+        f"Выберите, сколько минут назад лот должен быть выложен на Авито (максимум до 30 минут):\n"
         f"<i>(Лоты старше выбранного времени будут автоматически отсекаться, чтобы не присылать старый спам)</i>"
     )
 
     options = [
-        ("⚡️ 10 мин", 10),
-        ("⏱ 30 мин", 30),
-        ("⏳ 1 час", 60),
-        ("⌛️ 2 часа", 120),
-        ("📅 6 часов", 360),
-        ("🗓 24 часа", 1440),
+        ("⚡️ 3 мин", 3),
+        ("⚡️ 5 мин (дефолт)", 5),
+        ("⏱ 10 мин", 10),
+        ("⏱ 15 мин", 15),
+        ("⏱ 20 мин", 20),
+        ("⏱ 30 мин (макс)", 30),
     ]
 
     buttons = []
@@ -763,9 +751,7 @@ async def cb_set_age_menu(call: CallbackQuery):
     if row:
         buttons.append(row)
 
-    no_limit_mark = " ✓" if cur_age == 0 else ""
-    buttons.append([InlineKeyboardButton(text=f"♾ Без ограничений (все лоты){no_limit_mark}", callback_data=f"save_age:{search_id}:0")])
-    buttons.append([InlineKeyboardButton(text="✏️ Ввести минуты вручную...", callback_data=f"custom_age:{search_id}")])
+    buttons.append([InlineKeyboardButton(text="✏️ Ввести минуты вручную (1-30)...", callback_data=f"custom_age:{search_id}")])
     buttons.append([
         InlineKeyboardButton(text="« Назад к радару", callback_data=f"open_search:{search_id}"),
         InlineKeyboardButton(text="📁 Ко всем радарам", callback_data="list_searches")
@@ -783,7 +769,7 @@ async def cb_set_age_menu(call: CallbackQuery):
 async def cb_save_age(call: CallbackQuery):
     parts = call.data.split(":")
     search_id = int(parts[1])
-    val = int(parts[2])
+    val = min(30, max(1, int(parts[2])))
     user_id = call.from_user.id
 
     s = await database.get_search(search_id)
@@ -794,11 +780,7 @@ async def cb_save_age(call: CallbackQuery):
     await database.update_search_max_age(search_id, user_id, val)
     s["max_age_minutes"] = val
 
-    if val == 0:
-        ans_text = "Фильтр свежести отключен (пропускаются любые лоты)"
-    else:
-        ans_text = f"Установлен фильтр: {format_max_age_label(val)}"
-
+    ans_text = f"Установлен фильтр: {format_max_age_label(val)}"
     log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Настройка свежести", f"Радар #{search_id} -> {ans_text}", status="OK")
     await call.answer(f"✅ {ans_text}")
     card_text, kb = build_radar_card(s)
@@ -824,13 +806,12 @@ async def cb_prompt_custom_age(call: CallbackQuery, state: FSMContext):
         f"✏️ <b>РУЧНОЙ ВВОД ВРЕМЕНИ СВЕЖЕСТИ</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Радар: <b>{html.escape(s['title'])}</b>\n\n"
-        f"Отправьте сообщением максимальный возраст объявления <b>в минутах</b> (число от 0 до 10080):\n\n"
+        f"Отправьте сообщением максимальный возраст объявления <b>в минутах</b> (число от <b>1</b> до <b>30</b>):\n\n"
         f"<i>Примеры:\n"
-        f"• <code>5</code> — только супер-свежие (до 5 минут)\n"
-        f"• <code>15</code> — свежие (до 15 минут)\n"
-        f"• <code>90</code> — полтора часа (90 минут)\n"
-        f"• <code>180</code> — три часа (180 минут)\n"
-        f"• <code>0</code> — отключить фильтр (любой возраст)</i>"
+        f"• <code>2</code> — супер-быстрый перехват (до 2 минут)\n"
+        f"• <code>5</code> — стандарт (до 5 минут)\n"
+        f"• <code>15</code> — четверть часа (до 15 минут)\n"
+        f"• <code>30</code> — максимум каталога (до 30 минут)</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Отмена", callback_data=f"set_age:{search_id}")]
@@ -862,15 +843,15 @@ async def process_custom_age_input(message: Message, state: FSMContext):
     text = message.text.strip()
     if not text.isdigit():
         await message.answer(
-            "⚠️ <b>Пожалуйста, введите целое число минут</b> (например: <code>15</code> или <code>60</code>):",
+            "⚠️ <b>Пожалуйста, введите целое число минут от 1 до 30</b> (например: <code>5</code> или <code>15</code>):",
             parse_mode="HTML"
         )
         return
 
     val = int(text)
-    if val < 0 or val > 10080:  # до 7 суток
+    if val < 1 or val > 30:  # максимум 30 минут
         await message.answer(
-            "⚠️ <b>Число минут должно быть от 0 до 10080 (до 7 суток)!</b> Попробуйте ещё раз:",
+            "⚠️ <b>Число минут должно быть от 1 до 30 (максимум 30 минут)!</b> Попробуйте ещё раз:",
             parse_mode="HTML"
         )
         return
