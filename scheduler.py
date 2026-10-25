@@ -330,13 +330,22 @@ async def send_ad_to_user(
     try:
         photo_file: Optional[BufferedInputFile] = None
         if it.image_url:
-            try:
-                async with IMAGE_DOWNLOAD_SEMAPHORE:
-                    img_resp = await asyncio.to_thread(parser.session.get, it.image_url, timeout=8)
-                    if img_resp.status_code == 200 and len(img_resp.content) > 500:
-                        photo_file = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
-            except Exception as dl_err:
-                logger.debug(f"Не удалось скачать фото #{it.item_id}: {dl_err}")
+            # Предотвращаем таймауты: зеркало c80.img.avito.st доступно глобально 24/7 без сбросов соединений
+            urls_to_try = []
+            c80_url = re.sub(r"https?://[^.]+\.img\.avito\.st/", "https://c80.img.avito.st/", it.image_url)
+            urls_to_try.append(c80_url)
+            if it.image_url != c80_url:
+                urls_to_try.append(it.image_url)
+
+            for u in urls_to_try:
+                try:
+                    async with IMAGE_DOWNLOAD_SEMAPHORE:
+                        img_resp = await asyncio.to_thread(parser.session.get, u, timeout=4)
+                        if img_resp.status_code == 200 and len(img_resp.content) > 500:
+                            photo_file = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
+                            break
+                except Exception as dl_err:
+                    logger.debug(f"Не удалось скачать фото #{it.item_id} с {u[:35]}: {dl_err}")
 
         # Отправляем фото и сохраняем telegram file_id в кэш
         if photo_file:

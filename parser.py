@@ -476,37 +476,47 @@ class AvitoParser:
         2. Из тегов <img> (src, data-src, srcset)
         3. Из блока item-photo с ссылками на img.avito.st
         """
+        raw_url = None
         # 1. Слайдер изображений Авито
         li_img = it.find(attrs={"data-marker": lambda m: m and "slider-image/image-" in m})
         if li_img:
             marker = li_img.get("data-marker", "")
             url = marker.split("slider-image/image-")[-1].strip()
             if url.startswith("http"):
-                return url
+                raw_url = url
 
         # 2. Обычные теги img и srcset
-        for img in it.find_all("img"):
-            src = img.get("src") or img.get("data-src")
-            if src and src.startswith("http"):
-                return src
-            srcset = img.get("srcset")
-            if srcset:
-                parts = srcset.split(",")
-                if parts:
-                    first = parts[0].strip().split(" ")[0]
-                    if first.startswith("http"):
-                        return first
+        if not raw_url:
+            for img in it.find_all("img"):
+                src = img.get("src") or img.get("data-src")
+                if src and src.startswith("http"):
+                    raw_url = src
+                    break
+                srcset = img.get("srcset")
+                if srcset:
+                    parts = srcset.split(",")
+                    if parts:
+                        first = parts[0].strip().split(" ")[0]
+                        if first.startswith("http"):
+                            raw_url = first
+                            break
 
         # 3. Блок item-photo
-        photo_div = it.find(attrs={"data-marker": "item-photo"})
-        if photo_div:
-            for tag in photo_div.find_all(True):
-                for attr_name, attr_val in tag.attrs.items():
-                    if isinstance(attr_val, str) and "img.avito.st" in attr_val:
-                        m = re.search(r"(https?://[^\s\"\']+\.img\.avito\.st/[^\s\"\']+)", attr_val)
-                        if m:
-                            return m.group(1)
+        if not raw_url:
+            photo_div = it.find(attrs={"data-marker": "item-photo"})
+            if photo_div:
+                for tag in photo_div.find_all(True):
+                    for attr_name, attr_val in tag.attrs.items():
+                        if isinstance(attr_val, str) and "img.avito.st" in attr_val:
+                            m = re.search(r"(https?://[^\s\"\']+\.img\.avito\.st/[^\s\"\']+)", attr_val)
+                            if m:
+                                raw_url = m.group(1)
+                                break
+                    if raw_url:
+                        break
 
+        if raw_url:
+            return re.sub(r"https?://[^.]+\.img\.avito\.st/", "https://c80.img.avito.st/", raw_url)
         return None
 
     @classmethod
@@ -599,6 +609,10 @@ class AvitoParser:
                             if isinstance(v, str) and v.startswith("http"):
                                 image_url = v
                                 break
+
+                if image_url:
+                    # Нормализуем на быстрый глобальный Anycast CDN c80 (без региональных сбросов соединений)
+                    image_url = re.sub(r"https?://[^.]+\.img\.avito\.st/", "https://c80.img.avito.st/", image_url)
 
                 # Точный timestamp публикации (в секундах)
                 sort_ts = it.get("sortTimeStamp") or it.get("allowTimeStamp")
