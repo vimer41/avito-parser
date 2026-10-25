@@ -11,6 +11,14 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 from config import DATA_DIR
+from anti_bot import (
+    get_browser_user_agent,
+    handle_anti_bot_challenge,
+    is_qrator_challenge_response,
+    extract_pow_challenge,
+    solve_pow_challenge,
+    is_geetest_challenge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,22 +78,33 @@ class AvitoParser:
 
     @staticmethod
     def _is_firewall(r) -> bool:
-        return r.status_code in (403, 429, 439) or "firewall-container" in r.text
+        if not r:
+            return False
+        text = getattr(r, "text", "") or ""
+        return (
+            r.status_code in (403, 429, 439)
+            or is_qrator_challenge_response(r)
+            or is_geetest_challenge(r)
+            or "firewall-container" in text
+        )
 
     def _create_session(self) -> requests.Session:
+        ua = get_browser_user_agent()
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Connection": "keep-alive",
+            "Pragma": "no-cache",
+            "Cache-Control": "no-cache",
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
+            "User-Agent": ua,
         }
-        return requests.Session(impersonate="chrome120", headers=headers, timeout=20)
+        return requests.Session(impersonate="firefox147", headers=headers, timeout=20)
 
     def _save_cookies(self):
         """Сохраняет текущие валидные куки сессии на диск (исключая временный pow_challenge)."""
@@ -183,82 +202,16 @@ class AvitoParser:
         return normalized
 
     def _solve_pow_challenge(self, pow_challenge: str) -> bool:
-        """
-        Автоматическое решение криптографической капчи Proof-of-Work (PoW) Авито.
-        """
-        try:
-            headers = {
-                "Content-Type": "application/json",
-                "Referer": "https://www.avito.ru/",
-                "Origin": "https://www.avito.ru"
-            }
-            # 1. Получаем JWT с заданием
-            get_resp = self.session.post(
-                "https://www.avito.ru/web/3/firewallPow/get",
-                json={"challenge": pow_challenge},
-                headers=headers,
-                timeout=10,
-                allow_redirects=True
-            )
-            if get_resp.status_code != 200:
-                logger.error(f"Ошибка получения pow challenge: {get_resp.status_code}")
-                try:
-                    self.session.cookies.pop("pow_challenge", None)
-                except Exception:
-                    pass
-                return False
-
-            get_data = get_resp.json()
-            challenge_jwt = get_data.get("success", {}).get("result", {}).get("challenge_jwt")
-            if not challenge_jwt:
-                return False
-
-            # 2. Декодируем полезную нагрузку JWT
-            payload_b64 = challenge_jwt.split(".")[1]
-            payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode())
-
-            cid = payload.get("id")
-            compl = payload.get("compl", 3)
-            prefix = "0" * compl
-
-            # 3. Решаем sha256 PoW
-            nonce = 0
-            while True:
-                s = f"{cid}:{nonce}".encode()
-                if hashlib.sha256(s).hexdigest().startswith(prefix):
-                    break
-                nonce += 1
-
-            # 4. Отправляем решение на проверку
-            verify_resp = self.session.post(
-                "https://www.avito.ru/web/3/firewallPow/verify",
-                json={"challenge": challenge_jwt, "nonce": nonce},
-                headers=headers,
-                timeout=10,
-                allow_redirects=True
-            )
-
-            if verify_resp.status_code == 200:
-                v_data = verify_resp.json()
-                if v_data.get("success", {}).get("result", {}).get("verified"):
-                    self.session.cookies.set("pow_solved", "1", domain=".avito.ru", path="/")
-                    self.session.cookies.set("pow_solved", "1", domain="www.avito.ru", path="/")
-                    self._save_cookies()
-                    logger.info("✅ PoW успешно решен и кука pow_solved установлена!")
-                    return True
-
-            logger.warning(f"PoW не подтвержден: {verify_resp.text}")
-            return False
-
-        except Exception as e:
-            logger.error(f"Исключение при решении PoW: {e}")
-            return False
+        """Решает PoW challenge через модуль anti_bot."""
+        res = solve_pow_challenge(self.session, pow_challenge)
+        if res:
+            self._save_cookies()
+        return res
 
     def fetch_page(self, url: str) -> Optional[str]:
         """
         Загружает страницу Авито (прямое соединение):
-        - при защите Qrator решает PoW один раз и повторяет запрос;
+        - при наличии защиты (QRATOR, PoW, GeeTest) запускает автономный обход через anti_bot и повторяет запрос;
         - если Авито всё равно блокирует — включает паузу (1→2→4→8→15 мин) и НЕ шлёт запросы,
           чтобы не продлевать бан бесконечными повторами;
         - кэширует SSR-редиректы Авито, чтобы не делать 2 запроса на каждый радар.
@@ -272,19 +225,34 @@ class AvitoParser:
         try:
             r = self.session.get(target, timeout=20, allow_redirects=True)
 
-            if self._is_firewall(r):
-                challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
+            # Проверяем, сработала ли любая из защит Авито
+            if (
+                self._is_firewall(r)
+                or is_qrator_challenge_response(r)
+                or is_geetest_challenge(r)
+                or extract_pow_challenge(r, self.session)
+            ):
+                logger.info(f"🛡 {human}: Авито выставил проверку (HTTP {r.status_code}). Запуск протокола обхода...")
+                solved = handle_anti_bot_challenge(self.session, r, target)
 
-                # Челлендж иногда выдаётся только на главной — пробуем один раз, если это первый блок
-                if not challenge and self.block_streak == 0:
-                    r_main = self.session.get("https://www.avito.ru", timeout=15, allow_redirects=True)
-                    challenge = self.session.cookies.get("pow_challenge") or r_main.cookies.get("pow_challenge")
+                # Если челлендж не решен сразу и это первый блок — пробуем запросить главную страницу для снятия защиты
+                if not solved and self.block_streak == 0:
+                    try:
+                        r_main = self.session.get("https://www.avito.ru", timeout=15, allow_redirects=True)
+                        if (
+                            self._is_firewall(r_main)
+                            or is_qrator_challenge_response(r_main)
+                            or is_geetest_challenge(r_main)
+                            or extract_pow_challenge(r_main, self.session)
+                        ):
+                            solved = handle_anti_bot_challenge(self.session, r_main, "https://www.avito.ru")
+                    except Exception as e:
+                        logger.debug(f"Ошибка запроса к главной странице: {e}")
 
-                if challenge:
-                    logger.info("🧩 Авито выдал PoW-проверку, решаем...")
-                    if self._solve_pow_challenge(challenge):
-                        time.sleep(1.0)
-                        r = self.session.get(target, timeout=20, allow_redirects=True)
+                if solved:
+                    self._save_cookies()
+                    time.sleep(1.0)
+                    r = self.session.get(target, timeout=20, allow_redirects=True)
 
                 if self._is_firewall(r):
                     self._register_block(r.status_code)
