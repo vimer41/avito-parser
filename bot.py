@@ -14,7 +14,7 @@ import database
 from logging.handlers import RotatingFileHandler
 from handlers import main_router
 from middlewares import AccessControlMiddleware, ActionLoggingMiddleware
-from scheduler import monitoring_worker, start_background_services
+from scheduler import monitoring_worker, start_background_services, close_image_session
 
 # Принудительная поддержка UTF-8 в консоли Windows (для эмодзи)
 if sys.platform == "win32":
@@ -107,6 +107,7 @@ async def main():
         for task in background_tasks:
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
+        await close_image_session()
         await bot.session.close()
         if web_runner:
             await web_runner.cleanup()

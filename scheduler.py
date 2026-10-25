@@ -10,6 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import urlparse, parse_qs
+import aiohttp
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
@@ -35,23 +36,142 @@ class NotificationTask:
     old_price: Optional[int] = None
     drop_percent: Optional[int] = None
 
-# ── 2. Кэш Telegram file_id для отправленных фото (экономит 100% повторных скачиваний) ──
-PHOTO_FILE_ID_CACHE: Dict[str, str] = {}
-MAX_FILE_ID_CACHE = 3000
+
+# ── 2. Высокопроизводительный TTL/LRU кэш Telegram file_id (RAM) ─────────
+class TTLCache:
+    """
+    Легковесный in-memory TTL/LRU кэш для Telegram file_id (в RAM).
+    Экономит 100% повторных загрузок одного и того же лота для нескольких пользователей
+    и предотвращает утечки памяти.
+    """
+    def __init__(self, maxsize: int = 5000, ttl_seconds: float = 86400.0):
+        self.maxsize = maxsize
+        self.ttl = ttl_seconds
+        self._data: Dict[str, Tuple[str, float]] = {}
+
+    def get(self, key: str) -> Optional[str]:
+        now = time.monotonic()
+        item = self._data.get(key)
+        if item is None:
+            return None
+        val, expires_at = item
+        if now < expires_at:
+            return val
+        self._data.pop(key, None)
+        return None
+
+    def set(self, key: str, value: str):
+        now = time.monotonic()
+        if len(self._data) >= self.maxsize:
+            expired = [k for k, (_, exp) in self._data.items() if now >= exp]
+            for k in expired:
+                self._data.pop(k, None)
+            if len(self._data) >= self.maxsize:
+                for k in list(self._data.keys())[:500]:
+                    self._data.pop(k, None)
+        self._data[key] = (value, now + self.ttl)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+PHOTO_FILE_ID_CACHE = TTLCache(maxsize=5000, ttl_seconds=86400.0)
 
 def get_cached_photo_file_id(item_id: str) -> Optional[str]:
     return PHOTO_FILE_ID_CACHE.get(item_id)
 
 def set_cached_photo_file_id(item_id: str, file_id: str):
-    if len(PHOTO_FILE_ID_CACHE) >= MAX_FILE_ID_CACHE:
-        for k in list(PHOTO_FILE_ID_CACHE.keys())[:500]:
-            PHOTO_FILE_ID_CACHE.pop(k, None)
-    PHOTO_FILE_ID_CACHE[item_id] = file_id
+    PHOTO_FILE_ID_CACHE.set(item_id, file_id)
 
-# ── 3. Семафор ограничения параллельных сетевых загрузок фото (лимит RAM) ──
-IMAGE_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
 
-# ── 4. Асинхронная очередь доставки уведомлений (Outbox Queue) ───────────
+# ── 3. Блокировки по item_id (Cache Stampede Protection) ─────────────────
+ITEM_LOCKS: Dict[str, asyncio.Lock] = {}
+ITEM_LOCKS_MUTEX = asyncio.Lock()
+
+async def get_item_lock(item_id: str) -> asyncio.Lock:
+    """Гарантирует атомарную блокировку на уровне item_id для устранения Cache Stampede."""
+    async with ITEM_LOCKS_MUTEX:
+        lock = ITEM_LOCKS.get(item_id)
+        if lock is None:
+            if len(ITEM_LOCKS) >= 3000:
+                for k in list(ITEM_LOCKS.keys())[:1000]:
+                    ITEM_LOCKS.pop(k, None)
+            lock = asyncio.Lock()
+            ITEM_LOCKS[item_id] = lock
+        return lock
+
+
+# ── 4. Асинхронный клиент загрузки статики с Anycast CDN c80.img.avito.st ─
+IMAGE_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(12)
+_IMAGE_SESSION: Optional[aiohttp.ClientSession] = None
+_IMAGE_SESSION_LOCK = asyncio.Lock()
+
+async def get_image_session() -> aiohttp.ClientSession:
+    """Возвращает общий пул HTTP-соединений aiohttp для скачивания картинок лотов."""
+    global _IMAGE_SESSION
+    if _IMAGE_SESSION is None or _IMAGE_SESSION.closed:
+        async with _IMAGE_SESSION_LOCK:
+            if _IMAGE_SESSION is None or _IMAGE_SESSION.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=50,
+                    limit_per_host=25,
+                    ttl_dns_cache=300,
+                    use_dns_cache=True,
+                    enable_cleanup_closed=True
+                )
+                timeout = aiohttp.ClientTimeout(total=4.0, connect=1.5, sock_read=3.0)
+                _IMAGE_SESSION = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        "Accept": "image/jpeg, image/png;q=0.9, */*;q=0.1",
+                        "Accept-Encoding": "gzip, deflate",
+                        "Referer": "https://www.avito.ru/",
+                    }
+                )
+    return _IMAGE_SESSION
+
+async def close_image_session():
+    """Корректно закрывает aiohttp сессию при остановке приложения."""
+    global _IMAGE_SESSION
+    if _IMAGE_SESSION and not _IMAGE_SESSION.closed:
+        await _IMAGE_SESSION.close()
+        _IMAGE_SESSION = None
+
+async def download_image_bytes(raw_url: str) -> Optional[bytes]:
+    """
+    Асинхронная загрузка изображения через dedicated aiohttp session:
+    - Принудительно направляет запрос в глобальный Anycast CDN c80.img.avito.st;
+    - Запрашивает 'Accept: image/jpeg, image/png';
+    - Без блокирующих потоков curl_cffi;
+    - При сбое пробует оригинальный URL.
+    """
+    if not raw_url:
+        return None
+
+    session = await get_image_session()
+
+    urls_to_try = []
+    c80_url = re.sub(r"https?://[^.]+\.img\.avito\.st/", "https://c80.img.avito.st/", raw_url)
+    urls_to_try.append(c80_url)
+    if raw_url != c80_url:
+        urls_to_try.append(raw_url)
+
+    for u in urls_to_try:
+        try:
+            async with IMAGE_DOWNLOAD_SEMAPHORE:
+                async with session.get(u) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        if len(content) > 500:
+                            return content
+        except Exception as dl_err:
+            logger.debug(f"Сбой загрузки фото по {u[:45]}: {dl_err}")
+
+    return None
+
+# ── 5. Асинхронная очередь доставки уведомлений (Outbox Queue) ───────────
 NOTIFICATION_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=3000)
 
 
@@ -76,7 +196,7 @@ def build_notification_text(
     old_price: Optional[int] = None,
     drop_percent: Optional[int] = None
 ) -> str:
-    """Форматирует стильный и чистый текст карточки товара."""
+    """Форматирует стильный и чистый текст карточки товара с безопасным лимитом длины (до 1000 символов)."""
     clean_title = html.escape(item.title)
     clean_price = html.escape(item.price)
     clean_search = search_title.replace("\xa0", " ").strip()
@@ -93,7 +213,7 @@ def build_notification_text(
         diff_rub = (old_price - item.raw_price) if (old_price and item.raw_price) else 0
         diff_str = f" · выгода {diff_rub:,} ₽".replace(",", " ") if diff_rub > 0 else ""
         old_price_str = f"{old_price:,} ₽".replace(",", " ") if old_price else ""
-        lines = [
+        header_lines = [
             f"📉 <b>СНИЖЕНИЕ ЦЕНЫ НА АВИТО! [-{drop_percent}%]</b>{badge_header}",
             f"🏷 <b>{clean_price}</b> (было <s>{old_price_str}</s>{diff_str})",
             f"📦 <b>{clean_title}</b>",
@@ -103,12 +223,13 @@ def build_notification_text(
         discount_badge = ""
         if getattr(item, "was_lowered", False) and getattr(item, "discount_percent", None):
             discount_badge = f" 🏷 <i>(-{item.discount_percent}%)</i>"
-        lines = [
+        header_lines = [
             f"⚡️ <b>НОВЫЙ ЛОТ НА АВИТО</b>{badge_header}",
             f"🏷 <b>{clean_price}</b>{discount_badge} · <b>{clean_title}</b>",
             "────────────────────"
         ]
 
+    detail_lines = []
     # Локация / Адрес
     address = item.address
     if not address:
@@ -116,7 +237,7 @@ def build_notification_text(
         if m:
             address = m.group(1).strip()
     if address:
-        lines.append(f"📍 <b>Адрес:</b> {html.escape(address)}")
+        detail_lines.append(f"📍 <b>Адрес:</b> {html.escape(address)}")
 
     # Состояние и доставка
     details = []
@@ -125,39 +246,45 @@ def build_notification_text(
     if item.delivery:
         details.append(f"🚚 {html.escape(item.delivery)}")
     if details:
-        lines.append(f"📦 <b>Детали:</b> {' · '.join(details)}")
+        detail_lines.append(f"📦 <b>Детали:</b> {' · '.join(details)}")
 
     # Преимущества и бейджи (Скидка на доставку, 14 дней на возврат, Торг и т.д.)
     if getattr(item, "badges", None):
         clean_badges = [html.escape(b) for b in item.badges[:3]]
-        lines.append(f"🛡 <b>Преимущества:</b> {' · '.join(clean_badges)}")
+        detail_lines.append(f"🛡 <b>Преимущества:</b> {' · '.join(clean_badges)}")
 
     # Просмотры (если подгружены)
     if getattr(item, "views_total", None) is not None:
         today_str = f" (+{item.views_today} сегодня)" if getattr(item, "views_today", None) is not None else ""
-        lines.append(f"👁 <b>Просмотры:</b> {item.views_total}{today_str}")
+        detail_lines.append(f"👁 <b>Просмотры:</b> {item.views_total}{today_str}")
 
     # Продавец
     if item.seller:
-        lines.append(f"👤 <b>Продавец:</b> {html.escape(item.seller)}")
+        detail_lines.append(f"👤 <b>Продавец:</b> {html.escape(item.seller)}")
 
     # Время
     if item.date:
-        lines.append(f"🕒 <b>Опубликовано:</b> {html.escape(item.date)}")
+        detail_lines.append(f"🕒 <b>Опубликовано:</b> {html.escape(item.date)}")
 
+    footer_lines = [
+        "────────────────────",
+        f"🎯 <b>Радар:</b> <i>{html.escape(clean_search)}</i>"
+    ]
 
-    # Описание
-    if item.description:
-        desc = item.description.strip()
-        if len(desc) > 280:
-            desc = desc[:277] + "..."
-        lines.append("")
-        lines.append(f"📝 <i>«{html.escape(desc)}»</i>")
+    # Безопасный динамический расчет длины для Telegram caption (жесткий лимит Telegram = 1024 символа для фото)
+    base_chars = sum(len(l) + 1 for l in (header_lines + detail_lines + footer_lines))
+    max_desc_budget = max(0, 960 - base_chars)
 
-    lines.append("────────────────────")
-    lines.append(f"🎯 <b>Радар:</b> <i>{html.escape(clean_search)}</i>")
+    desc_lines = []
+    if item.description and max_desc_budget >= 40:
+        raw_desc = item.description.strip()
+        allowed_len = min(280, max_desc_budget)
+        if len(raw_desc) > allowed_len:
+            raw_desc = raw_desc[: allowed_len - 3].rstrip() + "..."
+        desc_lines = ["", f"📝 <i>«{html.escape(raw_desc)}»</i>"]
 
-    return "\n".join(lines)
+    all_lines = header_lines + detail_lines + desc_lines + footer_lines
+    return "\n".join(all_lines)
 
 
 def build_notification_keyboard(item_url: str, search_id: int, has_seller: bool = True) -> InlineKeyboardMarkup:
@@ -295,9 +422,11 @@ async def send_ad_to_user(
 ) -> bool:
     """
     Отправляет уведомление пользователю (фото или текст).
-    1. Сначала проверяет кэш telegram file_id для мгновенной отправки без скачивания.
-    2. Скачивает фото через семафор (ограничение параллельных загрузок в RAM).
-    3. Сохраняет полученный telegram file_id для остальных пользователей.
+    1. Синхронизируется через per-item lock (защита от Cache Stampede при параллельной отправке).
+    2. Сначала проверяет кэш telegram file_id для мгновенной отправки без скачивания.
+    3. Скачивает фото через high-performance aiohttp session (Anycast CDN c80.img.avito.st).
+    4. Сохраняет полученный telegram file_id для остальных пользователей и будущих отправок.
+    5. Автоматически выдерживает паузу и повторяет отправку при TelegramRetryAfter.
     """
     caption = build_notification_text(
         it, search_title,
@@ -309,85 +438,107 @@ async def send_ad_to_user(
     owner_str = f" [{user_label}]" if user_label else f" ID:{user_id}"
     delivery_tag = f"СНИЖЕНИЕ ЦЕНЫ (-{drop_percent}%)" if is_price_drop else "Доставлено"
 
-    # 1. Проверяем кэш telegram file_id (мгновенная доставка без повторного скачивания)
+    # 1. Быстрая попытка через кэш telegram file_id (без блокировки)
     cached_fid = get_cached_photo_file_id(it.item_id)
     if cached_fid:
-        try:
-            await bot.send_photo(
-                chat_id=user_id,
-                photo=cached_fid,
-                caption=caption,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-            logger.info(f"     ⚡️ [Радар #{search_id}{owner_str}] {delivery_tag} (file_id кэш): {it.price} · «{it.title[:35]}»")
-            return True
-        except (TelegramForbiddenError, TelegramRetryAfter):
-            raise
-        except Exception as cache_err:
-            logger.debug(f"file_id кэш сбой ({cache_err}), скачиваем картинку заново...")
-
-    try:
-        photo_file: Optional[BufferedInputFile] = None
-        if it.image_url:
-            # Предотвращаем таймауты: зеркало c80.img.avito.st доступно глобально 24/7 без сбросов соединений
-            urls_to_try = []
-            c80_url = re.sub(r"https?://[^.]+\.img\.avito\.st/", "https://c80.img.avito.st/", it.image_url)
-            urls_to_try.append(c80_url)
-            if it.image_url != c80_url:
-                urls_to_try.append(it.image_url)
-
-            for u in urls_to_try:
-                try:
-                    async with IMAGE_DOWNLOAD_SEMAPHORE:
-                        img_resp = await asyncio.to_thread(parser.session.get, u, timeout=4)
-                        if img_resp.status_code == 200 and len(img_resp.content) > 500:
-                            photo_file = BufferedInputFile(img_resp.content, filename=f"{it.item_id}.jpg")
-                            break
-                except Exception as dl_err:
-                    logger.debug(f"Не удалось скачать фото #{it.item_id} с {u[:35]}: {dl_err}")
-
-        # Отправляем фото и сохраняем telegram file_id в кэш
-        if photo_file:
+        for attempt in range(2):
             try:
-                sent_msg = await bot.send_photo(
+                await bot.send_photo(
                     chat_id=user_id,
-                    photo=photo_file,
+                    photo=cached_fid,
                     caption=caption,
                     reply_markup=keyboard,
                     parse_mode="HTML"
                 )
-                if sent_msg.photo:
-                    set_cached_photo_file_id(it.item_id, sent_msg.photo[-1].file_id)
-                logger.info(f"     🚀 [Радар #{search_id}{owner_str}] {delivery_tag} (с фото): {it.price} · «{it.title[:35]}»")
+                logger.info(f"     ⚡️ [Радар #{search_id}{owner_str}] {delivery_tag} (file_id кэш): {it.price} · «{it.title[:35]}»")
                 return True
-            except (TelegramForbiddenError, TelegramRetryAfter):
+            except TelegramForbiddenError:
                 raise
-            except Exception as photo_send_err:
-                logger.warning(f"⚠️ [РАДАР #{search_id}] Сбой send_photo: {photo_send_err}, отправляем текстом...")
+            except TelegramRetryAfter as retry_err:
+                logger.warning(f"⏳ [FLOODWAIT] Telegram лимит для ID:{user_id}: пауза {retry_err.retry_after} сек.")
+                await asyncio.sleep(retry_err.retry_after + 0.5)
+                continue
+            except Exception as cache_err:
+                logger.debug(f"file_id кэш сбой ({cache_err}), пробуем скачать фото...")
+                break
 
-        # Фолбэк: если фото нет или байты не скачались
-        await bot.send_message(
-            chat_id=user_id,
-            text=caption,
-            reply_markup=keyboard,
-            parse_mode="HTML",
-            disable_web_page_preview=False
-        )
-        logger.info(f"     🚀 [Радар #{search_id}{owner_str}] Доставлено (текст): {it.price} · «{it.title[:35]}»")
-        return True
+    # 2. Если в кэше нет — берем атомарный item_lock (исключает повторное скачивание одной картинки параллельными воркерами)
+    item_lock = await get_item_lock(it.item_id)
+    async with item_lock:
+        # Проверяем кэш повторно внутри лока (если другой воркер скачал и залил в Telegram мгновением ранее)
+        cached_fid = get_cached_photo_file_id(it.item_id)
+        if cached_fid:
+            for attempt in range(2):
+                try:
+                    await bot.send_photo(
+                        chat_id=user_id,
+                        photo=cached_fid,
+                        caption=caption,
+                        reply_markup=keyboard,
+                        parse_mode="HTML"
+                    )
+                    logger.info(f"     ⚡️ [Радар #{search_id}{owner_str}] {delivery_tag} (file_id кэш/lock): {it.price} · «{it.title[:35]}»")
+                    return True
+                except TelegramForbiddenError:
+                    raise
+                except TelegramRetryAfter as retry_err:
+                    await asyncio.sleep(retry_err.retry_after + 0.5)
+                    continue
+                except Exception:
+                    break
 
-    except TelegramForbiddenError:
-        logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{user_id} заблокировал бота. Отключаем его радары.")
-        await database.deactivate_user_searches(user_id)
-        return False
-    except TelegramRetryAfter as retry_err:
-        logger.warning(f"⏳ [FLOODWAIT] Telegram лимит отправки: пауза {retry_err.retry_after} сек.")
-        await asyncio.sleep(retry_err.retry_after + 1)
-        return True
-    except Exception as send_err:
-        logger.error(f"❌ [РАДАР #{search_id}] Не удалось доставить лот #{it.item_id}: {send_err}")
-        return True
+        # Скачиваем изображение через aiohttp
+        photo_bytes: Optional[bytes] = None
+        if it.image_url:
+            photo_bytes = await download_image_bytes(it.image_url)
+
+        # Отправляем фото и сохраняем telegram file_id в кэш
+        if photo_bytes:
+            for attempt in range(2):
+                try:
+                    photo_file = BufferedInputFile(photo_bytes, filename=f"{it.item_id}.jpg")
+                    sent_msg = await bot.send_photo(
+                        chat_id=user_id,
+                        photo=photo_file,
+                        caption=caption,
+                        reply_markup=keyboard,
+                        parse_mode="HTML"
+                    )
+                    if sent_msg.photo:
+                        set_cached_photo_file_id(it.item_id, sent_msg.photo[-1].file_id)
+                    logger.info(f"     🚀 [Радар #{search_id}{owner_str}] {delivery_tag} (с фото): {it.price} · «{it.title[:35]}»")
+                    return True
+                except TelegramForbiddenError:
+                    raise
+                except TelegramRetryAfter as retry_err:
+                    await asyncio.sleep(retry_err.retry_after + 0.5)
+                    continue
+                except Exception as photo_send_err:
+                    logger.warning(f"⚠️ [РАДАР #{search_id}] Сбой send_photo: {photo_send_err}, отправляем текстом...")
+                    break
+
+    # 3. Фолбэк: отправляем текстом (если фото недоступно или Telegram отклонил фото)
+    for attempt in range(2):
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=caption,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=False
+            )
+            logger.info(f"     🚀 [Радар #{search_id}{owner_str}] Доставлено (текст): {it.price} · «{it.title[:35]}»")
+            return True
+        except TelegramForbiddenError:
+            raise
+        except TelegramRetryAfter as retry_err:
+            await asyncio.sleep(retry_err.retry_after + 0.5)
+            continue
+        except Exception as text_err:
+            logger.error(f"❌ [РАДАР #{search_id}] Не удалось доставить лот #{it.item_id}: {text_err}")
+            return False
+
+    return False
 
 
 class ParserPool:
@@ -876,13 +1027,13 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
         raise
 
 
-async def notification_worker(bot: Bot, parser: AvitoParser):
+async def notification_worker(bot: Bot, parser: AvitoParser, worker_id: int = 1):
     """
     Фоновый воркер асинхронной очереди уведомлений (Outbox Worker).
     Отправляет уведомления в Telegram независимо от цикла сканирования радаров.
     Соблюдает безопасный лимит скорости (~20 сообщений/сек) и обрабатывает ошибки Telegram.
     """
-    logger.info("📬 Фоновый сервис очереди уведомлений Telegram запущен")
+    logger.info(f"📬 Фоновый сервис очереди уведомлений [Outbox #{worker_id}] запущен")
     while True:
         try:
             task: NotificationTask = await NOTIFICATION_QUEUE.get()
@@ -906,16 +1057,16 @@ async def notification_worker(bot: Bot, parser: AvitoParser):
                 logger.warning(f"⏳ [FLOODWAIT] Telegram лимит: пауза {retry_err.retry_after} сек.")
                 await asyncio.sleep(retry_err.retry_after + 1)
             except Exception as e:
-                logger.error(f"❌ Ошибка отправки уведомления для ID:{task.user_id}: {e}")
+                logger.error(f"❌ [Outbox #{worker_id}] Ошибка отправки уведомления для ID:{task.user_id}: {e}")
             finally:
                 NOTIFICATION_QUEUE.task_done()
-                # Мягкое ограничение скорости: ~20 сообщений в секунду суммарно (50 мс)
-                await asyncio.sleep(0.05)
+                # Мягкое квантование для каждого воркера
+                await asyncio.sleep(0.04)
         except asyncio.CancelledError:
-            logger.info("🛑 Сервис очереди уведомлений остановлен.")
+            logger.info(f"🛑 Сервис очереди уведомлений [Outbox #{worker_id}] остановлен.")
             break
         except Exception as loop_err:
-            logger.error(f"Неожиданный сбой в notification_worker: {loop_err}")
+            logger.error(f"Неожиданный сбой в notification_worker #{worker_id}: {loop_err}")
             await asyncio.sleep(1)
 
 
@@ -948,14 +1099,18 @@ async def supervised_monitoring_worker(bot: Bot, parser: AvitoParser):
 def start_background_services(bot: Bot) -> List[asyncio.Task]:
     """
     Запускает все фоновые сервисы:
-    1. Очередь отправки уведомлений (notification_worker)
+    1. Пул воркеров очереди отправки уведомлений (notification_worker x 6)
     2. Мониторинг Авито под супервизором (supervised_monitoring_worker)
     Возвращает список фоновых задач для управления их жизненным циклом.
     """
     shared_parser = AvitoParser()
-    notif_task = asyncio.create_task(notification_worker(bot, shared_parser))
+    NUM_NOTIF_WORKERS = 6
+    notif_tasks = [
+        asyncio.create_task(notification_worker(bot, shared_parser, worker_id=i + 1))
+        for i in range(NUM_NOTIF_WORKERS)
+    ]
     monitor_task = asyncio.create_task(supervised_monitoring_worker(bot, shared_parser))
-    return [notif_task, monitor_task]
+    return [*notif_tasks, monitor_task]
 
 
 

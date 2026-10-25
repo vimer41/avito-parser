@@ -12,6 +12,8 @@ async def init_db():
     """Инициализация базы данных и создание таблиц."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA synchronous = NORMAL;")
+        await db.execute("PRAGMA busy_timeout = 5000;")
         await db.execute("PRAGMA cache_size = -2000;")  # Ограничение кэша в памяти 2 МБ (для 512 МБ RAM)
         await db.execute("PRAGMA temp_store = MEMORY;")
         await db.execute("PRAGMA auto_vacuum = INCREMENTAL;")
