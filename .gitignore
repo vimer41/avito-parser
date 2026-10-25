@@ -7,10 +7,11 @@ __pycache__/
 *.env
 .env
 
-# Database
+# Database & Local Data
 *.db
 *.sqlite
 *.sqlite3
+data/
 
 # Logs
 *.log

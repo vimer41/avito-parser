@@ -10,9 +10,12 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
-from config import PROXY_URL
+from config import PROXY_URL, DATA_DIR
 
 logger = logging.getLogger(__name__)
+
+COOKIE_FILE = DATA_DIR / "avito_cookies.json"
+WORKING_PROXY_FILE = DATA_DIR / "working_proxy.txt"
 
 @dataclass
 class AvitoItem:
@@ -31,14 +34,33 @@ class AvitoItem:
 
 
 class AvitoParser:
-    def __init__(self, proxy: Optional[str] = PROXY_URL):
-        self.proxy = proxy
-        self.session = self._create_session()
+    _WORKING_PROXY_OVERRIDE: Optional[str] = None
 
-    def _create_session(self) -> requests.Session:
+    def __init__(self, proxy: Optional[str] = PROXY_URL):
+        if AvitoParser._WORKING_PROXY_OVERRIDE:
+            self.proxy = AvitoParser._WORKING_PROXY_OVERRIDE
+        elif WORKING_PROXY_FILE.exists():
+            try:
+                saved = WORKING_PROXY_FILE.read_text("utf-8").strip()
+                if saved:
+                    AvitoParser._WORKING_PROXY_OVERRIDE = saved
+                    self.proxy = saved
+                else:
+                    self.proxy = proxy
+            except Exception:
+                self.proxy = proxy
+        else:
+            self.proxy = proxy
+
+        self.current_proxy = self.proxy
+        self.proxy_fail_count = 0
+        self.session = self._create_session(self.current_proxy)
+        self._load_cookies()
+
+    def _create_session(self, proxy: Optional[str] = None) -> requests.Session:
         proxies = None
-        if self.proxy:
-            proxies = {"http": self.proxy, "https": self.proxy}
+        if proxy:
+            proxies = {"http": proxy, "https": proxy}
 
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -60,13 +82,77 @@ class AvitoParser:
         )
         return session
 
-    def _init_session(self):
-        """Сброс и повторная инициализация сессии с чистыми куками."""
+    def _save_cookies(self):
+        """Сохраняет текущие валидные куки сессии на диск."""
+        try:
+            cookie_dict = dict(self.session.cookies)
+            if cookie_dict:
+                COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(cookie_dict, f, ensure_ascii=False, indent=2)
+                logger.debug(f"Куки сохранены в {COOKIE_FILE.name} ({len(cookie_dict)} шт.)")
+        except Exception as e:
+            logger.debug(f"Не удалось сохранить куки: {e}")
+
+    def _load_cookies(self):
+        """Загружает сохраненные куки с диска в текущую сессию."""
+        if not COOKIE_FILE.exists():
+            return
+        try:
+            with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+                cookie_dict = json.load(f)
+            if isinstance(cookie_dict, dict) and cookie_dict:
+                for k, v in cookie_dict.items():
+                    self.session.cookies.set(k, str(v), domain=".avito.ru", path="/")
+                logger.info(f"🍪 Загружено {len(cookie_dict)} сохранённых кук из {COOKIE_FILE.name}")
+        except Exception as e:
+            logger.warning(f"Ошибка загрузки кук из файла: {e}")
+
+    def _init_session(self, clear_cookies: bool = False):
+        """Пересоздание сессии. Если clear_cookies=False, куки сохраняются/подгружаются."""
         try:
             self.session.close()
         except Exception:
             pass
-        self.session = self._create_session()
+        if clear_cookies and COOKIE_FILE.exists():
+            try:
+                COOKIE_FILE.unlink()
+                logger.info("Файл кук удален для полной очистки сессии.")
+            except Exception:
+                pass
+
+        self.session = self._create_session(self.current_proxy)
+        if not clear_cookies:
+            self._load_cookies()
+
+    def _handle_proxy_error(self, err: Exception):
+        """Обработка ошибок прокси: автоматический переход на socks5 или фолбэк на прямое соединение."""
+        self.proxy_fail_count += 1
+        err_str = str(err)
+        logger.warning(f"⚠️ Ошибка прокси (сбой #{self.proxy_fail_count}): {err_str[:120]}")
+
+        # Если HTTP-прокси упал с CONNECT tunnel failed (часто бывает на портах, где работает SOCKS5),
+        # пробуем переключиться на socks5://
+        if self.current_proxy and self.current_proxy.startswith("http://") and "CONNECT tunnel failed" in err_str:
+            logger.info("🔄 Прокси вернул ошибку CONNECT tunnel на HTTP. Автоматически переключаем на протокол SOCKS5...")
+            self.current_proxy = self.current_proxy.replace("http://", "socks5://", 1)
+            self.proxy = self.current_proxy
+            AvitoParser._WORKING_PROXY_OVERRIDE = self.current_proxy
+            try:
+                WORKING_PROXY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                WORKING_PROXY_FILE.write_text(self.current_proxy, "utf-8")
+            except Exception:
+                pass
+            self.proxy_fail_count = 0
+            self._init_session(clear_cookies=False)
+            return
+
+        # Если 2 сбоя подряд — временный фолбэк на прямое соединение
+        if self.proxy_fail_count >= 2:
+            logger.warning("🚨 Прокси недоступен 2 раза подряд! Включаем фолбэк на прямое подключение (без прокси).")
+            self.current_proxy = None
+            self._init_session(clear_cookies=False)
+
 
 
     @staticmethod
@@ -118,11 +204,18 @@ class AvitoParser:
         Автоматическое решение криптографической капчи Proof-of-Work (PoW) Авито.
         """
         try:
+            headers = {
+                "Content-Type": "application/json",
+                "Referer": "https://www.avito.ru/",
+                "Origin": "https://www.avito.ru"
+            }
             # 1. Получаем JWT с заданием
             get_resp = self.session.post(
                 "https://www.avito.ru/web/3/firewallPow/get",
                 json={"challenge": pow_challenge},
-                timeout=10
+                headers=headers,
+                timeout=10,
+                allow_redirects=True
             )
             if get_resp.status_code != 200:
                 logger.error(f"Ошибка получения pow challenge: {get_resp.status_code}")
@@ -154,13 +247,18 @@ class AvitoParser:
             verify_resp = self.session.post(
                 "https://www.avito.ru/web/3/firewallPow/verify",
                 json={"challenge": challenge_jwt, "nonce": nonce},
-                timeout=10
+                headers=headers,
+                timeout=10,
+                allow_redirects=True
             )
 
             if verify_resp.status_code == 200:
                 v_data = verify_resp.json()
                 if v_data.get("success", {}).get("result", {}).get("verified"):
-                    self.session.cookies.set("pow_solved", "1", domain=".avito.ru")
+                    self.session.cookies.set("pow_solved", "1", domain=".avito.ru", path="/")
+                    self.session.cookies.set("pow_solved", "1", domain="www.avito.ru", path="/")
+                    self._save_cookies()
+                    logger.info("✅ PoW успешно решен и кука pow_solved установлена!")
                     return True
 
             logger.warning(f"PoW не подтвержден: {verify_resp.text}")
@@ -172,45 +270,55 @@ class AvitoParser:
 
     def fetch_page(self, url: str) -> Optional[str]:
         """
-        Загружает страницу Авито с автообходом защиты QRATOR / PoW и обработкой таймаутов.
+        Загружает страницу Авито с автообходом защиты QRATOR / PoW, персистентными куками и фолбэком прокси.
         """
         for attempt in range(2):
             try:
-                r = self.session.get(url, timeout=20)
+                r = self.session.get(url, timeout=20, allow_redirects=True)
+
+                # Проверяем, не попали ли мы на страницу блокировки /blocked
+                if "/blocked" in str(r.url):
+                    logger.warning(f"🚫 Редирект на страницу блокировки: {r.url}")
 
                 # Если получили 403/429/439 или challenge
                 pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
                 if (r.status_code in (403, 429, 439) or "firewall-container" in r.text) and pow_challenge:
                     logger.info("Обнаружена PoW-защита Авито, решаем...")
                     if self._solve_pow_challenge(pow_challenge):
-                        time.sleep(0.5)
-                        r = self.session.get(url, timeout=20)
+                        time.sleep(1.0)
+                        r = self.session.get(url, timeout=20, allow_redirects=True)
                         logger.info(f"Повторный запрос после PoW: статус {r.status_code}")
-                elif r.status_code == 403:
-                    # Если 403 и кука устарела, сбрасываем сессию
-                    logger.info("Сброс сессии из-за 403...")
-                    self._init_session()
+
+                elif r.status_code in (403, 429):
+                    # Если получили 403/429 без челленджа, пробуем перепроверить сессию
+                    logger.info(f"Статус {r.status_code}, проверяем наличие PoW...")
                     time.sleep(1.0)
-                    r = self.session.get(url, timeout=20)
                     pow_challenge = self.session.cookies.get("pow_challenge") or r.cookies.get("pow_challenge")
                     if pow_challenge:
-                        self._solve_pow_challenge(pow_challenge)
-                        r = self.session.get(url, timeout=20)
+                        if self._solve_pow_challenge(pow_challenge):
+                            time.sleep(1.0)
+                            r = self.session.get(url, timeout=20, allow_redirects=True)
 
                 if r.status_code == 200:
+                    self.proxy_fail_count = 0  # Сбрасываем счетчик ошибок при успешном запросе
+                    self._save_cookies()       # Сохраняем свежие куки сессии
                     return r.text
                 else:
                     logger.warning(f"Не удалось получить страницу {url}, статус {r.status_code}")
-                    if attempt == 0 and r.status_code == 403:
-                        time.sleep(1.5)
+                    if attempt == 0 and r.status_code in (403, 429):
+                        time.sleep(2.0)
                         continue
                     return None
 
             except Exception as e:
+                err_msg = str(e)
+                if "curl: (28)" in err_msg or "Proxy" in type(e).__name__ or "CONNECT tunnel" in err_msg or "ConnectionError" in type(e).__name__:
+                    self._handle_proxy_error(e)
+
                 if attempt == 0:
                     logger.warning(f"Сбой подключения к {url} ({e}), повтор через 2 сек...")
                     time.sleep(2.0)
-                    self._init_session()
+                    self._init_session(clear_cookies=False)
                     continue
                 logger.error(f"Ошибка запроса к {url}: {e}")
                 return None
