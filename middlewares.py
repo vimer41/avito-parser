@@ -121,26 +121,30 @@ class AccessControlMiddleware(BaseMiddleware):
         # 4. Если доступ НЕ одобрен:
         text_for_user = (
             "🔒 <b>Доступ к боту ограничен</b>\n\n"
-            "Этот бот является приватным. Ваша заявка на доступ отправлена администратору <b>@vimerd</b>.\n"
-            "Как только администратор подтвердит доступ — вы получите уведомление и сможете начать поиск!"
+            "Этот бот является приватным. Ваша заявка передана администраторам сервиса.\n"
+            "Как только доступ будет подтверждён — вы получите уведомление и сможете начать поиск!"
         )
 
         if isinstance(event, Message):
             await event.answer(text_for_user, parse_mode="HTML")
         elif isinstance(event, CallbackQuery):
-            await event.answer("Доступ ограничен. Ожидайте подтверждения от @vimerd.", show_alert=True)
+            await event.answer("Доступ ограничен. Ожидайте подтверждения от администратора.", show_alert=True)
 
-        # 5. Отправляем запрос администратору
+        # 5. Отправляем запрос администраторам
+        user_msg = f"\n💬 <b>Сообщение:</b> <i>«{html.escape(event.text[:250])}»</i>" if (isinstance(event, Message) and event.text) else ""
         admin_text = (
             "🔔 <b>Новый запрос на доступ к боту!</b>\n\n"
             f"👤 <b>Имя:</b> {html.escape(user.full_name)}\n"
             f"🔗 <b>Username:</b> @{user.username if user.username else 'нет'}\n"
-            f"🆔 <b>ID:</b> <code>{user_id}</code>"
+            f"🆔 <b>ID:</b> <code>{user_id}</code>{user_msg}"
         )
         admin_kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Одобрить доступ", callback_data=f"admin_approve:{user_id}"),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin_reject:{user_id}")
+            ],
+            [
+                InlineKeyboardButton(text="✍️ Написать пользователю", callback_data=f"support_reply:{user_id}")
             ]
         ])
 

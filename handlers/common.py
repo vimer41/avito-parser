@@ -318,7 +318,7 @@ async def cb_select_tariff(call: CallbackQuery):
         action_buttons = []
     else:
         info_note = "<i>💡 Для оформления подписки и получения счёта на оплату свяжитесь с оператором поддержки:</i>"
-        action_buttons = [[InlineKeyboardButton(text="💳 Оплатить подписку (Оператор)", url="https://t.me/vimerd")]]
+        action_buttons = [[InlineKeyboardButton(text="💳 Написать оператору для оплаты", callback_data="support_start_ticket")]]
 
     text = (
         "💳 <b>ОФОРМЛЕНИЕ ПОДПИСКИ</b>\n"
@@ -358,17 +358,16 @@ async def cmd_support(event, state: Optional[FSMContext] = None):
         message = event
 
     text = (
-        "💬 <b>СЛУЖБА ПОДДЕРЖКИ И КОНТАКТЫ</b>\n"
+        "💬 <b>СЛУЖБА ПОДДЕРЖКИ И ОБРАТНАЯ СВЯЗЬ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "По вопросам работы сервиса, настройке радаров, оплате тарифов или предложениям:\n\n"
-        "👤 <b>Telegram поддержки:</b> @vimerd\n"
+        "По любым вопросам работы сервиса, настройке радаров, оплате тарифов или предложениям:\n\n"
         "🕒 <b>График работы:</b> Ежедневно с 09:00 до 23:00 (МСК)\n"
         "⚡️ <b>Среднее время ответа:</b> 5–15 минут\n\n"
-        "При вопросе по оплате укажите ваш <code>ID</code> из раздела «Мой профиль»."
+        "Нажмите кнопку ниже, чтобы задать вопрос — оператор ответит вам прямо в этом боте!"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="👨‍💻 Написать в поддержку", url="https://t.me/vimerd")
+            InlineKeyboardButton(text="✍️ Задать вопрос / Написать в поддержку", callback_data="support_start_ticket")
         ],
         [
             InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="open_subscription_menu"),
