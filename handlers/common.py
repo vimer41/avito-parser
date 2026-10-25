@@ -61,7 +61,7 @@ async def cmd_start(event, state: FSMContext):
         badge = "👑 <b>Администратор системы</b>"
     elif sub_until and trial_used and not is_allowed:
         formatted_until = database.format_subscription_date(sub_until)
-        badge = f"🎁 <b>Бесплатный триал (24 ч · до 2 радаров)</b>\n<i>└ Доступен: {formatted_until}</i>"
+        badge = f"🎁 <b>Бесплатный триал (24 ч · до 1 радара)</b>\n<i>└ Доступен: {formatted_until}</i>"
     elif sub_until and is_allowed:
         plan_name = (user_record.get("tariff_plan") or "Standart").upper()
         formatted_until = database.format_subscription_date(sub_until)
@@ -149,9 +149,9 @@ async def cmd_help(event):
         "⚡️ <b>6. Быстрый отклик продавцу:</b>\n"
         "Настройте шаблон в меню «⚡️ Быстрый отклик», и бот будет формировать ссылку для связи с продавцом в 1 клик.\n\n"
         "🎁 <b>7. Бесплатный триал и тарифы:</b>\n"
-        "• Всем новым пользователям автоматически доступен <b>24-часовой бесплатный триал на 2 радара</b>.\n"
-        "• <b>Тариф Standart (250 ₽ / мес):</b> до 5 радаров, моментальные HD-фото, стоп-слова и бан спамеров.\n"
-        "• <b>Тариф PRO (700 ₽ / мес):</b> до 15 радаров, приоритет доставки №1, алерты на скидки продавцов (Price Drop 💎)."
+        "• Всем новым пользователям автоматически доступен <b>24-часовой бесплатный триал на 1 радар</b>.\n"
+        "• <b>Тариф Standart (250 ₽ / мес):</b> до 4 радаров, моментальные HD-фото, стоп-слова и бан спамеров.\n"
+        "• <b>Тариф PRO (700 ₽ / мес):</b> до 9 радаров, приоритет доставки №1, алерты на скидки продавцов (Price Drop 💎)."
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -321,8 +321,8 @@ async def cmd_subscription_menu(event):
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"{status_line}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡️ <b>STANDART (250 ₽/мес)</b> — до 5 радаров, HD фото, стоп-слова, ЧС\n"
-        "🔥 <b>PRO (700 ₽/мес)</b> — до 15 радаров + <b>Price Drop 💎</b> (скидки продавцов)\n\n"
+        "⚡️ <b>STANDART (250 ₽/мес)</b> — до 4 радаров, HD фото, стоп-слова, ЧС\n"
+        "🔥 <b>PRO (700 ₽/мес)</b> — до 9 радаров + <b>Price Drop 💎</b> (скидки продавцов)\n\n"
         "<i>💡 Выберите тариф ниже для просмотра подробностей:</i>"
     )
 
@@ -334,10 +334,10 @@ async def cmd_subscription_menu(event):
         ])
 
     buttons.append([
-        InlineKeyboardButton(text="⚡️ Standart (5 радаров) — 250 ₽ / мес", callback_data="buy_tariff:standart")
+        InlineKeyboardButton(text="⚡️ Standart (4 радара) — 250 ₽ / мес", callback_data="buy_tariff:standart")
     ])
     buttons.append([
-        InlineKeyboardButton(text="🔥 PRO (15 радаров + Скидки) — 700 ₽ / мес", callback_data="buy_tariff:pro")
+        InlineKeyboardButton(text="🔥 PRO (9 радаров + Скидки) — 700 ₽ / мес", callback_data="buy_tariff:pro")
     ])
     buttons.append([
         InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile"),
@@ -364,11 +364,11 @@ async def cb_select_tariff(call: CallbackQuery):
     tariffs = {
         "standart": {
             "name": "⚡️ Standart",
-            "radars": 5,
+            "radars": 4,
             "price": "250 ₽ / месяц",
             "price_num": "250 ₽",
             "perks": (
-                "✔️ До <b>5 активных радаров</b> одновременно\n"
+                "✔️ До <b>4 активных радаров</b> одновременно\n"
                 "✔️ Молниеносный мониторинг раз в минуту\n"
                 "✔️ Моментальные оповещения с фото товара в HD\n"
                 "✔️ Фильтрация по стоп-словам\n"
@@ -377,11 +377,11 @@ async def cb_select_tariff(call: CallbackQuery):
         },
         "pro": {
             "name": "🔥 PRO Мониторинг",
-            "radars": 15,
+            "radars": 9,
             "price": "700 ₽ / месяц",
             "price_num": "700 ₽",
             "perks": (
-                "✔️ До <b>15 активных радаров</b> одновременно\n"
+                "✔️ До <b>9 активных радаров</b> одновременно\n"
                 "✔️ ⚡️ <b>Приоритет доставки №1</b> (раньше всех)\n"
                 "✔️ 📉 <b>Алерты на снижение цены (Price Drop Alert) 💎</b>\n"
                 "✔️ Точный поиск строго в названиях (bt=1)\n"

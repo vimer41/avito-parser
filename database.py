@@ -183,7 +183,7 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
                 (user_id, username, first_name, DEFAULT_SELLER_MESSAGE)
             )
         else:
-            # Новым пользователям автоматически активируем 24-часовой бесплатный пробный период (тариф Standart, 2 радара)
+            # Новым пользователям автоматически активируем 24-часовой бесплатный пробный период (тариф Standart, 1 радар)
             await db.execute("""
                 INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan, trial_used, subscription_until)
                 VALUES (?, ?, ?, ?, 0, 'standart', 1, datetime('now', '+1 day'))
@@ -199,9 +199,9 @@ async def get_user_max_radars(user_id: int) -> int:
     """
     Возвращает максимальное количество радаров для пользователя в зависимости от тарифа:
     - Администратор: MAX_SEARCHES_PER_USER
-    - PRO (оплаченный или вечный): 15
-    - Standart (оплаченный): 5
-    - Бесплатный триал (новый пользователь): 2
+    - PRO (оплаченный или вечный): 9
+    - Standart (оплаченный): 4
+    - Бесплатный триал (новый пользователь): 1
     """
     if user_id in ADMIN_IDS:
         return MAX_SEARCHES_PER_USER
@@ -212,13 +212,13 @@ async def get_user_max_radars(user_id: int) -> int:
     trial_used = bool(user.get("trial_used"))
 
     if is_allowed or plan == "pro":
-        return 15 if plan == "pro" else 5
+        return 9 if plan == "pro" else 4
 
     # Если бесплатный пробный период (новый пользователь без постоянного VIP)
     if trial_used and not is_allowed:
-        return 2
+        return 1
 
-    return 5 if plan == "standart" else 2
+    return 4 if plan == "standart" else 1
 
 
 async def is_user_allowed(user_id: int) -> bool:

@@ -47,9 +47,9 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         is_allowed = await database.is_user_allowed(trial_user_id)
         self.assertTrue(is_allowed)
 
-        # Лимит для триала — ровно 2 радара
+        # Лимит для триала — ровно 1 радар
         trial_radars = await database.get_user_max_radars(trial_user_id)
-        self.assertEqual(trial_radars, 2)
+        self.assertEqual(trial_radars, 1)
 
         # Проверяем сводную статистику системы: и админ, и триал-пользователь должны быть учтены в allowed_users
         stats = await database.get_system_stats()
@@ -57,19 +57,19 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["allowed_users"], 2)
 
     async def test_subscription_upgrade(self):
-        """Проверка апгрейда до Standart (5 радаров) и PRO (15 радаров)."""
+        """Проверка апгрейда до Standart (4 радара) и PRO (9 радаров)."""
         user_id = 55667788
         await database.get_or_create_user(user_id, "upgrader", "Alex")
 
         # Апгрейд до Standart
         await database.grant_subscription(user_id, days=30, tariff_plan="standart")
         standart_radars = await database.get_user_max_radars(user_id)
-        self.assertEqual(standart_radars, 5)
+        self.assertEqual(standart_radars, 4)
 
         # Апгрейд до PRO
         await database.grant_subscription(user_id, days=30, tariff_plan="pro")
         pro_radars = await database.get_user_max_radars(user_id)
-        self.assertEqual(pro_radars, 15)
+        self.assertEqual(pro_radars, 9)
 
     def test_main_keyboard_tariffs(self):
         """Проверка наличия кнопки тарифов в главном меню."""

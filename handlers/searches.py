@@ -141,7 +141,7 @@ async def process_avito_url(message: Message, state: FSMContext):
         log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка: лимит {max_radars} исчерпан", status="WARN")
         await message.answer(
             f"⚠️ <b>Достигнут лимит активных радаров ({max_radars})!</b>\n\n"
-            "Вы можете освободить место в меню <b>📁 Мои радары</b> или расширить лимит до 5 или 15 радаров в меню <b>💳 Тарифы</b>.",
+            "Вы можете освободить место в меню <b>📁 Мои радары</b> или расширить лимит до 4 или 9 радаров в меню <b>💳 Тарифы</b>.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💳 Расширить лимит (Тарифы)", callback_data="open_subscription_menu")],
                 [InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")]
