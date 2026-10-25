@@ -59,6 +59,35 @@ async def start_health_server():
         return None
 
 
+async def setup_bot_profile(bot: Bot):
+    """
+    Устанавливает официальное описание и презентацию бота в Telegram Bot API.
+    Отображается пользователю в окне чата ДО ТОГО, как он нажмет «Запустить» (/start).
+    """
+    bot_description = (
+        "🔥 AVITO RADAR — перехватывай лучшие предложения с выгодой!\n\n"
+        "📌 Мониторинг Авито 24/7!\n"
+        "Мгновенные оповещения о новых лотах за 1–3 секунды до конкурентов.\n\n"
+        "🎯 Что умеет бот?\n"
+        "✔️ Доставка новинок с реальными живыми HD фото\n"
+        "✔️ 📉 Price Drop 💎: авто-алерт при снижении цен продавцом\n"
+        "✔️ Умный фильтр стоп-слов и чёрный список спамеров\n"
+        "✔️ Точный поиск только в названиях или по всему тексту\n\n"
+        "🎁 Бонус! Нажмите «Старт» и получите 24 часа бесплатного тест-драйва прямо сейчас!"
+    )
+
+    bot_short_description = "⚡️ Мгновенный перехват новых объявлений и скидок на Авито 24/7. HD фото и алерты раньше перекупов!"
+
+    try:
+        await bot.set_my_description(description=bot_description, language_code="ru")
+        await bot.set_my_description(description=bot_description)
+        await bot.set_my_short_description(short_description=bot_short_description, language_code="ru")
+        await bot.set_my_short_description(short_description=bot_short_description)
+        logger.info("Презентационное описание бота (до /start) успешно обновлено в Telegram API!")
+    except Exception as e:
+        logger.warning(f"Не удалось обновить описание бота в Telegram API: {e}")
+
+
 async def main():
     if not config.BOT_TOKEN or config.BOT_TOKEN == "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ":
         logger.error(
@@ -95,10 +124,14 @@ async def main():
     # Удаляем вебхуки перед началом поллинга
     await bot.delete_webhook(drop_pending_updates=True)
 
+    # Устанавливаем официальную презентацию и описание бота в Telegram API (до нажатия /start)
+    await setup_bot_profile(bot)
+
     # Запуск фоновых сервисов мониторинга и очереди уведомлений под супервизором
     background_tasks = start_background_services(bot)
 
     logger.info("Бот успешно запущен и готов к работе!")
+
 
     try:
         await dp.start_polling(bot)
