@@ -537,13 +537,13 @@ async def process_url_group(
                 )
                 continue
 
-            # Защита от пачки: если ДАЖЕ среди свежих объявлений их больше 5 штук одновременно
-            if len(fresh_items) > 5:
+            # Защита от аномалий: если свежих лотов аномально много (> 15 штук одновременно)
+            if len(fresh_items) > 15:
                 fresh_label = plural_form(len(fresh_items), "свежий лот", "свежих лота", "свежих лотов")
                 logger.info(
-                    f"  {w_tag}📦 Радар #{radar_id} [{user_str}] «{search_title}»: пачка из {fresh_label} (сохранено в базу без спама)"
+                    f"  {w_tag}📦 Радар #{radar_id} [{user_str}] «{search_title}»: аномальная пачка из {fresh_label} (отправляем топ-10 самых свежих)"
                 )
-                continue
+                fresh_items = fresh_items[:10]
 
             fresh_label = plural_form(len(fresh_items), "СВЕЖИЙ ЛОТ", "СВЕЖИХ ЛОТА", "СВЕЖИХ ЛОТОВ")
             logger.info(f"  {w_tag}🔥 Радар #{radar_id} [{user_str}] «{search_title}»: НАЙДЕНО {fresh_label}!")
