@@ -166,6 +166,24 @@ class AvitoParser:
 
 
     @staticmethod
+    def _human_url(url: str) -> str:
+        """Превращает длинный технический URL Авито в читаемое название для логов."""
+        try:
+            from urllib.parse import unquote, urlparse
+            p = urlparse(url)
+            path = unquote(p.path).strip("/")
+            parts = [x for x in path.split("/") if x]
+            name = parts[-1].split("-")[0] if parts else "каталог"
+            qs = unquote(p.query)
+            m = re.search(r"q=([^&]+)", qs)
+            if m:
+                query = m.group(1).replace("+", " ").strip()
+                return f"«{query}»"
+            return f"«{name}»"
+        except Exception:
+            return url[:45]
+
+    @staticmethod
     def normalize_url(raw_url: str) -> str:
         """
         Нормализует ссылку:
@@ -314,7 +332,7 @@ class AvitoParser:
                     self._save_cookies()       # Сохраняем свежие куки сессии
                     return r.text
                 else:
-                    logger.warning(f"Не удалось получить страницу {url}, статус {r.status_code}")
+                    logger.warning(f"Не удалось получить {self._human_url(url)} (статус {r.status_code})")
                     if self.current_proxy and r.status_code in (403, 429):
                         self._handle_proxy_error(Exception(f"Avito статус {r.status_code} на прокси"))
                     if attempt == 0 and r.status_code in (403, 429):
@@ -328,11 +346,11 @@ class AvitoParser:
                     self._handle_proxy_error(e)
 
                 if attempt == 0:
-                    logger.warning(f"Сбой подключения к {url} ({e}), повтор через 2 сек...")
+                    logger.warning(f"Сбой подключения к {self._human_url(url)} ({e}), повтор через 2 сек...")
                     time.sleep(2.0)
                     self._init_session(clear_cookies=False)
                     continue
-                logger.error(f"Ошибка запроса к {url}: {e}")
+                logger.error(f"Ошибка запроса к {self._human_url(url)}: {e}")
                 return None
         return None
 

@@ -167,7 +167,7 @@ async def send_ad_to_user(
                     reply_markup=keyboard,
                     parse_mode="HTML"
                 )
-                logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО С ФОТО: #{it.item_id} «{it.title[:30]}...» ({it.price}) пользователю ID: {user_id}")
+                logger.info(f"     🚀 [Радар #{search_id}] Доставлено (с фото) ID:{user_id}: {it.price} · «{it.title[:35]}»")
                 return True
             except (TelegramForbiddenError, TelegramRetryAfter):
                 raise
@@ -182,7 +182,7 @@ async def send_ad_to_user(
             parse_mode="HTML",
             disable_web_page_preview=False
         )
-        logger.info(f"🚀 [РАДАР #{search_id}] УСПЕШНО ДОСТАВЛЕНО ТЕКСТОМ: #{it.item_id} «{it.title[:30]}...» ({it.price}) пользователю ID: {user_id}")
+        logger.info(f"     🚀 [Радар #{search_id}] Доставлено (текст) ID:{user_id}: {it.price} · «{it.title[:35]}»")
         return True
 
     except TelegramForbiddenError:
@@ -246,55 +246,40 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             seen_ids = await database.get_seen_item_ids_for_search(radar_id)
             new_items = [it for it in items if it.item_id not in seen_ids]
 
-            logger.info(
-                f"📡 [РАДАР #{radar_id}] «{search_title}» (User: {user_id}, Тариф: {radar.get('tariff_plan', 'standart')}): "
-                f"в выдаче {len(items)} лотов, новых для отправки: {len(new_items)}"
-            )
-
             if not new_items:
+                logger.info(f"  🔹 Радар #{radar_id} «{search_title}»: проверено {len(items)} лотов (новых нет)")
                 continue
 
             # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ, чтобы они не всплывали повторно
             await database.mark_items_seen_bulk(radar_id, [it.item_id for it in new_items])
 
             # 1. Отбираем только действительно свежие объявления (до 10 минут)
-            fresh_items = []
-            for it in new_items:
-                if is_ad_fresh_enough(it.date):
-                    fresh_items.append(it)
-                else:
-                    logger.info(
-                        f"⏳ [РАДАР #{radar_id}] Объявление #{it.item_id} пропущено как старое (дата: '{it.date}')"
-                    )
+            fresh_items = [it for it in new_items if is_ad_fresh_enough(it.date)]
 
             if not fresh_items:
+                logger.info(f"  🔹 Радар #{radar_id} «{search_title}»: {len(new_items)} лотов в ротации Авито (старые, пропущены)")
                 continue
 
             # Защита от пачки: если ДАЖЕ среди свежих объявлений их больше 5 штук одновременно
             if len(fresh_items) > 5:
                 logger.info(
-                    f"📦 [РАДАР #{radar_id}] Обнаружена аномальная пачка из {len(fresh_items)} свежих лотов. "
-                    f"Запоминаем без спама пользователю."
+                    f"  📦 Радар #{radar_id} «{search_title}»: пачка из {len(fresh_items)} свежих лотов (запомнено без спама)"
                 )
                 continue
 
+            logger.info(f"  🔥 Радар #{radar_id} «{search_title}»: НАЙДЕНО {len(fresh_items)} СВЕЖИХ ЛОТОВ!")
+
             # Отправляем в хронологическом порядке (снизу вверх)
             for it in reversed(fresh_items):
-
                 # 2. Проверяем стоп-слова
                 matched_stop = is_stop_word_matched(it, stop_words)
                 if matched_stop:
-                    logger.info(
-                        f"🛡 [РАДАР #{radar_id}] Объявление #{it.item_id} отсеяно по стоп-слову «{matched_stop}»"
-                    )
+                    logger.info(f"     🛡 Отсеяно по стоп-слову «{matched_stop}»: «{it.title[:30]}»")
                     continue
 
                 # 3. Проверяем черный список продавцов
                 if it.seller_name and it.seller_name.lower().strip() in blocked_sellers:
-                    logger.info(
-                        f"🚷 [РАДАР #{radar_id}] Объявление #{it.item_id} отсеяно: "
-                        f"продавец «{it.seller_name}» в черном списке пользователя ID:{user_id}"
-                    )
+                    logger.info(f"     🚷 Отсеян продавец «{it.seller_name}» из ЧС (ID:{user_id})")
                     continue
 
                 ok = await send_ad_to_user(bot, parser, user_id, radar_id, search_title, it)
@@ -328,15 +313,14 @@ async def monitoring_worker(bot: Bot):
             active_searches = await database.get_all_active_searches()
 
             if active_searches:
-                logger.info(f"🔄 [МОНИТОРИНГ] Начинаем круг сканирования ({len(active_searches)} активных радаров)...")
-
+                start_time = time.time()
                 # 1. Группируем радары по нормализованному URL (без context=..., localPriority=... и т.д.)
                 url_groups = defaultdict(list)
                 for search in active_searches:
                     clean_url = AvitoParser.normalize_url(search["url"])
                     url_groups[clean_url].append(search)
 
-                logger.info(f"🌐 [МОНИТОРИНГ] Уникальных URL-запросов к Авито: {len(url_groups)} (радаров в базе: {len(active_searches)})")
+                logger.info(f"🔄 [КРУГ МОНИТОРИНГА] Запуск проверки: {len(active_searches)} радаров ({len(url_groups)} ссылок Авито)...")
 
                 # 2. Делаем ровно 1 запрос к Авито на каждый уникальный URL
                 success_count = 0
@@ -348,7 +332,7 @@ async def monitoring_worker(bot: Bot):
                     else:
                         fail_count += 1
                     # Пауза между запросами к разным ссылкам для распределения нагрузки
-                    await asyncio.sleep(random.uniform(3.0, 5.0))
+                    await asyncio.sleep(random.uniform(2.5, 4.0))
 
                 # 🛡 Анализ здоровья мониторинга и защита от сбоев
                 if success_count == 0 and fail_count > 0:
@@ -385,6 +369,9 @@ async def monitoring_worker(bot: Bot):
                             except Exception as rec_err:
                                 logger.error(f"Не удалось отправить уведомление о восстановлении {aid}: {rec_err}")
                     consecutive_failures = 0
+
+                duration = time.time() - start_time
+                logger.info(f"💤 Круг завершён за {duration:.1f} сек. Пауза {CHECK_INTERVAL} сек.\n")
             else:
                 logger.info("ℹ️ [МОНИТОРИНГ] Нет активных радаров для сканирования.")
 
@@ -396,8 +383,6 @@ async def monitoring_worker(bot: Bot):
                 gc.collect()
                 logger.info("🧹 [ОПТИМИЗАЦИЯ] Очистка памяти (gc.collect) и БД успешно завершена")
 
-            # Ждем интервал до следующего круга проверок
-            logger.info(f"💤 [МОНИТОРИНГ] Круг завершён. Ожидание {CHECK_INTERVAL} сек. до следующей проверки...")
             await asyncio.sleep(CHECK_INTERVAL)
 
         except asyncio.CancelledError:

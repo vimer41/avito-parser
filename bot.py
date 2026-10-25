@@ -24,16 +24,20 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Настройка логирования с автоматической ротацией (максимум 3 файла по 10 МБ)
+# Настройка чистого логирования с автоматической ротацией
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
         RotatingFileHandler("bot.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
     ]
 )
-logger = logging.getLogger(__name__)
+# Отключаем шумные технические логи aiogram
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
+logger = logging.getLogger("bot")
 
 
 
