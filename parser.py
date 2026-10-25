@@ -218,7 +218,8 @@ class AvitoParser:
         - при наличии защиты (QRATOR, PoW, GeeTest) запускает автономный обход через anti_bot и повторяет запрос;
         - если Авито всё равно блокирует — включает паузу (1→2→4→8→15 мин) и НЕ шлёт запросы,
           чтобы не продлевать бан бесконечными повторами;
-        - кэширует SSR-редиректы Авито, чтобы не делать 2 запроса на каждый радар.
+        - кэширует SSR-редиректы Авито, чтобы не делать 2 запроса на каждый радар;
+        - при сетевых сбоях (сброс HTTP/2 сокета, таймаут) делает мгновенный повторный запрос.
         """
         if self.is_blocked():
             return None
@@ -226,71 +227,78 @@ class AvitoParser:
         target = self._canonical_cache.get(url, url)
         human = self._human_url(url)
 
-        try:
-            r = self.session.get(target, timeout=20, allow_redirects=True)
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                r = self.session.get(target, timeout=20, allow_redirects=True)
 
-            # Проверяем, сработала ли любая из защит Авито
-            if (
-                self._is_firewall(r)
-                or is_qrator_challenge_response(r)
-                or is_geetest_challenge(r)
-                or extract_pow_challenge(r, self.session)
-            ):
-                logger.info(f"🛡 {human}: Авито выставил проверку (HTTP {r.status_code}). Запуск протокола обхода...")
-                solved = handle_anti_bot_challenge(self.session, r, target)
+                # Проверяем, сработала ли любая из защит Авито
+                if (
+                    self._is_firewall(r)
+                    or is_qrator_challenge_response(r)
+                    or is_geetest_challenge(r)
+                    or extract_pow_challenge(r, self.session)
+                ):
+                    logger.info(f"🛡 {human}: Авито выставил проверку (HTTP {r.status_code}). Запуск протокола обхода...")
+                    solved = handle_anti_bot_challenge(self.session, r, target)
 
-                # Если челлендж не решен сразу и это первый блок — пробуем запросить главную страницу для снятия защиты
-                if not solved and self.block_streak == 0:
-                    try:
-                        r_main = self.session.get("https://www.avito.ru", timeout=15, allow_redirects=True)
-                        if (
-                            self._is_firewall(r_main)
-                            or is_qrator_challenge_response(r_main)
-                            or is_geetest_challenge(r_main)
-                            or extract_pow_challenge(r_main, self.session)
-                        ):
-                            solved = handle_anti_bot_challenge(self.session, r_main, "https://www.avito.ru")
-                    except Exception as e:
-                        logger.debug(f"Ошибка запроса к главной странице: {e}")
+                    # Если челлендж не решен сразу и это первый блок — пробуем запросить главную страницу для снятия защиты
+                    if not solved and self.block_streak == 0:
+                        try:
+                            r_main = self.session.get("https://www.avito.ru", timeout=15, allow_redirects=True)
+                            if (
+                                self._is_firewall(r_main)
+                                or is_qrator_challenge_response(r_main)
+                                or is_geetest_challenge(r_main)
+                                or extract_pow_challenge(r_main, self.session)
+                            ):
+                                solved = handle_anti_bot_challenge(self.session, r_main, "https://www.avito.ru")
+                        except Exception as e:
+                            logger.debug(f"Ошибка запроса к главной странице: {e}")
 
-                if solved:
-                    self._save_cookies()
+                    if solved:
+                        self._save_cookies()
+                        time.sleep(1.0)
+                        r = self.session.get(target, timeout=20, allow_redirects=True)
+
+                    if self._is_firewall(r):
+                        self._register_block(r.status_code)
+                        return None
+
+                if r.status_code != 200:
+                    logger.warning(f"⚠️ {human}: Авито ответил статусом {r.status_code}")
+                    return None
+
+                # Успех — сбрасываем серию блокировок
+                if self.block_streak:
+                    logger.info("✅ Доступ к Авито восстановлен")
+                self.block_streak = 0
+                self._save_cookies()
+                html = r.text
+
+                # Внутренний SSR-редирект Авито (ссылка устарела) — переходим и запоминаем канонический URL
+                if '"isSuspenseRedirect":true' in html:
+                    m_redir = re.search(r'"redirect"\s*:\s*"([^"]+)"', html)
+                    if m_redir:
+                        redir_path = m_redir.group(1).replace(r"\u0026", "&")
+                        canonical = "https://www.avito.ru" + redir_path if redir_path.startswith("/") else redir_path
+                        self._canonical_cache[url] = canonical
+                        logger.info(f"↪️ {human}: Авито сменил адрес выдачи, запомнили новый")
+                        r2 = self.session.get(canonical, timeout=20, allow_redirects=True)
+                        if r2.status_code == 200 and not self._is_firewall(r2):
+                            return r2.text
+                        return None
+
+                return html
+
+            except Exception as e:
+                err_msg = str(e)
+                if attempt < max_retries - 1:
+                    logger.info(f"🔄 {human}: сетевой сбой ({err_msg[:60]}...), мгновенный повторный запрос...")
                     time.sleep(1.0)
-                    r = self.session.get(target, timeout=20, allow_redirects=True)
-
-                if self._is_firewall(r):
-                    self._register_block(r.status_code)
-                    return None
-
-            if r.status_code != 200:
-                logger.warning(f"⚠️ {human}: Авито ответил статусом {r.status_code}")
+                    continue
+                logger.warning(f"🌐 {human}: сетевая ошибка — {err_msg[:120]}")
                 return None
-
-            # Успех — сбрасываем серию блокировок
-            if self.block_streak:
-                logger.info("✅ Доступ к Авито восстановлен")
-            self.block_streak = 0
-            self._save_cookies()
-            html = r.text
-
-            # Внутренний SSR-редирект Авито (ссылка устарела) — переходим и запоминаем канонический URL
-            if '"isSuspenseRedirect":true' in html:
-                m_redir = re.search(r'"redirect"\s*:\s*"([^"]+)"', html)
-                if m_redir:
-                    redir_path = m_redir.group(1).replace(r"\u0026", "&")
-                    canonical = "https://www.avito.ru" + redir_path if redir_path.startswith("/") else redir_path
-                    self._canonical_cache[url] = canonical
-                    logger.info(f"↪️ {human}: Авито сменил адрес выдачи, запомнили новый")
-                    r2 = self.session.get(canonical, timeout=20, allow_redirects=True)
-                    if r2.status_code == 200 and not self._is_firewall(r2):
-                        return r2.text
-                    return None
-
-            return html
-
-        except Exception as e:
-            logger.warning(f"🌐 {human}: сетевая ошибка — {str(e)[:120]}")
-            return None
 
     def fetch_item_details(self, item_id: str | int) -> Optional[dict]:
         """
