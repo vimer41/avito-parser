@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 
 COOKIE_FILE = DATA_DIR / "avito_cookies.json"
 
-# Пауза при блокировке IP Авито: 1 → 2 → 4 → 8 → 15 мин (максимум)
-BLOCK_BASE_COOLDOWN = 60
-BLOCK_MAX_COOLDOWN = 15 * 60
+# Пауза при блокировке сессии Авито: 15 сек → 30 сек → 60 сек
+BLOCK_BASE_COOLDOWN = 15
+BLOCK_MAX_COOLDOWN = 5 * 60
 
 @dataclass
 class AvitoItem:
@@ -79,9 +79,15 @@ class AvitoParser:
         self.block_streak += 1
         cooldown = min(BLOCK_BASE_COOLDOWN * 2 ** (self.block_streak - 1), BLOCK_MAX_COOLDOWN)
         self.blocked_until = time.time() + cooldown
+        # Мгновенно пересоздаем сессию, чтобы сбросить заблокированный контекст
+        try:
+            self.session = self._create_session()
+            self._load_cookies()
+        except Exception:
+            pass
         logger.warning(
-            f"🛑 Авито ограничил доступ (статус {status}). "
-            f"Не трогаем Авито {cooldown // 60} мин, чтобы IP «остыл» (блок #{self.block_streak} подряд)"
+            f"🛑 Авито ограничил доступ воркеру (статус {status}). "
+            f"Пауза {cooldown} сек., сессия обновлена (блок #{self.block_streak} подряд)"
         )
 
     @staticmethod
@@ -195,6 +201,10 @@ class AvitoParser:
 
         # Устанавливаем сортировку по дате (сначала новые)
         query_params["s"] = ["104"]
+
+        # Если bt=0 (по умолчанию 'везде'), убираем для каноничности и дедупликации
+        if query_params.get("bt") == ["0"]:
+            query_params.pop("bt", None)
 
         # Сортируем параметры для стабильного хеша URL при группировке
         sorted_params = sorted(query_params.items())

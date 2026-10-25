@@ -7,6 +7,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from typing import Optional, Tuple, List
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import config
 import database
@@ -155,8 +156,11 @@ async def process_avito_url(message: Message, state: FSMContext):
     search_title = AvitoParser.extract_search_title(html_content, normalized_url)
     items = AvitoParser.parse_items(html_content)
 
+    # Определяем область выборки: если в ссылке есть bt=1 — поиск строго по названиям
+    is_title_only = 1 if "bt=1" in normalized_url else 0
+
     # Сохраняем в БД
-    search_id = await database.add_search(user_id, search_title, normalized_url)
+    search_id = await database.add_search(user_id, search_title, normalized_url, search_in_title_only=is_title_only)
 
     # Запоминаем текущие объявления, чтобы не спамить старыми
     item_ids = [it.item_id for it in items]
@@ -170,9 +174,12 @@ async def process_avito_url(message: Message, state: FSMContext):
 
 
     clean_title = html.escape(search_title)
+    scope_icon = "🏷 Только в названиях" if is_title_only else "📄 Название + описание"
+    scope_btn = "🔍 Выборка: Только в названиях 🏷" if is_title_only else "🔍 Выборка: Название + описание 📄"
     text = (
         "┌ 🎯 <b>РАДАР УСПЕШНО АКТИВИРОВАН!</b>\n"
         f"├ 📌 <b>Цель:</b> <b>{clean_title}</b>\n"
+        f"├ 🔍 <b>Область выборки:</b> <b>{scope_icon}</b>\n"
         f"├ 📦 <b>Существующих объявлений:</b> <b>{len(items)}</b> (пропущены)\n"
         f"├ 📡 <b>Статус:</b> 🟢 Мониторинг 24/7 активен\n"
         f"└ ⚡️ <b>Частота сканирования:</b> каждые ~15 секунд\n\n"
@@ -180,6 +187,9 @@ async def process_avito_url(message: Message, state: FSMContext):
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=scope_btn, callback_data=f"toggle_title_scope:{search_id}")
+        ],
         [
             InlineKeyboardButton(text="📉 Алерт на скидки 💎", callback_data=f"set_discount:{search_id}"),
             InlineKeyboardButton(text="🚫 Стоп-слова", callback_data=f"manage_stops:{search_id}")
@@ -210,10 +220,19 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         disc_info = "<code>Выключено</code> ⚪️"
         disc_btn_label = "📉 Отслеживать скидки продавцов 💎"
 
+    title_only = bool(s.get("search_in_title_only", 0))
+    if title_only:
+        scope_info = "<b>Только в названиях</b> 🏷"
+        scope_btn_label = "🔍 Выборка: Только в названиях 🏷"
+    else:
+        scope_info = "<b>Название + описание</b> 📄"
+        scope_btn_label = "🔍 Выборка: Название + описание 📄"
+
     card_text = (
         f"🎯 <b>РАДАР: {title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>Статус:</b> {status_icon}\n"
+        f"🔍 <b>Область выборки:</b> {scope_info}\n"
         f"📉 <b>Скидки продавцов:</b> {disc_info}\n"
         f"🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>\n"
         f"🔗 <b>Ссылка:</b> <a href=\"{s['url']}\">Открыть выдачу на Авито</a>\n"
@@ -222,6 +241,9 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
 
     toggle_btn_text = "⏸ Поставить на паузу" if is_active else "▶️ Запустить радар"
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=scope_btn_label, callback_data=f"toggle_title_scope:{search_id}")
+        ],
         [
             InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{search_id}")
         ],
@@ -365,6 +387,51 @@ async def cb_toggle_search(call: CallbackQuery):
     if not s:
         return
 
+    card_text, kb = build_radar_card(s)
+    try:
+        await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        pass
+
+
+# ── Переключение области выборки (Только в названиях / Название + описание) ──
+
+@router.callback_query(F.data.startswith("toggle_title_scope:"))
+async def cb_toggle_title_scope(call: CallbackQuery):
+    user_id = call.from_user.id
+    search_id = int(call.data.split(":")[1])
+    s = await database.get_search(search_id)
+    if not s or s.get("user_id") != user_id:
+        await call.answer("Радар не найден", show_alert=True)
+        return
+
+    current_val = int(s.get("search_in_title_only") or 0)
+    new_val = 0 if current_val == 1 else 1
+    old_url = s["url"]
+
+    parsed = urlparse(old_url)
+    params = parse_qs(parsed.query)
+
+    if new_val == 1:
+        params["bt"] = ["1"]
+    else:
+        params.pop("bt", None)
+
+    new_query = urlencode(sorted(params.items()), doseq=True)
+    new_url = urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, parsed.params, new_query, ""))
+    new_url = AvitoParser.normalize_url(new_url)
+
+    await database.update_search_title_scope(search_id, user_id, new_val, new_url)
+
+    toast = (
+        "🏷 Выборка: ТОЛЬКО В НАЗВАНИЯХ!\nСпам из описаний теперь отсекается."
+        if new_val == 1 else
+        "📄 Выборка: НАЗВАНИЕ + ОПИСАНИЕ\nПоиск совпадений по всему тексту."
+    )
+    await call.answer(toast, show_alert=True)
+
+    s["search_in_title_only"] = new_val
+    s["url"] = new_url
     card_text, kb = build_radar_card(s)
     try:
         await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)

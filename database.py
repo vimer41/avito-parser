@@ -50,6 +50,11 @@ async def init_db():
             pass
 
         try:
+            await db.execute("ALTER TABLE searches ADD COLUMN search_in_title_only INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
+        try:
             await db.execute("ALTER TABLE seen_items ADD COLUMN last_price INTEGER DEFAULT 0;")
         except Exception:
             pass
@@ -165,15 +170,26 @@ async def update_user_default_template(user_id: int, template: str):
         await db.commit()
 
 
-async def add_search(user_id: int, title: str, url: str) -> int:
+async def add_search(user_id: int, title: str, url: str, search_in_title_only: int = 0) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO searches (user_id, title, url, stop_words) VALUES (?, ?, ?, ?)",
-            (user_id, title, url, json.dumps([], ensure_ascii=False))
+            "INSERT INTO searches (user_id, title, url, stop_words, search_in_title_only) VALUES (?, ?, ?, ?, ?)",
+            (user_id, title, url, json.dumps([], ensure_ascii=False), search_in_title_only)
         )
         search_id = cursor.lastrowid
         await db.commit()
         return search_id
+
+
+async def update_search_title_scope(search_id: int, user_id: int, search_in_title_only: int, new_url: str) -> bool:
+    """Обновляет область выборки (только название / название+описание) и URL радара."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE searches SET search_in_title_only = ?, url = ? WHERE id = ? AND user_id = ?",
+            (search_in_title_only, new_url, search_id, user_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def get_search(search_id: int) -> Optional[Dict[str, Any]]:

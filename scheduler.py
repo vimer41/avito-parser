@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
+from urllib.parse import urlparse, parse_qs
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
@@ -473,6 +474,28 @@ async def process_url_group(
             # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ с ценой, чтобы они не всплывали повторно
             await database.mark_items_seen_bulk(radar_id, [(it.item_id, it.raw_price or 0) for it in new_items])
 
+            # 🏷 Проверка области выборки (Только в названиях)
+            title_only = bool(radar.get("search_in_title_only", 0))
+            if title_only:
+                parsed_u = urlparse(radar.get("url", ""))
+                q_val = parse_qs(parsed_u.query).get("q", [""])[0].strip()
+                if q_val:
+                    keywords = [w.lower() for w in re.findall(r"[\w\d]+", q_val) if len(w) >= 2]
+                    if keywords:
+                        matching_title_items = []
+                        for it in new_items:
+                            t_lower = it.title.lower()
+                            if any(kw in t_lower for kw in keywords):
+                                matching_title_items.append(it)
+                            else:
+                                logger.info(
+                                    f"  {w_tag}🏷 [ТОЛЬКО В НАЗВАНИИ] Отсеян лот «{it.title[:35]}» (нет '{q_val}' в заголовке) [{user_str}]"
+                                )
+                        new_items = matching_title_items
+
+            if not new_items:
+                continue
+
             # 1. Отбираем только действительно свежие объявления (до 10 минут)
             fresh_items = [it for it in new_items if is_ad_fresh_enough(it.date, getattr(it, "timestamp", None))]
 
@@ -532,174 +555,290 @@ async def process_url_group(
 
 async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
     """
-    Главный бесконечный цикл фонового мониторинга поисков.
-    Оптимизирован для 512 МБ RAM и минимального числа HTTP-запросов к Авито (дедупликация URL).
-    Использует пул параллельных асинхронных воркеров для масштабирования на сотни и тысячи ссылок.
+    Непрерывный асинхронный конвейер мониторинга поисков (Continuous Pipeline Queue)
+    с приоритетным перехватом сбоев (Immediate Priority Failover).
+    
+    1. Непрерывная очередь (next_check_at):
+       Каждая ссылка опрашивается по своему индивидуальному таймлайну без жестких пауз между кругами.
+       Новые радары подхватываются мгновенно (в течение 1 секунды).
+       PRO-радары и администраторы опрашиваются с повышенным приоритетом и сокращенным интервалом.
+       
+    2. Приоритетный перехват сбоев (Immediate Priority Failover):
+       При ошибке парсинга (403, 429, таймаут сети) задача не отбрасывается в конец очереди,
+       а мгновенно помещается в стек urgent_failover_queue.
+       Первый освободившийся воркер немедленно забирает её со своим чистым сетевым контекстом (до 3 попыток).
     """
     pool_size = max(1, config.MAX_CONCURRENT_WORKERS)
-    # По требованию пользователя работаем напрямую (без прокси)
     parser_pool = ParserPool(pool_size, proxy_url=None)
     if parser is not None and parser_pool.parsers:
         parser_pool.parsers[0] = parser
 
-    logger.info(f"🚀 Запуск фонового сервиса мониторинга Авито (Worker Pool: {pool_size} воркеров)...")
-    cycle_count = 0
-    consecutive_failures = 0
+    logger.info(f"🚀 Запуск непрерывного конвейера мониторинга Авито (Worker Pool: {pool_size} воркеров, Continuous Queue)...")
+
+    # Очереди задач
+    urgent_failover_queue: asyncio.LifoQueue = asyncio.LifoQueue()
+    pipeline_queue: asyncio.Queue = asyncio.Queue()
+
+    # Состояние планировщика
+    url_next_check: Dict[str, float] = {}
+    url_intervals: Dict[str, float] = {}
+    url_radars_map: Dict[str, List[dict]] = {}
+    in_flight_urls: set = set()
+
+    # Статистика и здоровье
+    stats = {
+        "processed": 0,
+        "success": 0,
+        "failover_retries": 0,
+        "exhausted_fails": 0,
+        "consecutive_failures": 0,
+    }
     alert_sent = False
     FAILURE_THRESHOLD = 5
 
-    while True:
+    async def get_next_task() -> Tuple[Tuple[str, List[dict], int], bool]:
+        """
+        Забирает задачу с абсолютным приоритетом для urgent_failover_queue.
+        Если задач нет, ждет появления либо срочной, либо конвейерной задачи.
+        Возвращает: ((clean_url, radars, retry_attempt), is_urgent)
+        """
+        # 1. Проверяем приоритетный стек мгновенного перехвата без ожидания
         try:
-            active_searches = await database.get_all_active_searches()
+            return urgent_failover_queue.get_nowait(), True
+        except asyncio.QueueEmpty:
+            pass
 
-            if active_searches:
-                cycle_count += 1
-                start_time = time.time()
-                # 1. Группируем радары по нормализованному URL (без context=..., localPriority=... и т.д.)
-                url_groups = defaultdict(list)
-                for search in active_searches:
-                    clean_url = AvitoParser.normalize_url(search["url"])
-                    url_groups[clean_url].append(search)
+        # 2. Ждем задачу из любой из очередей
+        urgent_get = asyncio.create_task(urgent_failover_queue.get())
+        pipeline_get = asyncio.create_task(pipeline_queue.get())
 
-                radars_label = plural_form(len(active_searches), "радар", "радара", "радаров")
-                urls_label = plural_form(len(url_groups), "ссылка Авито", "ссылки Авито", "ссылок Авито")
-                num_workers = min(pool_size, len(url_groups))
-                workers_label = plural_form(num_workers, "воркер", "воркера", "воркеров")
+        done, pending = await asyncio.wait(
+            [urgent_get, pipeline_get],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for p in pending:
+            p.cancel()
 
+        if urgent_get in done and not urgent_get.cancelled() and not urgent_get.exception():
+            # Если плановая тоже успела выполниться в этот же квант времени, возвращаем ее обратно
+            if pipeline_get in done and not pipeline_get.cancelled() and not pipeline_get.exception():
+                pipeline_queue.put_nowait(pipeline_get.result())
+            return urgent_get.result(), True
+        else:
+            return pipeline_get.result(), False
+
+    async def worker_loop(worker_id: int):
+        """Индивидуальный параллельный воркер-обработчик конвейера."""
+        w_parser = parser_pool.get_parser(worker_id - 1)
+        # Небольшой начальный сдвиг старта воркеров
+        if worker_id > 1:
+            await asyncio.sleep((worker_id - 1) * 1.2)
+
+        while True:
+            # Если воркер в кулдауне из-за антибота, ждем
+            while w_parser.is_blocked():
+                wait_s = min(w_parser.block_remaining(), 5)
+                if wait_s <= 0:
+                    break
+                await asyncio.sleep(wait_s)
+
+            try:
+                task, is_urgent = await get_next_task()
+            except asyncio.CancelledError:
+                break
+            except Exception as task_err:
+                logger.error(f"[W{worker_id}] Ошибка извлечения задачи: {task_err}")
+                await asyncio.sleep(1)
+                continue
+
+            clean_url, radars_for_url, retry_attempt = task
+            human_name = AvitoParser._human_url(clean_url)
+
+            if is_urgent:
                 logger.info(
-                    f"🔄 [КРУГ #{cycle_count}] Запуск проверки: {radars_label} ({urls_label}) | "
-                    f"Параллельных потоков: {workers_label}..."
+                    f"  [W{worker_id}] 🎯 [FAILOVER ПЕРЕХВАТ #{retry_attempt}/3] Забрал задачу «{human_name}» из приоритетного стека!"
                 )
 
-                # 2. Очередь задач для параллельных воркеров с защитой от пропуска при сбоях (Round Retry)
-                task_queue: asyncio.Queue = asyncio.Queue()
-                for clean_url, radars_for_url in url_groups.items():
-                    await task_queue.put((clean_url, radars_for_url, 0))
+            stats["processed"] += 1
+            ok = await process_url_group(bot, w_parser, clean_url, radars_for_url, worker_id=worker_id)
 
-                async def worker_task(worker_id: int) -> Tuple[int, int]:
-                    w_parser = parser_pool.get_parser(worker_id - 1)
-                    w_success = 0
-                    w_fail = 0
-
-                    # Начальный сдвиг старта между воркерами для исключения одновременных сетевых пиков
-                    if worker_id > 1:
-                        await asyncio.sleep((worker_id - 1) * 1.5)
-
-                    while True:
-                        # Если данный парсер находится в кулдауне из-за 429/403, ждем его завершения
-                        while w_parser.is_blocked():
-                            wait_s = min(w_parser.block_remaining(), 5)
-                            if wait_s <= 0:
-                                break
-                            await asyncio.sleep(wait_s)
-
-                        try:
-                            # Ожидаем задачу из очереди (до 2.5 сек, пока другие воркеры могут передать задачу на повтор)
-                            clean_url, radars_for_url, retry_attempt = await asyncio.wait_for(task_queue.get(), timeout=2.5)
-                        except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                            break
-
-                        ok = await process_url_group(bot, w_parser, clean_url, radars_for_url, worker_id=worker_id)
-                        if ok:
-                            w_success += 1
-                        else:
-                            # Если опрос ссылки не удался (например, временный 403) — не теряем радар, а передаем другому воркеру!
-                            if retry_attempt < 1:
-                                human_name = AvitoParser._human_url(clean_url)
-                                logger.info(
-                                    f"  [W{worker_id}] 🔄 {human_name}: сбой проверки, задача возвращена в очередь на мгновенный повтор..."
-                                )
-                                await asyncio.sleep(1.0)
-                                await task_queue.put((clean_url, radars_for_url, retry_attempt + 1))
-                            else:
-                                w_fail += 1
-
-                        task_queue.task_done()
-                        # Безопасная пауза между запросами конкретного воркера
-                        await asyncio.sleep(random.uniform(2.0, 3.5))
-
-                    return w_success, w_fail
-
-                # Запуск параллельных воркеров
-                worker_coroutines = [worker_task(w_id) for w_id in range(1, num_workers + 1)]
-                worker_results = await asyncio.gather(*worker_coroutines)
-
-                success_count = sum(r[0] for r in worker_results)
-                fail_count = sum(r[1] for r in worker_results)
-
-                # 🛡 Анализ здоровья мониторинга и защита от сбоев
-                if success_count == 0 and fail_count > 0:
-                    consecutive_failures += 1
-                    logger.warning(
-                        f"⚠️ [СБОЙ МОНИТОРИНГА] Ни один радар не смог обновиться (сбой #{consecutive_failures}/{FAILURE_THRESHOLD} подряд)..."
+            if ok:
+                stats["success"] += 1
+                stats["consecutive_failures"] = 0
+                nonlocal alert_sent
+                if alert_sent:
+                    alert_sent = False
+                    recovery_msg = (
+                        f"✅ <b>Связь с Авито восстановлена!</b>\n\n"
+                        f"Конвейер мониторинга успешно получает данные. Бот работает в штатном режиме."
                     )
-                    if consecutive_failures >= FAILURE_THRESHOLD and not alert_sent:
+                    for aid in config.ADMIN_IDS:
+                        try:
+                            await bot.send_message(chat_id=aid, text=recovery_msg, parse_mode="HTML")
+                        except Exception:
+                            pass
+
+                # Вычисляем время следующей проверки
+                base_interval = url_intervals.get(clean_url, config.CHECK_INTERVAL)
+                jitter = random.uniform(-1.5, 1.5)
+                url_next_check[clean_url] = time.time() + max(10.0, base_interval + jitter)
+                in_flight_urls.discard(clean_url)
+
+                # Безопасная пауза между плановыми запросами конкретного воркера
+                if urgent_failover_queue.empty():
+                    await asyncio.sleep(random.uniform(1.8, 3.0))
+                else:
+                    await asyncio.sleep(0.3)
+            else:
+                # ОШИБКА: Immediate Priority Failover!
+                if retry_attempt < 3:
+                    next_attempt = retry_attempt + 1
+                    stats["failover_retries"] += 1
+                    logger.warning(
+                        f"  [W{worker_id}] ⚡️ [PRIORITY FAILOVER #{next_attempt}/3] Ошибка на «{human_name}» -> передано в приоритетный стек первому освободившемуся воркеру!"
+                    )
+                    # Задача остается в in_flight_urls, отдается в LIFO стек первому свободному воркеру
+                    await urgent_failover_queue.put((clean_url, radars_for_url, next_attempt))
+                    # Краткая пауза для смены состояния
+                    await asyncio.sleep(0.5)
+                else:
+                    # 3 попытки исчерпаны
+                    stats["exhausted_fails"] += 1
+                    stats["consecutive_failures"] += 1
+                    logger.error(
+                        f"  [W{worker_id}] ❌ [FAILOVER EXHAUSTED] «{human_name}» не ответил после 3 попыток обхода. Отложено на короткий кулдаун (30 сек)."
+                    )
+                    url_next_check[clean_url] = time.time() + 30.0
+                    in_flight_urls.discard(clean_url)
+
+                    if stats["consecutive_failures"] >= FAILURE_THRESHOLD and not alert_sent:
                         alert_sent = True
                         current_p = config.PROXY_URL or "Прямое соединение (без прокси)"
                         alert_msg = (
                             f"🚨 <b>ВНИМАНИЕ: Сбой мониторинга Авито!</b>\n\n"
-                            f"Мониторинг не может получить данные уже <b>{consecutive_failures} кругов подряд</b> (~{consecutive_failures} мин).\n"
-                            f"❌ Все запросы к Авито завершились ошибкой (403, 429 или таймаут).\n\n"
+                            f"Конвейер зафиксировал <b>{stats['consecutive_failures']} отказов подряд</b>.\n"
+                            f"❌ Запросы к Авито завершаются ошибкой (403, 429 или таймаут).\n\n"
                             f"🌐 <i>Текущий прокси:</i> <code>{html.escape(current_p)}</code>\n"
-                            f"🛠 <i>Рекомендация:</i> Проверьте прокси-сервер или перезапустите бота."
+                            f"🛠 <i>Рекомендация:</i> Проверьте соединение или перезапустите бота."
                         )
                         for aid in config.ADMIN_IDS:
                             try:
                                 await bot.send_message(chat_id=aid, text=alert_msg, parse_mode="HTML")
-                            except Exception as alert_err:
-                                logger.error(f"Не удалось отправить алерт админу {aid}: {alert_err}")
-                elif success_count > 0:
-                    if alert_sent:
-                        alert_sent = False
-                        recovery_msg = (
-                            f"✅ <b>Связь с Авито восстановлена!</b>\n\n"
-                            f"Мониторинг снова успешно получает данные (успешных запросов: {success_count}). "
-                            f"Бот работает в штатном режиме."
-                        )
-                        for aid in config.ADMIN_IDS:
-                            try:
-                                await bot.send_message(chat_id=aid, text=recovery_msg, parse_mode="HTML")
-                            except Exception as rec_err:
-                                logger.error(f"Не удалось отправить уведомление о восстановлении {aid}: {rec_err}")
-                    consecutive_failures = 0
+                            except Exception:
+                                pass
 
-                duration = time.time() - start_time
-                logger.info(
-                    f"💤 [КРУГ #{cycle_count}] Завершён за {duration:.1f} сек. | "
-                    f"Проверено: {radars_label} | Запросов к Авито: {success_count}/{len(url_groups)} | "
-                    f"Пауза {CHECK_INTERVAL} сек.\n"
-                )
-            else:
-                logger.info("ℹ️ [МОНИТОРИНГ] Нет активных радаров для сканирования.")
+                    await asyncio.sleep(2.0)
 
-            cycle_count += 1
-            # Каждые 50 циклов (~50 минут) очищаем базу от старых объявлений и чистим RAM
-            if cycle_count >= 50:
-                cycle_count = 0
-                await database.cleanup_old_seen_items(days=5)
-                gc.collect()
-                logger.info("🧹 [ОПТИМИЗАЦИЯ] Очистка памяти (gc.collect) и БД успешно завершена")
+    async def dispatcher_loop():
+        """
+        Диспетчер конвейера:
+        - Периодически обновляет список радаров из базы данных;
+        - Назначает индивидуальный интервал опроса (PRO/Standart);
+        - Добавляет подошедшие по времени ссылки (next_check_at <= now) в рабочий конвейер;
+        - Выводит регулярную статистику работы конвейера.
+        """
+        last_db_refresh = 0.0
+        last_stats_log = time.time()
+        last_maintenance = time.time()
 
-            await asyncio.sleep(CHECK_INTERVAL)
+        while True:
+            now = time.time()
 
-        except asyncio.CancelledError:
-            logger.info("🛑 Фоновый сервис мониторинга остановлен.")
-            break
-        except Exception as e:
-            logger.error(f"❌ Фатальная ошибка в цикле мониторинга: {e}", exc_info=True)
-            alert_text = (
-                f"🚨 <b>Алерт системы мониторинга!</b>\n\n"
-                f"Произошёл сбой в основном цикле планировщика:\n"
-                f"<code>{html.escape(str(e)[:300])}</code>\n\n"
-                f"<i>Автоматический перезапуск цикла через 10 секунд...</i>"
-            )
-            for aid in config.ADMIN_IDS:
+            # 1. Периодическое обновление активных радаров из БД (раз в 5 секунд)
+            if now - last_db_refresh >= 5.0:
+                last_db_refresh = now
                 try:
-                    await bot.send_message(chat_id=aid, text=alert_text, parse_mode="HTML")
-                except Exception:
-                    pass
-            gc.collect()
-            await asyncio.sleep(10)
+                    active_searches = await database.get_all_active_searches()
+                    new_groups: Dict[str, List[dict]] = defaultdict(list)
+                    for search in active_searches:
+                        clean_url = AvitoParser.normalize_url(search["url"])
+                        new_groups[clean_url].append(search)
+
+                    # Вычисляем интервалы для каждого URL
+                    for clean_url, radars in new_groups.items():
+                        # Если хотя бы один радар принадлежит PRO или Admin -> ускоренный интервал
+                        has_pro = any(
+                            r.get("user_id") in config.ADMIN_IDS or (r.get("tariff_plan") or "").lower() == "pro"
+                            for r in radars
+                        )
+                        if has_pro:
+                            # PRO-интервал: на 40% быстрее стандартного, но не менее 12 сек
+                            url_intervals[clean_url] = max(12.0, config.CHECK_INTERVAL * 0.6)
+                        else:
+                            url_intervals[clean_url] = float(config.CHECK_INTERVAL)
+
+                        # Если URL новый — ставим время проверки "прямо сейчас", чтобы проверить мгновенно!
+                        if clean_url not in url_next_check:
+                            url_next_check[clean_url] = now
+                            logger.info(
+                                f"✨ [КОНВЕЙЕР] Обнаружен новый радар «{AvitoParser._human_url(clean_url)}» "
+                                f"(интервал: {url_intervals[clean_url]:.0f}с) -> мгновенная постановка в очередь!"
+                            )
+
+                    # Удаляем удаленные пользователями радары из отслеживания
+                    existing_keys = set(new_groups.keys())
+                    for old_url in list(url_next_check.keys()):
+                        if old_url not in existing_keys:
+                            url_next_check.pop(old_url, None)
+                            url_intervals.pop(old_url, None)
+                            in_flight_urls.discard(old_url)
+
+                    url_radars_map.clear()
+                    url_radars_map.update(new_groups)
+
+                except Exception as db_err:
+                    logger.error(f"[ДИСПЕТЧЕР] Ошибка синхронизации с БД: {db_err}")
+
+            # 2. Постановка созревших задач в рабочий конвейер pipeline_queue
+            for clean_url, radars in list(url_radars_map.items()):
+                if clean_url not in in_flight_urls:
+                    due_time = url_next_check.get(clean_url, 0.0)
+                    if due_time <= now:
+                        in_flight_urls.add(clean_url)
+                        await pipeline_queue.put((clean_url, radars, 0))
+
+            # 3. Периодический лог состояния конвейера (раз в 60 сек)
+            if now - last_stats_log >= 60.0:
+                last_stats_log = now
+                total_radars = sum(len(r) for r in url_radars_map.values())
+                if total_radars > 0:
+                    logger.info(
+                        f"🔄 [КОНВЕЙЕР СТАТУС] Активно: {total_radars} радаров ({len(url_radars_map)} URL) | "
+                        f"В конвейере: {pipeline_queue.qsize()} | В приоритетном стеке: {urgent_failover_queue.qsize()} | "
+                        f"За минуту: обработано {stats['processed']} (успешно {stats['success']}, failover {stats['failover_retries']})"
+                    )
+                else:
+                    logger.info("ℹ️ [КОНВЕЙЕР] Нет активных радаров для сканирования.")
+                stats["processed"] = 0
+                stats["success"] = 0
+                stats["failover_retries"] = 0
+
+            # 4. Техническое обслуживание раз в 45 минут (очистка БД и RAM)
+            if now - last_maintenance >= 2700.0:
+                last_maintenance = now
+                try:
+                    await database.cleanup_old_seen_items(days=5)
+                    gc.collect()
+                    logger.info("🧹 [КОНВЕЙЕР] Очистка старых объявлений и сборка мусора (gc.collect) выполнены")
+                except Exception as maint_err:
+                    logger.error(f"Ошибка техобслуживания: {maint_err}")
+
+            # Шаг квантования диспетчера — 0.5 секунды
+            await asyncio.sleep(0.5)
+
+    # Запускаем диспетчер и пул воркеров
+    worker_tasks = [asyncio.create_task(worker_loop(w_id)) for w_id in range(1, pool_size + 1)]
+    dispatcher_task = asyncio.create_task(dispatcher_loop())
+
+    try:
+        await asyncio.gather(dispatcher_task, *worker_tasks)
+    except asyncio.CancelledError:
+        logger.info("🛑 Непрерывный конвейер мониторинга останавливается...")
+        dispatcher_task.cancel()
+        for wt in worker_tasks:
+            wt.cancel()
+        await asyncio.gather(dispatcher_task, *worker_tasks, return_exceptions=True)
+        raise
 
 
 async def notification_worker(bot: Bot, parser: AvitoParser):
