@@ -289,8 +289,8 @@ async def cb_select_tariff(call: CallbackQuery):
         info_note = "👑 <i>Вы являетесь администратором бота — для вас все функции и лимиты уже действуют бесплатно и бессрочно!</i>"
         action_buttons = []
     else:
-        info_note = "<i>💡 Автоматический шлюз онлайн-оплаты подключается. На данный момент активация происходит через администратора.</i>"
-        action_buttons = [[InlineKeyboardButton(text="👨‍💻 Написать админу для оплаты", url="https://t.me/vimerd")]]
+        info_note = "<i>💡 Для оформления подписки и получения счёта на оплату свяжитесь с оператором поддержки:</i>"
+        action_buttons = [[InlineKeyboardButton(text="💳 Оплатить подписку (Оператор)", url="https://t.me/vimerd")]]
 
     text = (
         "💳 <b>ОФОРМЛЕНИЕ ПОДПИСКИ</b>\n"
@@ -316,9 +316,9 @@ async def cb_select_tariff(call: CallbackQuery):
 
 
 
-# ── Служба поддержки (кнопка в меню) ──────────────────────────────────
+# ── Служба поддержки и контакты ───────────────────────────────────────
 
-@router.message(F.text.in_({"💬 Поддержка", "Поддержка", "Помощь", "SOS"}))
+@router.message(F.text.in_({"💬 Поддержка", "Поддержка", "Контакты", "Помощь", "SOS"}))
 @router.callback_query(F.data == "open_support_stub")
 async def cmd_support(event, state: Optional[FSMContext] = None):
     if state:
@@ -330,17 +330,20 @@ async def cmd_support(event, state: Optional[FSMContext] = None):
         message = event
 
     text = (
-        "💬 <b>СЛУЖБА ПОДДЕРЖКИ</b>\n"
+        "💬 <b>СЛУЖБА ПОДДЕРЖКИ И КОНТАКТЫ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Возникли сложности с добавлением ссылок, есть вопросы по тарифам или предложения по улучшению?\n\n"
-        "Свяжитесь со службой заботы, и мы оперативно поможем!\n\n"
-        "<i>(Раздел службы поддержки настраивается)</i>"
+        "По вопросам работы сервиса, настройке радаров, оплате тарифов или предложениям:\n\n"
+        "👤 <b>Telegram поддержки:</b> @vimerd\n"
+        "🕒 <b>График работы:</b> Ежедневно с 09:00 до 23:00 (МСК)\n"
+        "⚡️ <b>Среднее время ответа:</b> 5–15 минут\n\n"
+        "При вопросе по оплате укажите ваш <code>ID</code> из раздела «Мой профиль»."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="👨‍💻 Написать в поддержку", callback_data="support_stub_click")
+            InlineKeyboardButton(text="👨‍💻 Написать в поддержку", url="https://t.me/vimerd")
         ],
         [
+            InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="open_subscription_menu"),
             InlineKeyboardButton(text="👤 В профиль", callback_data="refresh_profile")
         ]
     ])
@@ -355,7 +358,8 @@ async def cmd_support(event, state: Optional[FSMContext] = None):
 
 @router.callback_query(F.data == "support_stub_click")
 async def cb_support_stub(call: CallbackQuery):
-    await call.answer("💬 Служба поддержки настраивается и скоро будет доступна!", show_alert=True)
+    await call.answer()
+    await cmd_support(call)
 
 
 # ── Чёрный список продавцов (Бан в 1 клик) ─────────────────────────────
