@@ -87,12 +87,13 @@ class AccessControlMiddleware(BaseMiddleware):
         user_id = user.id
         bot: Bot = data.get("bot")
 
-        # 1. Разрешаем технические callback-запросы (админка, служба поддержки, меню тарифов)
+        # 1. Разрешаем технические callback-запросы (админка, служба поддержки, меню тарифов, оплата)
         if isinstance(event, CallbackQuery) and event.data:
             allowed_callbacks = (
-                "admin_approve:", "admin_reject:", "admin_revoke:",
+                "admin_approve:", "admin_reject:", "admin_revoke:", "admin_grant_sub:",
                 "support_reply:", "admin_reply_cancel",
-                "open_subscription_menu", "buy_tariff:", "support_start_ticket", "support_cancel"
+                "open_subscription_menu", "buy_tariff:", "pay_request:", "activate_trial_btn",
+                "support_start_ticket", "support_cancel"
             )
             if any(event.data.startswith(prefix) for prefix in allowed_callbacks):
                 return await handler(event, data)
@@ -115,6 +116,7 @@ class AccessControlMiddleware(BaseMiddleware):
                 menu_keywords = {
                     "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
                     "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
+                    "💳 Тарифы", "💳 Тарифы и подписка", "Тарифы", "Подписка", "💳 Подписка",
                     "💬 Поддержка", "Поддержка", "Помощь",
                     "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
                     "📖 Инструкция", "Инструкция",

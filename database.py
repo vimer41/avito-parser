@@ -576,18 +576,32 @@ async def activate_trial(user_id: int) -> Dict[str, Any]:
         return {"success": True, "message": "Пробный период 24 часа успешно активирован!", "until": until}
 
 
-async def grant_subscription(user_id: int, days: int = 30) -> str:
-    """Выдаёт или продлевает подписку на N дней."""
+async def grant_subscription(user_id: int, days: int = 30, tariff_plan: Optional[str] = None) -> str:
+    """Выдаёт или продлевает подписку на N дней и опционально обновляет тариф."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            UPDATE users 
-            SET subscription_until = CASE 
-                WHEN subscription_until > datetime('now') 
-                THEN datetime(subscription_until, '+' || ? || ' days')
-                ELSE datetime('now', '+' || ? || ' days')
-            END
-            WHERE user_id = ?
-        """, (days, days, user_id))
+        if tariff_plan:
+            await db.execute("""
+                UPDATE users 
+                SET subscription_until = CASE 
+                    WHEN subscription_until > datetime('now') 
+                    THEN datetime(subscription_until, '+' || ? || ' days')
+                    ELSE datetime('now', '+' || ? || ' days')
+                END,
+                tariff_plan = ?,
+                is_allowed = 1
+                WHERE user_id = ?
+            """, (days, days, tariff_plan.lower(), user_id))
+        else:
+            await db.execute("""
+                UPDATE users 
+                SET subscription_until = CASE 
+                    WHEN subscription_until > datetime('now') 
+                    THEN datetime(subscription_until, '+' || ? || ' days')
+                    ELSE datetime('now', '+' || ? || ' days')
+                END,
+                is_allowed = 1
+                WHERE user_id = ?
+            """, (days, days, user_id))
         await db.commit()
 
         async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (user_id,)) as cur:

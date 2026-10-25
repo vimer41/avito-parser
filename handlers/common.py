@@ -27,8 +27,8 @@ def get_main_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     """Главная клавиатура бота."""
     kb = [
         [KeyboardButton(text="🎯 Добавить радар"), KeyboardButton(text="📁 Мои радары")],
-        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📖 Инструкция")],
-        [KeyboardButton(text="💬 Поддержка")]
+        [KeyboardButton(text="💳 Тарифы"), KeyboardButton(text="👤 Мой профиль")],
+        [KeyboardButton(text="📖 Инструкция"), KeyboardButton(text="💬 Поддержка")]
     ]
     if user_id and config.is_admin(user_id):
         kb.append([KeyboardButton(text="👑 Админ-панель")])
@@ -130,11 +130,16 @@ async def cmd_help(event):
         "🚷 <b>5. Чёрный список продавцов:</b>\n"
         "Нажмите <b>«🚷 Забанить продавца»</b> под карточкой любого лота, чтобы навсегда заблокировать спам от назойливых магазинов.\n\n"
         "⚡️ <b>6. Быстрый отклик продавцу:</b>\n"
-        "Настройте шаблон в меню «⚡️ Быстрый отклик», и бот будет формировать ссылку для связи с продавцом в 1 клик."
+        "Настройте шаблон в меню «⚡️ Быстрый отклик», и бот будет формировать ссылку для связи с продавцом в 1 клик.\n\n"
+        "🎁 <b>7. Бесплатный триал и тарифы:</b>\n"
+        "• Всем новым пользователям автоматически доступен <b>24-часовой бесплатный триал на 2 радара</b>.\n"
+        "• <b>Тариф Standart (250 ₽ / мес):</b> до 5 радаров, моментальные HD-фото, стоп-слова и бан спамеров.\n"
+        "• <b>Тариф PRO (700 ₽ / мес):</b> до 15 радаров, приоритет доставки №1, алерты на скидки продавцов (Price Drop 💎)."
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
+            InlineKeyboardButton(text="💳 Тарифы и подписка", callback_data="open_subscription_menu"),
             InlineKeyboardButton(text="📉 Настройка скидок (PRO) 💎", callback_data="all_discounts_menu")
         ],
         [
@@ -251,7 +256,9 @@ async def cb_activate_trial(call: CallbackQuery):
         await call.answer(res["message"], show_alert=True)
 
 
+@router.message(F.text.in_({"💳 Тарифы", "💳 Тарифы и подписка", "Тарифы", "Подписка", "💳 Подписка"}))
 @router.message(Command("subscribe"))
+@router.message(Command("tariffs"))
 @router.callback_query(F.data == "open_subscription_menu")
 async def cmd_subscription_menu(event):
     if isinstance(event, CallbackQuery):
@@ -262,40 +269,63 @@ async def cmd_subscription_menu(event):
         message = event
         user_id = message.from_user.id
 
+    user = await database.get_or_create_user(user_id)
     is_adm = config.is_admin(user_id)
-    admin_banner = "👑 <i>Режим администратора: у вас уже включен полный доступ ко всем функциям без ограничений.</i>\n\n" if is_adm else ""
+    sub_until = user.get("subscription_until")
+    trial_used = bool(user.get("trial_used"))
+    is_allowed = bool(user.get("is_allowed"))
+
+    if is_adm:
+        status_line = "👑 <b>Ваш статус:</b> <i>Администратор (Вечный PRO без ограничений)</i>"
+    elif sub_until and trial_used and not is_allowed:
+        status_line = f"🎁 <b>Ваш статус:</b> <i>Бесплатный триал активен (до {str(sub_until)[:16]})</i>"
+    elif sub_until and is_allowed:
+        plan_name = (user.get("tariff_plan") or "Standart").upper()
+        status_line = f"🟢 <b>Ваш статус:</b> <i>Подписка {plan_name} активна (до {str(sub_until)[:16]})</i>"
+    elif is_allowed:
+        status_line = "🟢 <b>Ваш статус:</b> <i>VIP Доступ одобрен</i>"
+    else:
+        status_line = "🔴 <b>Ваш статус:</b> <i>Подписка истекла. Выберите тариф ниже для продления:</i>"
 
     text = (
-        "💳 <b>ТАРИФНЫЕ ПЛАНЫ ПОДПИСКИ</b>\n"
+        "🔥 <b>AVITO RADAR — перехватывай лучшие предложения с выгодой!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{admin_banner}"
-        "Подписка снимает ограничения, позволяет отслеживать больше категорий и получать новые объявления с Авито мгновенно.\n\n"
-        "<b>Доступные тарифы на 1 месяц:</b>\n\n"
-        "⚡️ <b>Тариф «Standart»</b> — <b>250 ₽ / мес</b>\n"
-        "├ 🎯 До <b>5</b> активных радаров\n"
-        "├ 📡 Мониторинг раз в 60 секунд\n"
-        "├ 🚷 Чёрный список продавцов (бан в 1 клик)\n"
-        "└ 📸 Доставка с реальными фото товара в HD\n\n"
-        "🔥 <b>Тариф «PRO»</b> — <b>700 ₽ / мес</b>\n"
-        "├ 🎯 До <b>15</b> активных радаров\n"
-        "├ ⚡️ <b>Приоритет №1</b> (получают пуш первыми)\n"
-        "├ 📉 <b>Алерты на снижение цены</b> (Price Drop Alert) 💎\n"
-        "├ 🚷 Чёрный список продавцов (бан в 1 клик)\n"
-        "└ 🛡 Фильтрация по стоп-словам\n\n"
-        "Выберите тариф для подключения:"
+        "📌 <b>Суперпредложение: выгодная подписка на мониторинг Авито</b>\n"
+        "Перехватывайте горячие лоты за секунды до перекупов и экономьте десятки тысяч рублей на каждой сделке!\n\n"
+        "🎁 <b>Бесплатный тест-драйв:</b>\n"
+        "Каждому новому пользователю доступен <b>24-часовой триал на 2 радара</b> — протестируйте молниеносную скорость и качество прямо сейчас без ограничений!\n\n"
+        "📦 <b>Что входит в возможности AVITO RADAR?</b>\n"
+        "✔️ <b>Молниеносный парсинг 24/7</b> — проверка Авито каждую минуту\n"
+        "✔️ <b>Приоритет доставки №1</b> — оповещение в Telegram за 1–3 секунды до появления в поиске у конкурентов\n"
+        "✔️ <b>Живые фото в HD</b> — 100% доставка без битых картинок и необходимости переходить на сайт\n"
+        "✔️ <b>Чёрный список продавцов</b> — бан перекупов и спам-магазинов в 1 клик\n"
+        "✔️ <b>Умный фильтр стоп-слов</b> — отсеивание реплик, копий, дефектов и мусора\n"
+        "✔️ <b>Точный поиск в названиях (bt=1)</b> — поиск строго по заголовку лота\n"
+        "✔️ <b>Отслеживание снижения цен (Price Drop 💎)</b> — мгновенный повторный алерт со скидкой, когда продавец роняет цену\n\n"
+        "💡 <b>Гарантия окупаемости:</b>\n"
+        "Всего одна удачная покупка или перехват выгодного лота с запасом окупает подписку на год вперёд!\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{status_line}"
     )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="⚡️ Standart (5 радаров) — 250 ₽", callback_data="buy_tariff:standart")
-        ],
-        [
-            InlineKeyboardButton(text="🔥 PRO (15 радаров) — 700 ₽", callback_data="buy_tariff:pro")
-        ],
-        [
-            InlineKeyboardButton(text="👤 Назад в профиль", callback_data="refresh_profile")
-        ]
+    buttons = []
+    # Если триал ещё не использован (для старых аккаунтов)
+    if not is_adm and not sub_until and not trial_used:
+        buttons.append([
+            InlineKeyboardButton(text="🎁 Активировать 24 часа БЕСПЛАТНО", callback_data="activate_trial_btn")
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(text="⚡️ Standart (5 радаров) — 250 ₽ / мес", callback_data="buy_tariff:standart")
     ])
+    buttons.append([
+        InlineKeyboardButton(text="🔥 PRO (15 радаров + Скидки) — 700 ₽ / мес", callback_data="buy_tariff:pro")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile"),
+        InlineKeyboardButton(text="💬 Поддержка", callback_data="support_start_ticket")
+    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     if isinstance(event, CallbackQuery):
         try:
@@ -314,12 +344,29 @@ async def cb_select_tariff(call: CallbackQuery):
         "standart": {
             "name": "⚡️ Standart",
             "radars": 5,
-            "price": "250 ₽"
+            "price": "250 ₽ / месяц",
+            "price_num": "250 ₽",
+            "perks": (
+                "✔️ До <b>5 активных радаров</b> одновременно\n"
+                "✔️ Молниеносный мониторинг раз в минуту\n"
+                "✔️ Моментальные оповещения с фото товара в HD\n"
+                "✔️ Фильтрация по стоп-словам\n"
+                "✔️ Чёрный список продавцов в 1 клик"
+            )
         },
         "pro": {
-            "name": "🔥 PRO",
+            "name": "🔥 PRO Мониторинг",
             "radars": 15,
-            "price": "700 ₽"
+            "price": "700 ₽ / месяц",
+            "price_num": "700 ₽",
+            "perks": (
+                "✔️ До <b>15 активных радаров</b> одновременно\n"
+                "✔️ ⚡️ <b>Приоритет доставки №1</b> (раньше всех)\n"
+                "✔️ 📉 <b>Алерты на снижение цены (Price Drop Alert) 💎</b>\n"
+                "✔️ Точный поиск строго в названиях (bt=1)\n"
+                "✔️ Моментальные оповещения с фото товара в HD\n"
+                "✔️ Фильтрация по стоп-словам и чёрный список"
+            )
         }
     }
     selected = tariffs.get(tariff_key, tariffs["standart"])
@@ -328,18 +375,27 @@ async def cb_select_tariff(call: CallbackQuery):
 
     if is_adm:
         info_note = "👑 <i>Вы являетесь администратором бота — для вас все функции и лимиты уже действуют бесплатно и бессрочно!</i>"
-        action_buttons = []
+        pay_btn = []
     else:
-        info_note = "<i>💡 Для оформления подписки и получения счёта на оплату свяжитесь с оператором поддержки:</i>"
-        action_buttons = [[InlineKeyboardButton(text="💳 Написать оператору для оплаты", callback_data="support_start_ticket")]]
+        info_note = (
+            "💳 <b>Доступные способы оплаты:</b>\n"
+            "• <b>СБП (Система быстрых платежей / Тинькофф / Сбер / ВТБ)</b>\n"
+            "• <b>Банковская карта (МИР, Visa, Mastercard)</b>\n"
+            "• <b>Криптовалюта (USDT TRC20 / TON)</b>\n\n"
+            "<i>Нажмите кнопку «Оплатить», чтобы получить реквизиты. Оператор пришлёт их прямо в этот чат за 1-2 минуты!</i>"
+        )
+        pay_btn = [[InlineKeyboardButton(text=f"💳 Оплатить {selected['price_num']}", callback_data=f"pay_request:{tariff_key}")]]
 
     text = (
-        "💳 <b>ОФОРМЛЕНИЕ ПОДПИСКИ</b>\n"
+        f"💳 <b>ОФОРМЛЕНИЕ ПОДПИСКИ: {selected['name']}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Тариф: <b>{selected['name']}</b>\n"
-        f"Лимит радаров: <b>{selected['radars']} шт.</b>\n"
-        f"Срок: <b>1 месяц (30 дней)</b>\n"
-        f"Стоимость: <b>{selected['price']}</b>\n\n"
+        f"📦 <b>Тариф:</b> <b>{selected['name']}</b>\n"
+        f"🎯 <b>Лимит радаров:</b> <b>{selected['radars']} шт.</b>\n"
+        f"⚡️ <b>Срок действия:</b> <b>30 дней (1 месяц)</b>\n"
+        f"💰 <b>Стоимость:</b> <b>{selected['price']}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚀 <b>Что входит в тариф:</b>\n"
+        f"{selected['perks']}\n\n"
         f"{info_note}"
     )
 
@@ -347,13 +403,79 @@ async def cb_select_tariff(call: CallbackQuery):
         InlineKeyboardButton(text="« Назад к тарифам", callback_data="open_subscription_menu"),
         InlineKeyboardButton(text="👤 В профиль", callback_data="refresh_profile")
     ]
-    kb = InlineKeyboardMarkup(inline_keyboard=action_buttons + [nav_buttons])
+    kb = InlineKeyboardMarkup(inline_keyboard=pay_btn + [nav_buttons])
 
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("pay_request:"))
+async def cb_pay_request(call: CallbackQuery):
+    tariff_key = call.data.split(":")[1]
+    tariff_info = {
+        "standart": ("⚡️ Standart", "250 ₽"),
+        "pro": ("🔥 PRO", "700 ₽")
+    }
+    t_name, t_price = tariff_info.get(tariff_key, ("Подписка", "250 ₽"))
+    user = call.from_user
+    user_id = user.id
+    bot = call.bot
+
+    log_user_event(user_id, user.username, user.full_name, "Заявка на оплату", f"Тариф {t_name} ({t_price})", status="CLICK")
+
+    user_confirm_text = (
+        f"✅ <b>Заявка на оплату тарифа {t_name} принята!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Сумма к оплате: <b>{t_price}</b>\n\n"
+        "👨‍💻 Оператор поддержки уже получил вашу заявку и отправит реквизиты (СБП / карта / крипта) "
+        "прямо в этот чат в течение 2-5 минут.\n\n"
+        "<i>Если вам удобен конкретный банк или криптовалюта — просто напишите об этом следующим сообщением!</i>"
+    )
+
+    user_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать оператору", callback_data="support_start_ticket")],
+        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")]
+    ])
+
+    await call.message.answer(user_confirm_text, reply_markup=user_kb, parse_mode="HTML")
+    await call.answer("Заявка успешно отправлена операторам!")
+
+    # Отправляем уведомление администраторам с кнопками быстрой активации в 1 клик
+    admin_alert_text = (
+        "🚨 <b>НОВАЯ ЗАЯВКА НА ОПЛАТУ ПОДПИСКИ!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Пользователь:</b> {html.escape(user.full_name)}\n"
+        f"🔗 <b>Username:</b> @{user.username or 'нет'}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+        f"📦 <b>Тариф:</b> <b>{t_name}</b>\n"
+        f"💰 <b>Сумма к оплате:</b> <b>{t_price}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "После получения перевода нажмите кнопку ниже для мгновенной выдачи доступа:"
+    )
+
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"✅ Активировать {t_name} (30 дн.)", callback_data=f"admin_grant_sub:{user_id}:{tariff_key}:30")
+        ],
+        [
+            InlineKeyboardButton(text="✍️ Ответить / отправить реквизиты", callback_data=f"support_reply:{user_id}")
+        ]
+    ])
+
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=admin_alert_text,
+                reply_markup=admin_kb,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление о заявке админу {admin_id}: {e}")
+
 
 
 

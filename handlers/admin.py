@@ -80,6 +80,56 @@ async def cb_admin_reject(call: CallbackQuery, bot: Bot):
         pass
 
 
+@router.callback_query(F.data.startswith("admin_grant_sub:"))
+async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+
+    # Формат: admin_grant_sub:{user_id}:{plan}:{days}
+    parts = call.data.split(":")
+    target_user_id = int(parts[1])
+    plan = parts[2] if len(parts) > 2 else "standart"
+    days = int(parts[3]) if len(parts) > 3 else 30
+
+    until = await database.grant_subscription(target_user_id, days=days, tariff_plan=plan)
+    max_radars = await database.get_user_max_radars(target_user_id)
+
+    plan_title = "🔥 PRO" if plan == "pro" else "⚡️ STANDART"
+    logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} выдал подписку {plan_title} на {days} дн. пользователю ID:{target_user_id}")
+
+    await call.message.edit_text(
+        f"✅ <b>Подписка {plan_title} успешно выдана!</b>\n\n"
+        f"👤 ID пользователя: <code>{target_user_id}</code>\n"
+        f"📦 Тариф: <b>{plan_title}</b> (до {max_radars} радаров)\n"
+        f"📅 Активна до: <b>{str(until)[:16]}</b> ({days} дн.)",
+        parse_mode="HTML"
+    )
+    await call.answer(f"Подписка {plan_title} активирована!")
+
+    # Уведомляем пользователя об успешной оплате и активации
+    try:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt")],
+            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")]
+        ])
+        await bot.send_message(
+            chat_id=target_user_id,
+            text=(
+                f"🎉 <b>Оплата подтверждена! Ваша подписка {plan_title} активирована!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 Доступно активных радаров: <b>{max_radars} шт.</b>\n"
+                f"📅 Срок действия: <b>до {str(until)[:16]}</b> ({days} дн.)\n\n"
+                f"Все ограничения сняты! Теперь бот моментально присылает новые лоты с Авито с реальными HD фото. "
+                f"Удачных и прибыльных покупок!"
+            ),
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось уведомить пользователя {target_user_id} об активации подписки: {e}")
+
+
 # ── Панель администратора (/admin, /users, кнопка в меню) ─────────────
 
 @router.message(F.text.in_({"👑 Админ-панель", "👑 Админка"}))
