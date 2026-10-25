@@ -262,10 +262,19 @@ class AvitoParser:
                         r = self.session.get(target, timeout=20, allow_redirects=True)
 
                     if self._is_firewall(r):
+                        if attempt < max_retries - 1:
+                            logger.info(f"🔄 {human}: статус {r.status_code}, обновление сессии и быстрый повтор...")
+                            self.session = self._create_session()
+                            self._load_cookies()
+                            time.sleep(1.0)
+                            continue
                         self._register_block(r.status_code)
                         return None
 
                 if r.status_code != 200:
+                    if attempt < max_retries - 1:
+                        time.sleep(1.0)
+                        continue
                     logger.warning(f"⚠️ {human}: Авито ответил статусом {r.status_code}")
                     return None
 

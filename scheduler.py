@@ -494,22 +494,22 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
                     f"Параллельных потоков: {workers_label}..."
                 )
 
-                # 2. Очередь задач для параллельных воркеров
+                # 2. Очередь задач для параллельных воркеров с защитой от пропуска при сбоях (Round Retry)
                 task_queue: asyncio.Queue = asyncio.Queue()
                 for clean_url, radars_for_url in url_groups.items():
-                    await task_queue.put((clean_url, radars_for_url))
+                    await task_queue.put((clean_url, radars_for_url, 0))
 
                 async def worker_task(worker_id: int) -> Tuple[int, int]:
                     w_parser = parser_pool.get_parser(worker_id - 1)
                     w_success = 0
                     w_fail = 0
 
-                    # Начальный сдвиг старта между воркерами на одном IP для исключения одновременных сетевых пиков
+                    # Начальный сдвиг старта между воркерами для исключения одновременных сетевых пиков
                     if worker_id > 1:
                         await asyncio.sleep((worker_id - 1) * 1.5)
 
-                    while not task_queue.empty():
-                        # Если парсер находится в кулдауне из-за 429/403, ждем его завершения
+                    while True:
+                        # Если данный парсер находится в кулдауне из-за 429/403, ждем его завершения
                         while w_parser.is_blocked():
                             wait_s = min(w_parser.block_remaining(), 5)
                             if wait_s <= 0:
@@ -517,15 +517,25 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
                             await asyncio.sleep(wait_s)
 
                         try:
-                            clean_url, radars_for_url = task_queue.get_nowait()
-                        except asyncio.QueueEmpty:
+                            # Ожидаем задачу из очереди (до 2.5 сек, пока другие воркеры могут передать задачу на повтор)
+                            clean_url, radars_for_url, retry_attempt = await asyncio.wait_for(task_queue.get(), timeout=2.5)
+                        except (asyncio.TimeoutError, asyncio.QueueEmpty):
                             break
 
                         ok = await process_url_group(bot, w_parser, clean_url, radars_for_url, worker_id=worker_id)
                         if ok:
                             w_success += 1
                         else:
-                            w_fail += 1
+                            # Если опрос ссылки не удался (например, временный 403) — не теряем радар, а передаем другому воркеру!
+                            if retry_attempt < 1:
+                                human_name = AvitoParser._human_url(clean_url)
+                                logger.info(
+                                    f"  [W{worker_id}] 🔄 {human_name}: сбой проверки, задача возвращена в очередь на мгновенный повтор..."
+                                )
+                                await asyncio.sleep(1.0)
+                                await task_queue.put((clean_url, radars_for_url, retry_attempt + 1))
+                            else:
+                                w_fail += 1
 
                         task_queue.task_done()
                         # Безопасная пауза между запросами конкретного воркера
