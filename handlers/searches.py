@@ -6,6 +6,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from typing import Optional, Tuple, List
 
 import config
 import database
@@ -192,11 +193,56 @@ async def process_avito_url(message: Message, state: FSMContext):
     await status_msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
-# ── Список радаров ─────────────────────────────────────────────────────
+# ── Список радаров и компактное меню ────────────────────────────────────
+
+def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
+    """Формирует детальную карточку конкретного радара и клавиатуру управления."""
+    search_id = s["id"]
+    title = html.escape(s["title"])
+    is_active = bool(s["is_active"])
+    status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
+    stops_count = len(s["stop_words"])
+    disc_val = s.get("min_discount_percent") or 0
+    if disc_val > 0:
+        disc_info = f"<b>от -{disc_val}%</b> 🟢"
+        disc_btn_label = f"📉 Алерт на скидки: от -{disc_val}% 💎 ⚙️"
+    else:
+        disc_info = "<code>Выключено</code> ⚪️"
+        disc_btn_label = "📉 Отслеживать скидки продавцов 💎"
+
+    card_text = (
+        f"🎯 <b>РАДАР: {title}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 <b>Статус:</b> {status_icon}\n"
+        f"📉 <b>Скидки продавцов:</b> {disc_info}\n"
+        f"🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>\n"
+        f"🔗 <b>Ссылка:</b> <a href=\"{s['url']}\">Открыть выдачу на Авито</a>\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    toggle_btn_text = "⏸ Поставить на паузу" if is_active else "▶️ Запустить радар"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{search_id}"),
+            InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}")
+        ],
+        [
+            InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{search_id}")
+        ],
+        [
+            InlineKeyboardButton(text="↗️ Открыть на Авито", url=s["url"]),
+            InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{search_id}")
+        ],
+        [
+            InlineKeyboardButton(text="« Назад ко всем радарам", callback_data="list_searches")
+        ]
+    ])
+    return card_text, kb
+
 
 @router.message(F.text.in_({"📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары"}))
 @router.callback_query(F.data == "list_searches")
-async def show_searches(event, state: FSMContext):
+async def show_searches(event, state: Optional[FSMContext] = None):
     if isinstance(event, CallbackQuery):
         message = event.message
         user_id = event.from_user.id
@@ -205,7 +251,8 @@ async def show_searches(event, state: FSMContext):
         message = event
         user_id = message.from_user.id
 
-    await state.clear()
+    if state:
+        await state.clear()
     searches = await database.get_user_searches(user_id)
 
     if not searches:
@@ -218,58 +265,81 @@ async def show_searches(event, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎯 Добавить первый радар", callback_data="add_search_prompt")]
         ])
-        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        if isinstance(event, CallbackQuery):
+            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        else:
+            await message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
 
     from scheduler import get_last_scan_info
     scan_info = get_last_scan_info()
 
     active_cnt = sum(1 for s in searches if s.get("is_active"))
-    header_text = (
-        f"📁 <b>ВАШИ РАДАРЫ</b> (Всего: <b>{len(searches)}</b> · Активно: <b>{active_cnt}</b> 🟢)\n"
-        f"📡 <i>Проверка выдачи: <b>{scan_info}</b></i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-    await message.answer(header_text, parse_mode="HTML")
-
+    lines = [
+        f"📁 <b>ВАШИ РАДАРЫ</b> (Всего: <b>{len(searches)}</b> · В работе: <b>{active_cnt}</b> 🟢)",
+        f"📡 <i>Сканирование Авито: <b>{scan_info}</b></i>",
+        "━━━━━━━━━━━━━━━━━━━━"
+    ]
 
     for i, s in enumerate(searches, 1):
-        s_id = s["id"]
         title = html.escape(s["title"])
         is_active = bool(s["is_active"])
-        status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
-        stops_count = len(s["stop_words"])
+        status_dot = "🟢" if is_active else "⏸"
         disc_val = s.get("min_discount_percent") or 0
-        if disc_val > 0:
-            disc_info = f"<b>-{disc_val}%</b> 🟢"
-            disc_btn_label = f"📉 Алерт на скидки: от -{disc_val}% 💎 ⚙️"
-        else:
-            disc_info = "<code>Выключено</code> ⚪️"
-            disc_btn_label = "📉 Отслеживать скидки продавцов 💎"
+        disc_str = f" 🏷 <i>(-{disc_val}%)</i>" if disc_val > 0 else ""
+        stops_cnt = len(s["stop_words"])
+        stops_str = f" · 🛡 {stops_cnt}" if stops_cnt > 0 else ""
+        pause_str = " <i>(пауза)</i>" if not is_active else ""
+        lines.append(f"<b>{i}.</b> {status_dot} <b>{title}</b>{pause_str}{disc_str}{stops_str}")
 
-        card_text = (
-            f"╭─ 🎯 <b>Радар #{i}: {title}</b>\n"
-            f"│ 📡 <b>Статус:</b> {status_icon}\n"
-            f"│ 📉 <b>Скидки:</b> {disc_info}\n"
-            f"╰ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>"
-        )
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("<i>Выберите радар для перехода к настройкам:</i>")
+    text = "\n".join(lines)
 
-        toggle_btn_text = "⏸ На паузу" if is_active else "▶️ Запустить"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{s_id}"),
-                InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{s_id}")
-            ],
-            [
-                InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{s_id}")
-            ],
-            [
-                InlineKeyboardButton(text="↗️ Открыть на Авито", url=s["url"]),
-                InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{s_id}")
-            ]
-        ])
+    buttons = []
+    row = []
+    for i, s in enumerate(searches, 1):
+        status_dot = "🟢" if s.get("is_active") else "⏸"
+        raw_title = s["title"].strip()
+        short_title = (raw_title[:15] + "…") if len(raw_title) > 16 else raw_title
+        btn_label = f"{status_dot} {i}. {short_title}"
+        row.append(InlineKeyboardButton(text=btn_label, callback_data=f"open_search:{s['id']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
 
-        await message.answer(card_text, reply_markup=kb, parse_mode="HTML")
+    buttons.append([
+        InlineKeyboardButton(text="➕ Добавить радар", callback_data="add_search_prompt"),
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="list_searches")
+    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    if isinstance(event, CallbackQuery):
+        try:
+            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("open_search:"))
+async def cb_open_search(call: CallbackQuery):
+    """Открывает детальную карточку конкретного радара."""
+    search_id = int(call.data.split(":")[1])
+    s = await database.get_search(search_id)
+    if not s or s.get("user_id") != call.from_user.id:
+        await call.answer("Радар не найден", show_alert=True)
+        return
+
+    card_text, kb = build_radar_card(s)
+    try:
+        await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        await call.message.answer(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await call.answer()
 
 
 # ── Пауза / Возобновление ──────────────────────────────────────────────
@@ -292,42 +362,9 @@ async def cb_toggle_search(call: CallbackQuery):
     if not s:
         return
 
-    title = html.escape(s["title"])
-    is_active = bool(s["is_active"])
-    status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
-    stops_count = len(s["stop_words"])
-    disc_val = s.get("min_discount_percent") or 0
-    if disc_val > 0:
-        disc_info = f"<b>-{disc_val}%</b> 🟢"
-        disc_btn_label = f"📉 Алерт на скидки: от -{disc_val}% 💎 ⚙️"
-    else:
-        disc_info = "<code>Выключено</code> ⚪️"
-        disc_btn_label = "📉 Отслеживать скидки продавцов 💎"
-
-    card_text = (
-        f"╭─ 🎯 <b>Радар: {title}</b>\n"
-        f"│ 📡 <b>Статус:</b> {status_icon}\n"
-        f"│ 📉 <b>Скидки:</b> {disc_info}\n"
-        f"╰ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>"
-    )
-
-    toggle_btn_text = "⏸ На паузу" if is_active else "▶️ Запустить"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{search_id}"),
-            InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}")
-        ],
-        [
-            InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{search_id}")
-        ],
-        [
-            InlineKeyboardButton(text="↗️ Открыть на Авито", url=s["url"]),
-            InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{search_id}")
-        ]
-    ])
-
+    card_text, kb = build_radar_card(s)
     try:
-        await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML")
+        await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     except Exception:
         pass
 
@@ -383,7 +420,10 @@ async def cb_set_discount_menu(call: CallbackQuery):
 
     buttons.append([InlineKeyboardButton(text="✏️ Ввести свой процент...", callback_data=f"custom_discount:{search_id}")])
     buttons.append([InlineKeyboardButton(text="❌ Отключить отслеживание", callback_data=f"save_discount:{search_id}:0")])
-    buttons.append([InlineKeyboardButton(text="« Назад к радарам", callback_data="list_searches")])
+    buttons.append([
+        InlineKeyboardButton(text="« Назад к радару", callback_data=f"open_search:{search_id}"),
+        InlineKeyboardButton(text="📁 Ко всем радарам", callback_data="list_searches")
+    ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     try:
@@ -404,6 +444,14 @@ async def cb_save_discount(call: CallbackQuery):
     status_text = f"скидки от -{val}%" if val > 0 else "отслеживание скидок отключено"
     log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Настройка скидки", f"Радар #{search_id} -> {status_text}", status="OK")
     await call.answer(f"✅ Сохранено: {status_text}!")
+    s = await database.get_search(search_id)
+    if s:
+        card_text, kb = build_radar_card(s)
+        try:
+            await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+            return
+        except Exception:
+            pass
     await show_searches(call)
 
 
@@ -421,7 +469,7 @@ async def cb_prompt_custom_discount(call: CallbackQuery, state: FSMContext):
         "<i>Бот пришлёт уведомление, как только продавец скинет цену на указанный процент!</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="list_searches")]
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"open_search:{search_id}")]
     ])
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -503,8 +551,8 @@ async def cb_confirm_delete(call: CallbackQuery):
     await database.delete_search(search_id, call.from_user.id)
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Удаление радара", f"Удален радар #{search_id}", status="OK")
     logger.info(f"🗑 [РАДАР] Пользователь ID:{call.from_user.id} удалил радар #{search_id}")
-    await call.message.edit_text("🗑 <b>Радар успешно удалён!</b>", parse_mode="HTML")
-    await call.answer("Удалено")
+    await call.answer("Радар удален!")
+    await show_searches(call)
 
 
 @router.callback_query(F.data.startswith("cancel_delete:"))
@@ -512,37 +560,14 @@ async def cb_cancel_delete(call: CallbackQuery):
     search_id = int(call.data.split(":")[1])
     s = await database.get_search(search_id)
     if not s:
-        await call.message.delete()
+        await show_searches(call)
         return
 
-    title = html.escape(s["title"])
-    is_active = bool(s["is_active"])
-    status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
-    stops_count = len(s["stop_words"])
-    tmpl_status = "индивидуальный" if s["template"] else "общий"
-
-    card_text = (
-        f"╭─ 🎯 <b>Радар: {title}</b>\n"
-        f"│ 📡 <b>Статус:</b> {status_icon}\n"
-        f"│ 🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>\n"
-        f"╰ 💬 <b>Отклик:</b> <i>{tmpl_status}</i>"
-    )
-
-    toggle_btn_text = "⏸ На паузу" if is_active else "▶️ Запустить"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{search_id}"),
-            InlineKeyboardButton(text=f"🛡 Стоп-слова ({stops_count})", callback_data=f"manage_stops:{search_id}")
-        ],
-        [
-            InlineKeyboardButton(text="💬 Текст отклика", callback_data=f"manage_tmpl:{search_id}"),
-            InlineKeyboardButton(text="↗️ На Авито", url=s["url"])
-        ],
-        [
-            InlineKeyboardButton(text="🗑 Удалить радар", callback_data=f"delete_search:{search_id}")
-        ]
-    ])
-    await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML")
+    card_text, kb = build_radar_card(s)
+    try:
+        await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        pass
     await call.answer()
 
 
@@ -584,7 +609,14 @@ async def cb_manage_stops(call: CallbackQuery):
         buttons.append(current_row)
 
     buttons.append([InlineKeyboardButton(text="➕ Добавить стоп-слово", callback_data=f"add_stop:{search_id}")])
-    buttons.append([InlineKeyboardButton(text="📁 К списку радаров", callback_data="list_searches")])
+    buttons.append([
+        InlineKeyboardButton(text="« Назад к радару", callback_data=f"open_search:{search_id}"),
+        InlineKeyboardButton(text="📁 Ко всем радарам", callback_data="list_searches")
+    ])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await call.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    await call.answer()
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     await call.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")

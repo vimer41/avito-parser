@@ -6,7 +6,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "25"))
 MAX_SEARCHES_PER_USER = int(os.getenv("MAX_SEARCHES_PER_USER", "10"))
 # Количество параллельных воркеров мониторинга (по умолчанию 4)
 MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))
