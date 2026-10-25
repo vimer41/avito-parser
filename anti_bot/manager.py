@@ -276,9 +276,9 @@ def solve_qrator_challenge(
 def extract_pow_challenge(response: Any, session: requests.Session) -> Optional[str]:
     """
     Извлекает pow_challenge из:
-    1. Тела ответа JSON (при HTTP 439 / 429) - открытие из репозитория!
+    1. Тела ответа JSON (при HTTP 439 / 429)
     2. Кук ответа
-    3. Кук текущей сессии
+    3. Кук сессии (только если ответ вернул статус блокировки 403, 429 или 439)
     """
     # 1. Из тела ответа JSON
     try:
@@ -294,8 +294,9 @@ def extract_pow_challenge(response: Any, session: requests.Session) -> Optional[
     if hasattr(response, "cookies") and response.cookies.get("pow_challenge"):
         return response.cookies.get("pow_challenge")
 
-    # 3. Из кук сессии
-    if hasattr(session, "cookies") and session.cookies.get("pow_challenge"):
+    # 3. Из кук сессии — ТОЛЬКО если код ответа сигнализирует о блоке или челлендже
+    status = getattr(response, "status_code", None)
+    if status in (403, 429, 439) and hasattr(session, "cookies") and session.cookies.get("pow_challenge"):
         return session.cookies.get("pow_challenge")
 
     return None
@@ -364,6 +365,11 @@ def solve_pow_challenge(
             unblock_ttl = result.get("unblock_ttl")
             session.cookies.set("pow_solved", "1", domain=".avito.ru", path="/")
             session.cookies.set("pow_solved", "1", domain="www.avito.ru", path="/")
+            # Очищаем временный вызов pow_challenge, чтобы исключить ложные срабатывания
+            try:
+                session.cookies.pop("pow_challenge", None)
+            except Exception:
+                pass
             logger.info(f"✅ PoW успешно решен! (unblock_ttl: {unblock_ttl} сек)")
             return True
         else:

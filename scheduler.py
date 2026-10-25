@@ -140,6 +140,36 @@ def build_notification_keyboard(item_url: str, search_id: int, has_seller: bool 
 
 
 
+def plural_form(n: int, form1: str, form2: str, form5: str) -> str:
+    """Склонение существительных с числительными (1 лот, 2 лота, 5 лотов)."""
+    n_abs = abs(n) % 100
+    n1 = n_abs % 10
+    if 10 < n_abs < 20:
+        return f"{n} {form5}"
+    if 1 < n1 < 5:
+        return f"{n} {form2}"
+    if n1 == 1:
+        return f"{n} {form1}"
+    return f"{n} {form5}"
+
+
+def format_item_age(date_str: Optional[str], timestamp: Optional[int] = None) -> str:
+    """Возвращает наглядное описание возраста объявления (например: '42 мин. назад', '2 ч. назад')."""
+    if timestamp:
+        age_seconds = max(0, int(time.time() - timestamp))
+        if age_seconds < 60:
+            return f"{age_seconds} сек. назад"
+        elif age_seconds < 3600:
+            return f"{age_seconds // 60} мин. назад"
+        elif age_seconds < 86400:
+            return f"{age_seconds // 3600} ч. назад"
+        else:
+            return f"{age_seconds // 86400} дн. назад"
+    if date_str:
+        return date_str.strip()
+    return "возраст не указан"
+
+
 def is_ad_fresh_enough(date_str: Optional[str], timestamp: Optional[int] = None) -> bool:
     """
     Проверяет, действительно ли объявление свежее (опубликовано до 15 минут назад).
@@ -298,13 +328,16 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
     """
     try:
         # Выполняем 1 сетевой запрос к Авито на всю группу радаров с этим URL
+        fetch_t0 = time.monotonic()
         html_content = await asyncio.to_thread(parser.fetch_page, clean_url)
+        fetch_ms = int((time.monotonic() - fetch_t0) * 1000)
+
         if not html_content:
             return False
 
         items = parser.parse_items(html_content)
         if not items:
-            logger.info(f"📡 [ПАРСЕР] По URL «{clean_url[:60]}...»: страница получена, лотов в каталоге не найдено")
+            logger.info(f"📡 [ПАРСЕР] По URL «{clean_url[:60]}...»: страница получена за {fetch_ms} мс, лотов в каталоге не найдено")
             return True
 
         # ⚡️ ПРИОРИТЕТНАЯ ДОСТАВКА ЛОТОВ:
@@ -323,12 +356,13 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
         radars_for_url.sort(key=get_radar_priority)
 
         # Раздаем полученные объявления каждому радару, подписанному на этот URL
-        for radar in radars_for_url:
+        for idx, radar in enumerate(radars_for_url):
             radar_id = radar["id"]
             user_id = radar["user_id"]
             search_title = radar["title"]
             stop_words = radar.get("stop_words", [])
             user_str = get_user_display_name(radar)
+            source_tag = f"{fetch_ms} мс" if idx == 0 else "⚡ кэш запроса"
 
             # Получаем актуальный черный список продавцов пользователя
             blocked_sellers = await database.get_blocked_sellers(user_id)
@@ -337,7 +371,7 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             new_items = [it for it in items if it.item_id not in seen_ids]
 
             if not new_items:
-                logger.info(f"  🔹 Радар #{radar_id} [{user_str}] «{search_title}»: проверено {len(items)} лотов (новых нет)")
+                logger.info(f"  🔹 Радар #{radar_id} [{user_str}] «{search_title}»: проверено {len(items)} лотов [{source_tag}] (новых нет)")
                 continue
 
             # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ, чтобы они не всплывали повторно
@@ -347,17 +381,27 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             fresh_items = [it for it in new_items if is_ad_fresh_enough(it.date, getattr(it, "timestamp", None))]
 
             if not fresh_items:
-                logger.info(f"  🔹 Радар #{radar_id} [{user_str}] «{search_title}»: {len(new_items)} лотов в ротации Авито (старые, пропущены)")
+                ages = [format_item_age(it.date, getattr(it, "timestamp", None)) for it in new_items[:2]]
+                age_summary = ", ".join(ages)
+                if len(new_items) > 2:
+                    age_summary += f", и ещё {len(new_items) - 2}"
+                items_label = plural_form(len(new_items), "лот", "лота", "лотов")
+                logger.info(
+                    f"  🔹 Радар #{radar_id} [{user_str}] «{search_title}»: {items_label} в ротации [{source_tag}] "
+                    f"(отсеян как старый: {age_summary}; порог 15 мин)"
+                )
                 continue
 
             # Защита от пачки: если ДАЖЕ среди свежих объявлений их больше 5 штук одновременно
             if len(fresh_items) > 5:
+                fresh_label = plural_form(len(fresh_items), "свежий лот", "свежих лота", "свежих лотов")
                 logger.info(
-                    f"  📦 Радар #{radar_id} [{user_str}] «{search_title}»: пачка из {len(fresh_items)} свежих лотов (запомнено без спама)"
+                    f"  📦 Радар #{radar_id} [{user_str}] «{search_title}»: пачка из {fresh_label} (сохранено в базу без спама)"
                 )
                 continue
 
-            logger.info(f"  🔥 Радар #{radar_id} [{user_str}] «{search_title}»: НАЙДЕНО {len(fresh_items)} СВЕЖИХ ЛОТОВ!")
+            fresh_label = plural_form(len(fresh_items), "СВЕЖИЙ ЛОТ", "СВЕЖИХ ЛОТА", "СВЕЖИХ ЛОТОВ")
+            logger.info(f"  🔥 Радар #{radar_id} [{user_str}] «{search_title}»: НАЙДЕНО {len(fresh_items)} {fresh_label}!")
 
             # Отправляем в хронологическом порядке (снизу вверх)
             for it in reversed(fresh_items):
@@ -408,6 +452,7 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
             active_searches = await database.get_all_active_searches()
 
             if active_searches:
+                cycle_count += 1
                 start_time = time.time()
                 # 1. Группируем радары по нормализованному URL (без context=..., localPriority=... и т.д.)
                 url_groups = defaultdict(list)
@@ -415,7 +460,9 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
                     clean_url = AvitoParser.normalize_url(search["url"])
                     url_groups[clean_url].append(search)
 
-                logger.info(f"🔄 [КРУГ МОНИТОРИНГА] Запуск проверки: {len(active_searches)} радаров ({len(url_groups)} ссылок Авито)...")
+                radars_label = plural_form(len(active_searches), "радар", "радара", "радаров")
+                urls_label = plural_form(len(url_groups), "ссылка Авито", "ссылки Авито", "ссылок Авито")
+                logger.info(f"🔄 [КРУГ #{cycle_count}] Запуск проверки: {radars_label} ({urls_label})...")
 
                 # 2. Делаем ровно 1 запрос к Авито на каждый уникальный URL
                 success_count = 0
@@ -466,7 +513,11 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
                     consecutive_failures = 0
 
                 duration = time.time() - start_time
-                logger.info(f"💤 Круг завершён за {duration:.1f} сек. Пауза {CHECK_INTERVAL} сек.\n")
+                logger.info(
+                    f"💤 [КРУГ #{cycle_count}] Завершён за {duration:.1f} сек. | "
+                    f"Проверено: {radars_label} | Запросов к Авито: {success_count}/{len(url_groups)} | "
+                    f"Пауза {CHECK_INTERVAL} сек.\n"
+                )
             else:
                 logger.info("ℹ️ [МОНИТОРИНГ] Нет активных радаров для сканирования.")
 
