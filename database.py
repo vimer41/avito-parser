@@ -282,7 +282,7 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
         db.row_factory = aiosqlite.Row
         admin_placeholders = ",".join("?" for _ in ADMIN_IDS)
         query = f"""
-            SELECT s.*, u.tariff_plan, u.subscription_until 
+            SELECT s.*, u.username, u.first_name, u.tariff_plan, u.subscription_until 
             FROM searches s 
             JOIN users u ON s.user_id = u.user_id 
             WHERE s.is_active = 1

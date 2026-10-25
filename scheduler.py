@@ -131,13 +131,31 @@ def is_stop_word_matched(item: AvitoItem, stop_words: list) -> Optional[str]:
     return None
 
 
+def get_user_display_name(radar: Dict) -> str:
+    """Форматирует читаемое имя владельца радара: @username, Имя или ID."""
+    username = radar.get("username")
+    first_name = radar.get("first_name")
+    user_id = radar.get("user_id")
+
+    parts = []
+    if username:
+        parts.append(f"@{username}")
+    if first_name:
+        parts.append(first_name)
+
+    if parts:
+        return ", ".join(parts)
+    return f"ID:{user_id}"
+
+
 async def send_ad_to_user(
     bot: Bot,
     parser: AvitoParser,
     user_id: int,
     search_id: int,
     search_title: str,
-    it: AvitoItem
+    it: AvitoItem,
+    user_label: str = ""
 ) -> bool:
     """
     Отправляет уведомление пользователю (фото или текст).
@@ -145,6 +163,7 @@ async def send_ad_to_user(
     """
     caption = build_notification_text(it, search_title)
     keyboard = build_notification_keyboard(it.url, search_id, has_seller=bool(it.seller_name))
+    owner_str = f" [{user_label}]" if user_label else f" ID:{user_id}"
 
     try:
         photo_file: Optional[BufferedInputFile] = None
@@ -167,7 +186,7 @@ async def send_ad_to_user(
                     reply_markup=keyboard,
                     parse_mode="HTML"
                 )
-                logger.info(f"     🚀 [Радар #{search_id}] Доставлено (с фото) ID:{user_id}: {it.price} · «{it.title[:35]}»")
+                logger.info(f"     🚀 [Радар #{search_id}{owner_str}] Доставлено (с фото): {it.price} · «{it.title[:35]}»")
                 return True
             except (TelegramForbiddenError, TelegramRetryAfter):
                 raise
@@ -182,7 +201,7 @@ async def send_ad_to_user(
             parse_mode="HTML",
             disable_web_page_preview=False
         )
-        logger.info(f"     🚀 [Радар #{search_id}] Доставлено (текст) ID:{user_id}: {it.price} · «{it.title[:35]}»")
+        logger.info(f"     🚀 [Радар #{search_id}{owner_str}] Доставлено (текст): {it.price} · «{it.title[:35]}»")
         return True
 
     except TelegramForbiddenError:
@@ -239,6 +258,7 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             user_id = radar["user_id"]
             search_title = radar["title"]
             stop_words = radar.get("stop_words", [])
+            user_str = get_user_display_name(radar)
 
             # Получаем актуальный черный список продавцов пользователя
             blocked_sellers = await database.get_blocked_sellers(user_id)
@@ -247,7 +267,7 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             new_items = [it for it in items if it.item_id not in seen_ids]
 
             if not new_items:
-                logger.info(f"  🔹 Радар #{radar_id} «{search_title}»: проверено {len(items)} лотов (новых нет)")
+                logger.info(f"  🔹 Радар #{radar_id} [{user_str}] «{search_title}»: проверено {len(items)} лотов (новых нет)")
                 continue
 
             # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ, чтобы они не всплывали повторно
@@ -257,32 +277,32 @@ async def process_url_group(bot: Bot, parser: AvitoParser, clean_url: str, radar
             fresh_items = [it for it in new_items if is_ad_fresh_enough(it.date)]
 
             if not fresh_items:
-                logger.info(f"  🔹 Радар #{radar_id} «{search_title}»: {len(new_items)} лотов в ротации Авито (старые, пропущены)")
+                logger.info(f"  🔹 Радар #{radar_id} [{user_str}] «{search_title}»: {len(new_items)} лотов в ротации Авито (старые, пропущены)")
                 continue
 
             # Защита от пачки: если ДАЖЕ среди свежих объявлений их больше 5 штук одновременно
             if len(fresh_items) > 5:
                 logger.info(
-                    f"  📦 Радар #{radar_id} «{search_title}»: пачка из {len(fresh_items)} свежих лотов (запомнено без спама)"
+                    f"  📦 Радар #{radar_id} [{user_str}] «{search_title}»: пачка из {len(fresh_items)} свежих лотов (запомнено без спама)"
                 )
                 continue
 
-            logger.info(f"  🔥 Радар #{radar_id} «{search_title}»: НАЙДЕНО {len(fresh_items)} СВЕЖИХ ЛОТОВ!")
+            logger.info(f"  🔥 Радар #{radar_id} [{user_str}] «{search_title}»: НАЙДЕНО {len(fresh_items)} СВЕЖИХ ЛОТОВ!")
 
             # Отправляем в хронологическом порядке (снизу вверх)
             for it in reversed(fresh_items):
                 # 2. Проверяем стоп-слова
                 matched_stop = is_stop_word_matched(it, stop_words)
                 if matched_stop:
-                    logger.info(f"     🛡 Отсеяно по стоп-слову «{matched_stop}»: «{it.title[:30]}»")
+                    logger.info(f"     🛡 Отсеяно по стоп-слову «{matched_stop}» [{user_str}]: «{it.title[:30]}»")
                     continue
 
                 # 3. Проверяем черный список продавцов
                 if it.seller_name and it.seller_name.lower().strip() in blocked_sellers:
-                    logger.info(f"     🚷 Отсеян продавец «{it.seller_name}» из ЧС (ID:{user_id})")
+                    logger.info(f"     🚷 Отсеян продавец «{it.seller_name}» из ЧС [{user_str}]")
                     continue
 
-                ok = await send_ad_to_user(bot, parser, user_id, radar_id, search_title, it)
+                ok = await send_ad_to_user(bot, parser, user_id, radar_id, search_title, it, user_str)
                 if not ok:
                     break
                 await asyncio.sleep(0.5)
