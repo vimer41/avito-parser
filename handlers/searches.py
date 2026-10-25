@@ -23,6 +23,7 @@ class SearchStates(StatesGroup):
     waiting_for_url = State()
     waiting_for_stop_word = State()
     waiting_for_custom_discount = State()
+    waiting_for_custom_age = State()
 
 
 # ── Добавление радара ──────────────────────────────────────────────────
@@ -203,6 +204,7 @@ async def process_avito_url(message: Message, state: FSMContext):
     text = (
         "┌ 🎯 <b>РАДАР УСПЕШНО АКТИВИРОВАН!</b>\n"
         f"├ 📌 <b>Цель:</b> <b>{clean_title}</b>\n"
+        f"├ ⏱ <b>Свежесть лотов:</b> <b>до 1 часа ⏳</b>\n"
         f"├ 🔍 <b>Область выборки:</b> <b>{scope_icon}</b>\n"
         f"├ 📦 <b>Существующих объявлений:</b> <b>{len(items)}</b> (пропущены)\n"
         f"├ 📡 <b>Статус:</b> 🟢 Мониторинг 24/7 активен\n"
@@ -212,6 +214,7 @@ async def process_avito_url(message: Message, state: FSMContext):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
+            InlineKeyboardButton(text="⏱ Свежесть: до 1 часа ⚙️", callback_data=f"set_age:{search_id}"),
             InlineKeyboardButton(text=scope_btn, callback_data=f"toggle_title_scope:{search_id}")
         ],
         [
@@ -228,6 +231,27 @@ async def process_avito_url(message: Message, state: FSMContext):
 
 
 # ── Список радаров и компактное меню ────────────────────────────────────
+
+def format_max_age_label(max_age_minutes: Optional[int]) -> str:
+    """Форматирует человекочитаемое представление фильтра свежести."""
+    if max_age_minutes is None:
+        max_age_minutes = 60
+    if max_age_minutes <= 0:
+        return "Без ограничений ♾"
+    if max_age_minutes < 60:
+        return f"до {max_age_minutes} мин. ⚡️"
+    if max_age_minutes % 60 == 0:
+        hours = max_age_minutes // 60
+        if hours == 1:
+            return "до 1 часа ⏳"
+        elif hours in [2, 3, 4]:
+            return f"до {hours} часов ⌛️"
+        elif hours == 24:
+            return "до 24 часов 🗓"
+        else:
+            return f"до {hours} ч. ⌛️"
+    return f"до {max_age_minutes} мин. ⏱"
+
 
 def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     """Формирует детальную карточку конкретного радара и клавиатуру управления."""
@@ -252,10 +276,18 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         scope_info = "<b>Название + описание</b> 📄"
         scope_btn_label = "🔍 Выборка: Название + описание 📄"
 
+    max_age = s.get("max_age_minutes")
+    if max_age is None:
+        max_age = 60
+    else:
+        max_age = int(max_age)
+    age_label = format_max_age_label(max_age)
+
     card_text = (
         f"🎯 <b>РАДАР: {title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>Статус:</b> {status_icon}\n"
+        f"⏱ <b>Свежесть лотов:</b> <b>{age_label}</b>\n"
         f"🔍 <b>Область выборки:</b> {scope_info}\n"
         f"📉 <b>Скидки продавцов:</b> {disc_info}\n"
         f"🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>\n"
@@ -265,6 +297,9 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
 
     toggle_btn_text = "⏸ Поставить на паузу" if is_active else "▶️ Запустить радар"
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"⏱ Свежесть: {age_label} ⚙️", callback_data=f"set_age:{search_id}")
+        ],
         [
             InlineKeyboardButton(text=scope_btn_label, callback_data=f"toggle_title_scope:{search_id}")
         ],
@@ -675,6 +710,186 @@ async def process_custom_discount_input(message: Message, state: FSMContext):
         await database.update_search_discount_percent(search_id, message.from_user.id, percent)
         log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Настройка скидки", f"Радар #{search_id} -> свой порог: {percent}%", status="OK")
         await message.answer(f"✅ <b>Отлично! Алерт установлен на снижение цены от -{percent}%!</b>", parse_mode="HTML")
+
+    await show_searches(message, state)
+
+
+# ── Настройка свежести лотов (max_age_minutes) ──────────────────────────
+
+@router.callback_query(F.data.startswith("set_age:"))
+async def cb_set_age_menu(call: CallbackQuery):
+    search_id = int(call.data.split(":")[1])
+    user_id = call.from_user.id
+
+    s = await database.get_search(search_id)
+    if not s or s.get("user_id") != user_id:
+        await call.answer("Радар не найден", show_alert=True)
+        return
+
+    cur_age = s.get("max_age_minutes")
+    if cur_age is None:
+        cur_age = 60
+    else:
+        cur_age = int(cur_age)
+
+    cur_label = format_max_age_label(cur_age)
+
+    text = (
+        f"⏱ <b>НАСТРОЙКА СВЕЖЕСТИ ОБЪЯВЛЕНИЙ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Радар: <b>{html.escape(s['title'])}</b>\n"
+        f"Текущий фильтр: <b>{cur_label}</b>\n\n"
+        f"Выберите, сколько времени назад объявление должно быть выложено на Авито:\n"
+        f"<i>(Лоты старше выбранного времени будут автоматически отсекаться, чтобы не присылать старый спам)</i>"
+    )
+
+    options = [
+        ("⚡️ 10 мин", 10),
+        ("⏱ 30 мин", 30),
+        ("⏳ 1 час", 60),
+        ("⌛️ 2 часа", 120),
+        ("📅 6 часов", 360),
+        ("🗓 24 часа", 1440),
+    ]
+
+    buttons = []
+    row = []
+    for label, val in options:
+        btn_mark = " ✓" if cur_age == val else ""
+        row.append(InlineKeyboardButton(text=f"{label}{btn_mark}", callback_data=f"save_age:{search_id}:{val}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    no_limit_mark = " ✓" if cur_age == 0 else ""
+    buttons.append([InlineKeyboardButton(text=f"♾ Без ограничений (все лоты){no_limit_mark}", callback_data=f"save_age:{search_id}:0")])
+    buttons.append([InlineKeyboardButton(text="✏️ Ввести минуты вручную...", callback_data=f"custom_age:{search_id}")])
+    buttons.append([
+        InlineKeyboardButton(text="« Назад к радару", callback_data=f"open_search:{search_id}"),
+        InlineKeyboardButton(text="📁 Ко всем радарам", callback_data="list_searches")
+    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("save_age:"))
+async def cb_save_age(call: CallbackQuery):
+    parts = call.data.split(":")
+    search_id = int(parts[1])
+    val = int(parts[2])
+    user_id = call.from_user.id
+
+    s = await database.get_search(search_id)
+    if not s or s.get("user_id") != user_id:
+        await call.answer("Радар не найден", show_alert=True)
+        return
+
+    await database.update_search_max_age(search_id, user_id, val)
+    s["max_age_minutes"] = val
+
+    if val == 0:
+        ans_text = "Фильтр свежести отключен (пропускаются любые лоты)"
+    else:
+        ans_text = f"Установлен фильтр: {format_max_age_label(val)}"
+
+    log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Настройка свежести", f"Радар #{search_id} -> {ans_text}", status="OK")
+    await call.answer(f"✅ {ans_text}")
+    card_text, kb = build_radar_card(s)
+    try:
+        await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("custom_age:"))
+async def cb_prompt_custom_age(call: CallbackQuery, state: FSMContext):
+    search_id = int(call.data.split(":")[1])
+    user_id = call.from_user.id
+    s = await database.get_search(search_id)
+    if not s or s.get("user_id") != user_id:
+        await call.answer("Радар не найден", show_alert=True)
+        return
+
+    await state.set_state(SearchStates.waiting_for_custom_age)
+    await state.update_data(age_search_id=search_id)
+
+    text = (
+        f"✏️ <b>РУЧНОЙ ВВОД ВРЕМЕНИ СВЕЖЕСТИ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Радар: <b>{html.escape(s['title'])}</b>\n\n"
+        f"Отправьте сообщением максимальный возраст объявления <b>в минутах</b> (число от 0 до 10080):\n\n"
+        f"<i>Примеры:\n"
+        f"• <code>5</code> — только супер-свежие (до 5 минут)\n"
+        f"• <code>15</code> — свежие (до 15 минут)\n"
+        f"• <code>90</code> — полтора часа (90 минут)\n"
+        f"• <code>180</code> — три часа (180 минут)\n"
+        f"• <code>0</code> — отключить фильтр (любой возраст)</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="« Отмена", callback_data=f"set_age:{search_id}")]
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@router.message(SearchStates.waiting_for_custom_age)
+async def process_custom_age_input(message: Message, state: FSMContext):
+    menu_buttons = {
+        "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
+        "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
+        "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
+        "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
+        "📖 Инструкция", "❓ Помощь", "Инструкция",
+        "👑 Админ-панель", "👑 Админка",
+        "❌ Отмена", "Отмена"
+    }
+    if message.text.strip() in menu_buttons or message.text.strip().startswith("/"):
+        await state.clear()
+        if message.text.strip() in {"📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары"}:
+            return await show_searches(message, state)
+        return
+
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer(
+            "⚠️ <b>Пожалуйста, введите целое число минут</b> (например: <code>15</code> или <code>60</code>):",
+            parse_mode="HTML"
+        )
+        return
+
+    val = int(text)
+    if val < 0 or val > 10080:  # до 7 суток
+        await message.answer(
+            "⚠️ <b>Число минут должно быть от 0 до 10080 (до 7 суток)!</b> Попробуйте ещё раз:",
+            parse_mode="HTML"
+        )
+        return
+
+    data = await state.get_data()
+    search_id = data.get("age_search_id")
+    await state.clear()
+
+    if search_id:
+        await database.update_search_max_age(search_id, message.from_user.id, val)
+        label = format_max_age_label(val)
+        log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Настройка свежести", f"Радар #{search_id} -> свой порог: {val} мин.", status="OK")
+        await message.answer(f"✅ <b>Отлично! Фильтр свежести установлен: {label}!</b>", parse_mode="HTML")
+
+        s = await database.get_search(search_id)
+        if s:
+            card_text, kb = build_radar_card(s)
+            await message.answer(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+            return
 
     await show_searches(message, state)
 

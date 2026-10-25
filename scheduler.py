@@ -329,25 +329,34 @@ def format_item_age(date_str: Optional[str], timestamp: Optional[int] = None) ->
     return "возраст не указан"
 
 
-def is_ad_fresh_enough(date_str: Optional[str], timestamp: Optional[int] = None) -> bool:
+def is_ad_fresh_enough(
+    date_str: Optional[str],
+    timestamp: Optional[int] = None,
+    max_age_minutes: Optional[int] = 60
+) -> bool:
     """
-    Проверяет, действительно ли объявление актуальное/свежее (до 2 часов),
+    Проверяет, действительно ли объявление актуальное/свежее согласно настройке радара (max_age_minutes),
     отсекая старый спам из глубины каталога.
 
+    Если max_age_minutes is None или <= 0 — фильтр свежести отключен (пропускаем любые объявления).
     1. Если есть точный timestamp из SSR JSON — вычисляет возраст лота с точностью до секунды.
     2. Если timestamp нет — парсит относительные фразы и время 'сегодня в HH:MM'.
     """
+    if max_age_minutes is None or max_age_minutes <= 0:
+        return True
+
+    threshold_seconds = max_age_minutes * 60
+
     if timestamp:
         age_seconds = max(0, int(time.time() - timestamp))
-        # До 2 часов (7200 сек) считаем свежим лотом (с запасом на задержку модерации Авито)
-        return age_seconds <= 2 * 3600
+        return age_seconds <= threshold_seconds
 
     if not date_str:
         return True
 
     d = date_str.lower().strip()
 
-    # Секунды и "только что"
+    # Секунды и "только что" (всегда свежие, менее минуты)
     if any(k in d for k in ["секунд", "только что"]):
         return True
 
@@ -356,12 +365,16 @@ def is_ad_fresh_enough(date_str: Optional[str], timestamp: Optional[int] = None)
         m = re.search(r"(\d+)\s+минут", d)
         if m:
             mins = int(m.group(1))
-            return mins <= 120
+            return mins <= max_age_minutes
         return True
 
-    # "1 час назад" (Авито отображает это для любых лотов от 0 до 59 мин!) и "2 часа назад"
-    if any(k in d for k in ["1 час назад", "час назад", "2 часа назад"]):
-        return True
+    # "1 час назад" (Авито отображает это для лотов 1..59 мин или около часа)
+    if any(k in d for k in ["1 час назад", "час назад"]):
+        return max_age_minutes >= 60
+
+    # "2 часа назад"
+    if "2 часа назад" in d:
+        return max_age_minutes >= 120
 
     # "сегодня в 18:06" / "сегодня, 18:06"
     if "сегодня" in d:
@@ -373,7 +386,11 @@ def is_ad_fresh_enough(date_str: Optional[str], timestamp: Optional[int] = None)
             # Учитываем возможный рассинхрон часов / смену суток
             if diff_min < -60:
                 return True
-            return diff_min <= 120
+            return diff_min <= max_age_minutes
+        return True
+
+    # Если порог больше суток (например 1440+ минут), то "вчера" тоже подходит
+    if "вчера" in d and max_age_minutes >= 1440:
         return True
 
     # Все остальное: "вчера", "24 октября", "3 дня назад" и т.д. считаем старыми
@@ -623,7 +640,7 @@ async def process_url_group(
             # 📉 Проверка снижения цены (Price Drop Alert) для PRO-тарифа и администраторов
             user_plan = (radar.get("tariff_plan") or "").lower()
             is_pro = (user_id in config.ADMIN_IDS or user_plan == "pro")
-            min_drop = int(radar.get("min_discount_percent") if radar.get("min_discount_percent") is not None else 5)
+            min_drop = int(radar.get("min_discount_percent") or 0)
 
             if is_pro and min_drop > 0:
                 for it in items:
@@ -689,8 +706,17 @@ async def process_url_group(
             if not new_items:
                 continue
 
-            # 1. Отбираем только действительно свежие объявления (до 10 минут)
-            fresh_items = [it for it in new_items if is_ad_fresh_enough(it.date, getattr(it, "timestamp", None))]
+            # 1. Отбираем только действительно свежие объявления с учетом настройки max_age_minutes радара
+            max_age_min = radar.get("max_age_minutes")
+            if max_age_min is None:
+                max_age_min = 60
+            else:
+                max_age_min = int(max_age_min)
+
+            fresh_items = [
+                it for it in new_items 
+                if is_ad_fresh_enough(it.date, getattr(it, "timestamp", None), max_age_minutes=max_age_min)
+            ]
 
             if not fresh_items:
                 ages = [format_item_age(it.date, getattr(it, "timestamp", None)) for it in new_items[:2]]
@@ -698,9 +724,10 @@ async def process_url_group(
                 if len(new_items) > 2:
                     age_summary += f", и ещё {len(new_items) - 2}"
                 items_label = plural_form(len(new_items), "лот", "лота", "лотов")
+                limit_label = f"порог {max_age_min} мин." if max_age_min > 0 else "без ограничений"
                 logger.info(
                     f"  {w_tag}🔹 Радар #{radar_id} [{user_str}] «{search_title}»: {items_label} в ротации [{source_tag}] "
-                    f"(отсеян как старый: {age_summary}; порог 2 ч.)"
+                    f"(отсеян по возрасту: {age_summary}; {limit_label})"
                 )
                 continue
 
