@@ -172,14 +172,14 @@ def format_item_age(date_str: Optional[str], timestamp: Optional[int] = None) ->
 
 def is_ad_fresh_enough(date_str: Optional[str], timestamp: Optional[int] = None) -> bool:
     """
-    Проверяет, действительно ли объявление свежее (опубликовано до 15 минут назад).
+    Проверяет, действительно ли объявление свежее (опубликовано до 10 минут назад).
     1. Если есть точный timestamp из SSR JSON — вычисляет возраст лота с точностью до секунды.
     2. Если timestamp нет — использует текстовые маркеры (фолбэк).
     """
     if timestamp:
         age_seconds = time.time() - timestamp
-        # До 15 минут (900 сек) считаем свежим
-        return age_seconds <= 15 * 60
+        # До 10 минут (600 сек) считаем свежим
+        return age_seconds <= 10 * 60
 
     if not date_str:
         return True
@@ -190,7 +190,7 @@ def is_ad_fresh_enough(date_str: Optional[str], timestamp: Optional[int] = None)
         m = re.search(r"(\d+)\s+минут", d)
         if m:
             mins = int(m.group(1))
-            return mins <= 15  # максимум 15 минут назад
+            return mins <= 10  # максимум 10 минут назад
         return True
     # Все остальное: "1 час назад", "2 часа назад", "вчера", "24 октября" и т.д. считаем старыми
     return False
@@ -396,7 +396,7 @@ async def process_url_group(
             # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ, чтобы они не всплывали повторно
             await database.mark_items_seen_bulk(radar_id, [it.item_id for it in new_items])
 
-            # 1. Отбираем только действительно свежие объявления (до 15 минут)
+            # 1. Отбираем только действительно свежие объявления (до 10 минут)
             fresh_items = [it for it in new_items if is_ad_fresh_enough(it.date, getattr(it, "timestamp", None))]
 
             if not fresh_items:
@@ -407,7 +407,7 @@ async def process_url_group(
                 items_label = plural_form(len(new_items), "лот", "лота", "лотов")
                 logger.info(
                     f"  {w_tag}🔹 Радар #{radar_id} [{user_str}] «{search_title}»: {items_label} в ротации [{source_tag}] "
-                    f"(отсеян как старый: {age_summary}; порог 15 мин)"
+                    f"(отсеян как старый: {age_summary}; порог 10 мин)"
                 )
                 continue
 
