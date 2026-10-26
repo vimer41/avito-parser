@@ -49,6 +49,7 @@ systemctl is-active --quiet avito-bot && WAS_ACTIVE=1
 
 cleanup() {
     rm -rf "$STAGE_DIR"
+    rm -rf "$TARGET_DIR/.tmp" 2>/dev/null || true
     # Failed preflight environments were never used by the service.
     if [[ -n "$NEW_ENV" && "$ENV_CHANGED" == 0 ]]; then
         rm -rf "$NEW_ENV"
@@ -67,6 +68,7 @@ report_state() {
 rollback() {
     local status="${1:-$?}"
     trap - ERR INT TERM
+    rm -rf "$TARGET_DIR/.tmp" 2>/dev/null || true
     if [[ "$CHANGED" == 1 ]]; then
         echo "Deploy failed; restoring previous code/environment"
         systemctl stop avito-bot || true
@@ -106,12 +108,60 @@ trap rollback ERR
 trap 'rollback 130' INT
 trap 'rollback 143' TERM
 
-# Clean up temporary pip build artifacts, old logs, and VPS pip cache to free disk space
+# Clean up temporary pip build artifacts, old logs, stale environments and VPS cache to free disk space
 if [[ -z "${MOCK_ROOT:-}" ]]; then
-    rm -rf /root/.cache/pip ~/.cache/pip /tmp/pip-* 2>/dev/null || true
-    find "$TARGET_DIR/logs" "$TARGET_DIR" -maxdepth 2 -name "*.log.*" -mtime +3 -delete 2>/dev/null || true
-    command -v journalctl >/dev/null 2>&1 && journalctl --vacuum-size=30M 2>/dev/null || true
+    echo "=== Initial Disk & Memory Status ==="
+    df -h "$TARGET_DIR" / /tmp 2>/dev/null || df -h "$TARGET_DIR" || true
+    free -m 2>/dev/null || true
+
+    # Clean package manager cache and systemd journals
+    command -v apt-get >/dev/null 2>&1 && apt-get clean 2>/dev/null || true
+    command -v journalctl >/dev/null 2>&1 && journalctl --vacuum-size=20M --vacuum-time=2d 2>/dev/null || true
+
+    # Clean pip caches and system temp directories
+    rm -rf /root/.cache/pip ~/.cache/pip /tmp/pip-* /tmp/tmp.* /tmp/*.whl /var/tmp/tmp.* /var/tmp/pip-* "$TARGET_DIR/.tmp" 2>/dev/null || true
+    find "$TARGET_DIR/logs" "$TARGET_DIR" -maxdepth 2 -name "*.log.*" -mtime +2 -delete 2>/dev/null || true
+
+    # Prune old releases in .releases to free disk BEFORE building NEW_ENV:
+    # Always keep the active venv and at most 1 rollback candidate (newest previous-venv).
+    if [[ -d "$TARGET_DIR/.releases" ]]; then
+        ACTIVE_VENV=""
+        if [[ -e "$TARGET_DIR/venv" || -L "$TARGET_DIR/venv" ]]; then
+            ACTIVE_VENV="$(readlink -f "$TARGET_DIR/venv" 2>/dev/null || true)"
+        fi
+        NEWEST_PREV=""
+        for prev_env in $(ls -dt "$TARGET_DIR/.releases"/previous-venv-* 2>/dev/null); do
+            prev_real="$(readlink -f "$prev_env" 2>/dev/null || true)"
+            if [[ -z "$NEWEST_PREV" && -d "$prev_env" ]]; then
+                NEWEST_PREV="$prev_real"
+            elif [[ -d "$prev_env" && -n "$prev_real" && "$prev_real" != "$ACTIVE_VENV" ]]; then
+                echo "Pre-clean: removing older previous-venv $(basename "$prev_env")"
+                rm -rf "$prev_env" 2>/dev/null || true
+            fi
+        done
+        for old_v in $(ls -dt "$TARGET_DIR/.releases"/venv-* 2>/dev/null); do
+            v_real="$(readlink -f "$old_v" 2>/dev/null || true)"
+            if [[ -n "$v_real" && "$v_real" != "$ACTIVE_VENV" && "$v_real" != "$NEWEST_PREV" ]]; then
+                echo "Pre-clean: removing stale release environment $(basename "$old_v")"
+                rm -rf "$old_v" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # Prune old SQLite backups in backups/ (keep at most 3 newest)
+    if [[ -d "$TARGET_DIR/backups" ]]; then
+        ls -dt "$TARGET_DIR/backups"/bot-before-*.db 2>/dev/null | tail -n +4 | xargs -r rm -f 2>/dev/null || true
+    fi
+
+    echo "=== Disk Status After Pre-Deploy Cleanup ==="
+    df -h "$TARGET_DIR" / /tmp 2>/dev/null || df -h "$TARGET_DIR" || true
 fi
+
+# Use dedicated on-disk temporary directory for pip to avoid filling RAM-backed /tmp tmpfs
+BUILD_TMP="$TARGET_DIR/.tmp"
+rm -rf "$BUILD_TMP" 2>/dev/null || true
+mkdir -p "$BUILD_TMP"
+export TMPDIR="$BUILD_TMP"
 
 # Free RAM on constrained systems (e.g. 600MB VPS) by stopping old bot before pip install
 if [[ "$DEPLOY_STOP_BEFORE_PREFLIGHT" == 1 && "$WAS_ACTIVE" == 1 ]]; then
@@ -127,7 +177,25 @@ mkdir -p "$TARGET_DIR/.releases"
 NEW_ENV="$(mktemp -d "$TARGET_DIR/.releases/venv-$DEPLOY_SHA-XXXXXX")"
 python3.11 -m venv "$NEW_ENV" 2>/dev/null || python3 -m venv "$NEW_ENV"
 "$NEW_ENV/bin/python" -B -c 'import sys; print("Deploy Python:", sys.version.split()[0], flush=True); sys.exit(0 if sys.version_info[:2] in ((3, 11), (3, 12)) else "Unsupported deploy Python; expected 3.11 or 3.12")'
+
+# Seed site-packages from existing active venv using hardlinks (zero disk space, instant)
+if [[ -e "$TARGET_DIR/venv" || -L "$TARGET_DIR/venv" ]]; then
+    ACTIVE_SRC="$(readlink -f "$TARGET_DIR/venv" 2>/dev/null || true)"
+    if [[ -d "$ACTIVE_SRC/lib" ]]; then
+        for sp in "$ACTIVE_SRC"/lib/python3.*/site-packages; do
+            if [[ -d "$sp" ]]; then
+                for dst_sp in "$NEW_ENV"/lib/python3.*/site-packages; do
+                    if [[ -d "$dst_sp" ]]; then
+                        cp -al "$sp"/* "$dst_sp"/ 2>/dev/null || cp -r "$sp"/* "$dst_sp"/ 2>/dev/null || true
+                    fi
+                done
+            fi
+        done
+    fi
+fi
+
 "$NEW_ENV/bin/python" -m pip install --no-cache-dir --disable-pip-version-check -r "$STAGE_DIR/requirements.txt"
+rm -rf "$BUILD_TMP" 2>/dev/null || true
 "$NEW_ENV/bin/python" -m pip check
 "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/check_syntax.py"
 echo "Resources before activation:"
