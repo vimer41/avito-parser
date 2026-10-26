@@ -169,11 +169,19 @@ async def process_avito_url(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-    parser = AvitoParser(proxy=config.PROXY_URL)
-    try:
-        html_content = await parser.fetch_page_async(normalized_url)
-    finally:
-        parser.close()
+    html_content = None
+    for attempt in range(1, 4):
+        parser = AvitoParser(proxy=config.PROXY_URL)
+        try:
+            html_content = await parser.fetch_page_async(normalized_url)
+            if html_content:
+                break
+        except Exception as e:
+            logger.warning("Ошибка калибровки (попытка %d/3): %s", attempt, e)
+        finally:
+            parser.close()
+        if attempt < 3:
+            await asyncio.sleep(1.2)
 
     if not html_content:
         log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Калибровка радара", f"Ошибка: Авито не вернул HTML («{normalized_url[:80]}»)", status="ERROR")
