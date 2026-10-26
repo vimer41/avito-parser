@@ -38,10 +38,23 @@ systemctl is-active --quiet avito-bot && WAS_ACTIVE=1
 
 cleanup() {
     rm -rf "$STAGE_DIR"
+    # Failed preflight environments were never used by the service.
+    if [[ -n "$NEW_ENV" && "$ENV_CHANGED" == 0 ]]; then
+        rm -rf "$NEW_ENV"
+    fi
+}
+
+report_state() {
+    local current_sha service_active=0
+    current_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    if systemctl is-active --quiet avito-bot; then
+        service_active=1
+    fi
+    echo "Deployment state: commit=$current_sha service_active=$service_active environment_changed=$ENV_CHANGED"
 }
 
 rollback() {
-    status="${1:-$?}"
+    local status="${1:-$?}"
     trap - ERR INT TERM
     if [[ "$CHANGED" == 1 ]]; then
         echo "Deploy failed; restoring previous code/environment"
@@ -60,7 +73,10 @@ rollback() {
         if [[ "$WAS_ACTIVE" == 1 ]]; then
             systemctl start avito-bot || true
         fi
+    else
+        echo "Deploy failed before activation (exit $status); running code/environment were not changed"
     fi
+    report_state
     exit "$status"
 }
 trap cleanup EXIT
@@ -69,14 +85,20 @@ trap 'rollback 130' INT
 trap 'rollback 143' TERM
 
 # Build and retest in isolation. The running bot keeps its existing environment.
+report_state
 git archive "$DEPLOY_SHA" | tar -x -C "$STAGE_DIR"
 mkdir -p "$TARGET_DIR/.releases"
 NEW_ENV="$(mktemp -d "$TARGET_DIR/.releases/venv-$DEPLOY_SHA-XXXXXX")"
 python3.11 -m venv "$NEW_ENV" 2>/dev/null || python3 -m venv "$NEW_ENV"
+"$NEW_ENV/bin/python" -B -c 'import sys; print("Deploy Python:", sys.version.split()[0], flush=True); sys.exit(0 if sys.version_info[:2] in ((3, 11), (3, 12)) else "Unsupported deploy Python; expected 3.11 or 3.12")'
 "$NEW_ENV/bin/python" -m pip install --disable-pip-version-check -r "$STAGE_DIR/requirements.txt"
 "$NEW_ENV/bin/python" -m pip check
 "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/check_syntax.py"
-AVITO_RADAR_TESTING=1 PYTHONDONTWRITEBYTECODE=1 timeout 180 "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/run_offline_tests.py"
+echo "Resources before isolated retests (the existing bot is still running):"
+if command -v free >/dev/null 2>&1; then free -m || true; fi
+echo "Running offline tests: timeout=600s, native_threads=1"
+AVITO_RADAR_TESTING=1 PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    timeout --kill-after=30s 600s "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/run_offline_tests.py"
 
 # No automatic deletion or log scrubbing. Backup is read-only and precedes migrations.
 CHANGED=1
@@ -120,4 +142,5 @@ for _ in $(seq 1 10); do
     [[ "$(systemctl show avito-bot --property=NRestarts --value)" == 0 ]]
 done
 [[ "$(git rev-parse HEAD)" == "$DEPLOY_SHA" ]]
+report_state
 echo "Deployed tested commit $DEPLOY_SHA; service stayed active for 20 seconds"

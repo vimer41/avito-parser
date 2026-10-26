@@ -27,7 +27,9 @@ class TestDeployScript(unittest.TestCase):
         path.write_text("#!/usr/bin/env bash\nset -eu\n" + body, encoding="utf-8", newline="\n")
         path.chmod(0o755)
 
-    def run_deploy(self, *, fail_tests=False, fail_service=False, stale=False, posix_shell=False):
+    def run_deploy(self, *, fail_tests=False, fail_service=False, stale=False,
+                   posix_shell=False, test_timeout=False, python_fallback=False,
+                   unsupported_python=False):
         with tempfile.TemporaryDirectory(prefix="avito-deploy-test-") as temporary:
             directory = Path(temporary)
             project = directory / "project"
@@ -73,16 +75,33 @@ esac
             # A regular link marker avoids Git Bash's Windows directory-copy fallback.
             # Fake systemd never executes venv; rollback only needs unlink/move semantics.
             self.create_script(binary, "ln", "printf '%s\\n' \"$2\" > \"$3\"\n")
-            self.create_script(binary, "timeout", "shift\nexec \"$@\"\n")
-            self.create_script(binary, "python3.11", """
+            self.create_script(binary, "timeout", """
+echo "timeout $*" >> "$MOCK_ROOT/events"
+if [[ "$1" == --kill-after=* ]]; then shift; fi
+shift
+exec "$@"
+""")
+            build_environment = """
 echo "build-env $*" >> "$MOCK_ROOT/events"
 mkdir -p "$3/bin"
 cp "$MOCK_ROOT/bin/python-template" "$3/bin/python"
 chmod +x "$3/bin/python"
-""")
+"""
+            self.create_script(binary, "python3.11", 'if [[ "$PYTHON_FALLBACK" == 1 ]]; then exit 127; fi\n' + build_environment)
+            self.create_script(binary, "python3", build_environment)
             self.create_script(binary, "python-template", """
 echo "python $*" >> "$MOCK_ROOT/events"
-if [[ "$*" == *run_offline_tests.py* && "$FAIL_TESTS" == 1 ]]; then exit 17; fi
+if [[ "$*" == *"Deploy Python:"* ]]; then
+  if [[ "$UNSUPPORTED_PYTHON" == 1 ]]; then
+    echo "Unsupported deploy Python; expected 3.11 or 3.12" >&2
+    exit 1
+  fi
+  echo "Deploy Python: $MOCK_PYTHON_VERSION"
+fi
+if [[ "$*" == *run_offline_tests.py* ]]; then
+  echo "test-runtime testing=$AVITO_RADAR_TESTING no_pyc=$PYTHONDONTWRITEBYTECODE openblas=$OPENBLAS_NUM_THREADS omp=$OMP_NUM_THREADS mkl=$MKL_NUM_THREADS" >> "$MOCK_ROOT/events"
+  exit "$TEST_EXIT_CODE"
+fi
 if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT/events"; fi
 """)
             prefix = bash_path(binary)
@@ -90,7 +109,11 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
             env.update({
                 "MOCK_ROOT": bash_path(directory), "DEPLOY_TARGET_DIR": bash_path(project),
                 "DEPLOY_SHA": TEST_SHA, "OLD_SHA": OLD_SHA, "DEPLOY_BRANCH": "feature/json-api",
-                "FAIL_TESTS": "1" if fail_tests else "0", "FAIL_SERVICE": "1" if fail_service else "0",
+                "TEST_EXIT_CODE": "124" if test_timeout else "17" if fail_tests else "0",
+                "FAIL_SERVICE": "1" if fail_service else "0",
+                "PYTHON_FALLBACK": "1" if python_fallback else "0",
+                "UNSUPPORTED_PYTHON": "1" if unsupported_python else "0",
+                "MOCK_PYTHON_VERSION": "3.12.5" if python_fallback else "3.11.15",
                 "STALE": "1" if stale else "0",
             })
             if posix_shell:
@@ -104,45 +127,84 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
             events_path = directory / "events"
             events = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
             old_environment = (project / "venv" / "old-environment-marker").is_file()
-            return result, head, events, old_environment
+            release_count = len(list((project / ".releases").glob("venv-*")))
+            return result, head, events, old_environment, release_count
 
     def test_success_deploys_exact_sha_after_tests_and_backup(self):
-        result, head, events, old_environment = self.run_deploy()
+        result, head, events, old_environment, release_count = self.run_deploy()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(head, TEST_SHA)
         self.assertFalse(old_environment)
+        self.assertEqual(release_count, 1)
+        self.assertIn("timeout --kill-after=30s 600s", events)
+        self.assertIn("test-runtime testing=1 no_pyc=1 openblas=1 omp=1 mkl=1", events)
+        self.assertIn("Deploy Python: 3.11.15", result.stdout)
         self.assertLess(events.index("run_offline_tests.py"), events.index("systemctl stop"))
         self.assertLess(events.index("backup-created"), events.index("git checkout"))
         self.assertEqual(events.count("systemctl show"), 10)
 
     def test_test_failure_never_stops_running_bot(self):
-        result, head, events, old_environment = self.run_deploy(fail_tests=True)
-        self.assertNotEqual(result.returncode, 0)
+        result, head, events, old_environment, release_count = self.run_deploy(fail_tests=True)
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
         self.assertEqual(head, OLD_SHA)
         self.assertTrue(old_environment)
+        self.assertEqual(release_count, 0)
+        self.assertIn("Deploy failed before activation (exit 17)", result.stdout)
         self.assertNotIn("systemctl stop", events)
         self.assertNotIn("git checkout", events)
 
     def test_failed_service_restores_code_and_old_environment(self):
-        result, head, events, old_environment = self.run_deploy(fail_service=True)
+        result, head, events, old_environment, release_count = self.run_deploy(fail_service=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(head, OLD_SHA)
         self.assertTrue(old_environment, result.stdout + result.stderr + events)
+        self.assertEqual(release_count, 1)
         self.assertIn(f"git checkout -B feature/json-api {OLD_SHA}", events)
 
     def test_stale_workflow_skips_deploy(self):
-        result, head, events, old_environment = self.run_deploy(stale=True)
+        result, head, events, old_environment, release_count = self.run_deploy(stale=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(head, OLD_SHA)
         self.assertTrue(old_environment)
+        self.assertEqual(release_count, 0)
         self.assertNotIn("build-env", events)
         self.assertNotIn("systemctl stop", events)
 
     def test_ssh_wrapper_runs_under_a_posix_login_shell(self):
-        result, head, events, old_environment = self.run_deploy(posix_shell=True)
+        result, head, events, old_environment, release_count = self.run_deploy(posix_shell=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(head, TEST_SHA)
         self.assertIn("backup-created", events)
+
+    def test_test_timeout_preserves_running_version_and_removes_unused_env(self):
+        result, head, events, old_environment, release_count = self.run_deploy(test_timeout=True)
+        self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+        self.assertEqual(head, OLD_SHA)
+        self.assertTrue(old_environment)
+        self.assertEqual(release_count, 0)
+        self.assertNotIn("systemctl stop", events)
+        self.assertNotIn("git checkout", events)
+        self.assertIn("Deploy failed before activation (exit 124)", result.stdout)
+        self.assertIn(f"Deployment state: commit={OLD_SHA} service_active=1 environment_changed=0", result.stdout)
+
+    def test_python_312_fallback_is_reported_and_retested(self):
+        result, head, events, old_environment, release_count = self.run_deploy(python_fallback=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(head, TEST_SHA)
+        self.assertIn("Deploy Python: 3.12.5", result.stdout)
+        self.assertIn("run_offline_tests.py", events)
+        self.assertFalse(old_environment)
+        self.assertEqual(release_count, 1)
+
+    def test_unsupported_python_fails_before_install_without_stopping_bot(self):
+        result, head, events, old_environment, release_count = self.run_deploy(unsupported_python=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(head, OLD_SHA)
+        self.assertTrue(old_environment)
+        self.assertEqual(release_count, 0)
+        self.assertIn("Unsupported deploy Python", result.stderr)
+        self.assertNotIn("pip install", events)
+        self.assertNotIn("systemctl stop", events)
 
 
 if __name__ == "__main__":

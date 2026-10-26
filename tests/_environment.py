@@ -5,6 +5,15 @@ import os
 import tempfile
 from pathlib import Path
 
+# Set these before discovery imports NumPy/ONNX. VPS retests share resources
+# with the running bot; native libraries must not size pools for the host CPU.
+NATIVE_THREAD_LIMITS = {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+}
+os.environ.update(NATIVE_THREAD_LIMITS)
+
 TEST_ROOT = tempfile.TemporaryDirectory(prefix="avito-radar-tests-")
 atexit.register(TEST_ROOT.cleanup)
 root = Path(TEST_ROOT.name)

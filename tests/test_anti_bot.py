@@ -2,6 +2,9 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -141,6 +144,25 @@ class TestLocalPow(unittest.TestCase):
 
 
 class TestChallengeManager(unittest.TestCase):
+    def test_bootstrap_limits_native_threads_before_ml_imports(self):
+        environment = dict(os.environ)
+        environment.update({name: "64" for name in _environment.NATIVE_THREAD_LIMITS})
+        probe = (
+            "from tests import _environment; import json, os, sys; "
+            "print(json.dumps({'limits': {name: os.environ[name] for name in "
+            "_environment.NATIVE_THREAD_LIMITS}, 'ml_imported': any(name in "
+            "sys.modules for name in ('numpy', 'onnxruntime', 'ddddocr'))}))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", "-B", "-c", probe],
+            cwd=Path(__file__).resolve().parents[1], env=environment,
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertEqual(observed["limits"], _environment.NATIVE_THREAD_LIMITS)
+        self.assertFalse(observed["ml_imported"])
+
     def test_qrator_pixel_failure_is_not_success(self):
         challenge = FakeResponse(429, '<script src="/0123456789abcdefabcd.js"></script>', headers={"server": "QRATOR"})
         for status, expected in ((429, False), (200, True)):
@@ -188,8 +210,12 @@ class TestChallengeManager(unittest.TestCase):
 
     def test_icon_models_initialize_offline(self):
         service = dddd_server.DdddService()
-        self.assertTrue(callable(service.det.detection))
-        self.assertTrue(callable(service.cnn.classification))
+        try:
+            self.assertTrue(callable(service.det.detection))
+            self.assertTrue(callable(service.cnn.classification))
+        finally:
+            service.det.cleanup()
+            service.cnn.cleanup()
 
     def test_icon_recognition_never_fills_missing_answers_randomly(self):
         import cv2
