@@ -29,7 +29,7 @@ class TestDeployScript(unittest.TestCase):
 
     def run_deploy(self, *, fail_tests=False, fail_service=False, stale=False,
                    posix_shell=False, test_timeout=False, python_fallback=False,
-                   unsupported_python=False):
+                   unsupported_python=False, full_tests=None, preflight_failure=""):
         with tempfile.TemporaryDirectory(prefix="avito-deploy-test-") as temporary:
             directory = Path(temporary)
             project = directory / "project"
@@ -98,6 +98,7 @@ if [[ "$*" == *"Deploy Python:"* ]]; then
   fi
   echo "Deploy Python: $MOCK_PYTHON_VERSION"
 fi
+if [[ -n "$PREFLIGHT_FAILURE" && "$*" == *"$PREFLIGHT_FAILURE"* ]]; then exit 19; fi
 if [[ "$*" == *run_offline_tests.py* ]]; then
   echo "test-runtime testing=$AVITO_RADAR_TESTING no_pyc=$PYTHONDONTWRITEBYTECODE openblas=$OPENBLAS_NUM_THREADS omp=$OMP_NUM_THREADS mkl=$MKL_NUM_THREADS" >> "$MOCK_ROOT/events"
   exit "$TEST_EXIT_CODE"
@@ -115,7 +116,12 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
                 "UNSUPPORTED_PYTHON": "1" if unsupported_python else "0",
                 "MOCK_PYTHON_VERSION": "3.12.5" if python_fallback else "3.11.15",
                 "STALE": "1" if stale else "0",
+                "PREFLIGHT_FAILURE": preflight_failure,
             })
+            if full_tests is None:
+                env.pop("DEPLOY_FULL_TESTS", None)
+            else:
+                env["DEPLOY_FULL_TESTS"] = full_tests
             if posix_shell:
                 wrapper = directory / "wrapper.sh"
                 wrapper.write_text("bash -s <<'AVITO_DEPLOY_SCRIPT'\n" + (ROOT / "tools/deploy.sh").read_text(encoding="utf-8") + "\nAVITO_DEPLOY_SCRIPT\n", encoding="utf-8", newline="\n")
@@ -131,7 +137,7 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
             return result, head, events, old_environment, release_count
 
     def test_success_deploys_exact_sha_after_tests_and_backup(self):
-        result, head, events, old_environment, release_count = self.run_deploy()
+        result, head, events, old_environment, release_count = self.run_deploy(full_tests="1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(head, TEST_SHA)
         self.assertFalse(old_environment)
@@ -204,6 +210,53 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
         self.assertEqual(release_count, 0)
         self.assertIn("Unsupported deploy Python", result.stderr)
         self.assertNotIn("pip install", events)
+        self.assertNotIn("systemctl stop", events)
+
+    def test_minimal_checks_skip_suite_but_keep_backup_and_service_checks(self):
+        result, head, events, old_environment, release_count = self.run_deploy(full_tests="0", fail_tests=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(head, TEST_SHA)
+        self.assertFalse(old_environment)
+        self.assertEqual(release_count, 1)
+        self.assertIn("pip check", events)
+        self.assertIn("check_syntax.py", events)
+        self.assertNotIn("run_offline_tests.py", events)
+        self.assertNotIn("timeout ", events)
+        self.assertIn("full offline suite skipped (DEPLOY_FULL_TESTS=0)", result.stdout)
+        self.assertLess(events.index("pip check"), events.index("backup-created"))
+        self.assertLess(events.index("check_syntax.py"), events.index("backup-created"))
+        self.assertLess(events.index("backup-created"), events.index("git checkout"))
+        self.assertEqual(events.count("systemctl show"), 10)
+
+    def test_minimal_check_failure_never_stops_running_bot(self):
+        for check in ("pip check", "check_syntax.py"):
+            with self.subTest(check=check):
+                result, head, events, old_environment, release_count = self.run_deploy(full_tests="0", preflight_failure=check)
+                self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+                self.assertEqual(head, OLD_SHA)
+                self.assertTrue(old_environment)
+                self.assertEqual(release_count, 0)
+                self.assertNotIn("systemctl stop", events)
+                self.assertNotIn("git checkout", events)
+
+    def test_minimal_service_failure_restores_code_and_old_environment(self):
+        result, head, events, old_environment, release_count = self.run_deploy(full_tests="0", fail_service=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(head, OLD_SHA)
+        self.assertTrue(old_environment)
+        self.assertEqual(release_count, 1)
+        self.assertIn("backup-created", events)
+        self.assertIn(f"git checkout -B feature/json-api {OLD_SHA}", events)
+        self.assertNotIn("run_offline_tests.py", events)
+
+    def test_invalid_test_mode_fails_before_install_or_activation(self):
+        result, head, events, old_environment, release_count = self.run_deploy(full_tests="invalid")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(head, OLD_SHA)
+        self.assertTrue(old_environment)
+        self.assertEqual(release_count, 0)
+        self.assertIn("DEPLOY_FULL_TESTS must be 0 or 1", result.stdout)
+        self.assertNotIn("build-env", events)
         self.assertNotIn("systemctl stop", events)
 
 

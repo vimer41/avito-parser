@@ -6,6 +6,8 @@ umask 077
 : "${DEPLOY_BRANCH:?DEPLOY_BRANCH is required}"
 [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid commit SHA"; exit 1; }
 [[ "$DEPLOY_BRANCH" == main || "$DEPLOY_BRANCH" == feature/json-api ]] || { echo "Invalid deploy branch"; exit 1; }
+DEPLOY_FULL_TESTS="${DEPLOY_FULL_TESTS:-1}"
+[[ "$DEPLOY_FULL_TESTS" == 0 || "$DEPLOY_FULL_TESTS" == 1 ]] || { echo "DEPLOY_FULL_TESTS must be 0 or 1"; exit 1; }
 
 TARGET_DIR=""
 for candidate in "${DEPLOY_TARGET_DIR:-}" /opt/avito_parser_bot /opt/avito-bot; do
@@ -84,7 +86,7 @@ trap rollback ERR
 trap 'rollback 130' INT
 trap 'rollback 143' TERM
 
-# Build and retest in isolation. The running bot keeps its existing environment.
+# Build and validate in isolation. The running bot keeps its existing environment.
 report_state
 git archive "$DEPLOY_SHA" | tar -x -C "$STAGE_DIR"
 mkdir -p "$TARGET_DIR/.releases"
@@ -94,11 +96,15 @@ python3.11 -m venv "$NEW_ENV" 2>/dev/null || python3 -m venv "$NEW_ENV"
 "$NEW_ENV/bin/python" -m pip install --disable-pip-version-check -r "$STAGE_DIR/requirements.txt"
 "$NEW_ENV/bin/python" -m pip check
 "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/check_syntax.py"
-echo "Resources before isolated retests (the existing bot is still running):"
+echo "Resources before activation (the existing bot is still running):"
 if command -v free >/dev/null 2>&1; then free -m || true; fi
-echo "Running offline tests: timeout=600s, native_threads=1"
-AVITO_RADAR_TESTING=1 PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-    timeout --kill-after=30s 600s "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/run_offline_tests.py"
+if [[ "$DEPLOY_FULL_TESTS" == 1 ]]; then
+    echo "Running offline tests: timeout=600s, native_threads=1"
+    AVITO_RADAR_TESTING=1 PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+        timeout --kill-after=30s 600s "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/run_offline_tests.py"
+else
+    echo "Minimal VPS checks passed: dependencies and syntax; full offline suite skipped (DEPLOY_FULL_TESTS=0)"
+fi
 
 # No automatic deletion or log scrubbing. Backup is read-only and precedes migrations.
 CHANGED=1
