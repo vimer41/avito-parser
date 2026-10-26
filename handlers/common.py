@@ -325,9 +325,8 @@ async def cmd_subscription_menu(event):
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"⚡️ <b>STANDART ({config.STARS_PRICE_STANDART} ⭐ / 30 дней)</b> — до 4 радаров, фото, стоп-слова, ЧС\n"
         f"🔥 <b>PRO ({config.STARS_PRICE_PRO} ⭐ / 30 дней)</b> — до 9 радаров + <b>Price Drop 💎</b>\n\n"
-        "⭐ <b>Доступна моментальная оплата Telegram Stars.</b>\n"
-        "Разовая оплата, без автосписания.\n\n"
-        "⏳ <i>Другие способы оплаты находятся в состоянии настройки и скоро будут доступны.</i>\n\n"
+        "⭐ <b>Моментальная оплата Telegram Stars.</b>\n"
+        "Разовая оплата за 30 дней доступа, без регулярных списаний и комиссий.\n\n"
         f"{'Приём платежей включён.' if config.STARS_PAYMENTS_ENABLED else 'Приём платежей временно выключен.'}\n\n"
         "<i>💡 Выберите тариф ниже для просмотра подробностей:</i>"
     )
@@ -345,12 +344,8 @@ async def cmd_subscription_menu(event):
     buttons.append([
         InlineKeyboardButton(text=f"🔥 PRO — {config.STARS_PRICE_PRO} ⭐ / 30 дней", callback_data="buy_tariff:pro")
     ])
-    if config.STARS_PAYMENTS_ENABLED:
-        buttons.append([
-            InlineKeyboardButton(text=f"🧪 Тестовая покупка — {config.STARS_PRICE_TEST} ⭐ (1 день)", callback_data="buy_tariff:test")
-        ])
     buttons.append([
-        InlineKeyboardButton(text="⏳ Другие способы оплаты (в настройке)", callback_data="other_payment_methods")
+        InlineKeyboardButton(text="💳 Другие способы оплаты", callback_data="other_payment_methods")
     ])
     buttons.append([
         InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile"),
@@ -429,10 +424,8 @@ async def cb_select_tariff(call: CallbackQuery):
         "🚀 <b>Возможности тарифа:</b>\n"
         f"{selected['perks']}\n\n"
         "⭐ <b>Оплата через Telegram Stars активна.</b>\n"
-        "Разовая подписка, без автосписания. 30 дней добавляются к оставшемуся сроку; "
-        "выбранный тариф применяется сразу, включая при смене PRO на Standart. "
-        "Доступность и скорость зависят от Авито. Условия и возврат: /terms, поддержка: /paysupport.\n\n"
-        "⏳ <i>Другие способы оплаты находятся в состоянии настройки и скоро будут подключены.</i>"
+        "Разовая подписка на 30 дней, без автосписания. Доступ активируется мгновенно после подтверждения. "
+        "Доступность и скорость зависят от Авито. Условия и возврат: /terms, поддержка: /paysupport."
     )
 
     nav_buttons = [
@@ -446,7 +439,7 @@ async def cb_select_tariff(call: CallbackQuery):
     else:
         text += "\n\n⚠️ Приём платежей временно выключен."
     buttons.append([
-        InlineKeyboardButton(text="⏳ Другие способы оплаты (в настройке)", callback_data="other_payment_methods")
+        InlineKeyboardButton(text="💳 Другие способы оплаты", callback_data="other_payment_methods")
     ])
     buttons.append([InlineKeyboardButton(text="📃 Условия оплаты", callback_data="payment_terms"),
                     InlineKeyboardButton(text="💬 Платёжная поддержка", callback_data="payment_support")])
@@ -463,15 +456,15 @@ async def cb_select_tariff(call: CallbackQuery):
 @router.callback_query(F.data == "other_payment_methods")
 async def cb_other_payment_methods(call: CallbackQuery):
     text = (
-        "⏳ <b>ДРУГИЕ СПОСОБЫ ОПЛАТЫ</b>\n"
+        "💳 <b>ДРУГИЕ СПОСОБЫ ОПЛАТЫ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⭐ В данный момент моментальная оплата доступна через <b>Telegram Stars</b>.\n\n"
-        "⚙️ <b>В процессе настройки и подключения:</b>\n"
+        "⭐ Моментальная автоматическая оплата доступна через <b>Telegram Stars</b>.\n\n"
+        "💳 <b>Оплата через оператора (по запросу):</b>\n"
         "• Банковские карты (МИР, Visa, Mastercard)\n"
-        "• СБП (Система быстрых платежей)\n"
-        "• Альтернативные электронные способы\n\n"
-        "Ведутся технические работы по интеграции платёжного шлюза. Скоро эти способы будут полностью доступны для оплаты прямо в боте!\n\n"
-        "💬 <i>Если у вас есть вопросы по оплате или нужна помощь с доступом — свяжитесь с поддержкой:</i>"
+        "• СБП (Система быстрых платежей)\n\n"
+        "Для выставления индивидуального счёта и персональной настройки обратитесь в службу поддержки:\n"
+        "📧 Email: <b>bernardgofov@gmail.com</b>\n"
+        "💬 Нажмите кнопку «Написать в поддержку» ниже для создания тикета."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Оплатить через Telegram Stars", callback_data="open_subscription_menu")],
@@ -487,6 +480,7 @@ async def cb_other_payment_methods(call: CallbackQuery):
 
 # ── Служба поддержки и контакты ───────────────────────────────────────
 
+@router.message(Command("support", "contacts", "help"))
 @router.message(F.text.in_({"💬 Поддержка", "Поддержка", "Контакты", "Помощь", "SOS"}))
 @router.callback_query(F.data == "open_support_stub")
 async def cmd_support(event, state: Optional[FSMContext] = None):
@@ -499,12 +493,14 @@ async def cmd_support(event, state: Optional[FSMContext] = None):
         message = event
 
     text = (
-        "💬 <b>СЛУЖБА ПОДДЕРЖКИ И ОБРАТНАЯ СВЯЗЬ</b>\n"
+        "📞 <b>КОНТАКТЫ И СЛУЖБА ПОДДЕРЖКИ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "По любым вопросам работы сервиса, настройке радаров, оплате тарифов или предложениям:\n\n"
+        "По любым вопросам работы сервиса Avito Radar, оплате тарифов, возвратам и предложениям:\n\n"
+        "📧 <b>Email:</b> bernardgofov@gmail.com\n"
+        "💬 <b>Telegram-поддержка:</b> тикет-система прямо в боте (кнопка ниже)\n"
         "🕒 <b>График работы:</b> Ежедневно с 09:00 до 23:00 (МСК)\n"
         "⚡️ <b>Среднее время ответа:</b> 5–15 минут\n\n"
-        "Нажмите кнопку ниже, чтобы задать вопрос — оператор ответит вам прямо в этом боте!"
+        "Нажмите кнопку ниже, чтобы задать вопрос — оператор ответит вам прямо в этом чате!"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
