@@ -219,7 +219,7 @@ async def process_avito_url(message: Message, state: FSMContext):
         f"├ 🔍 <b>Область выборки:</b> <b>{scope_icon}</b>\n"
         f"├ 📦 <b>Существующих объявлений:</b> <b>{len(items)}</b> (пропущены)\n"
         f"├ 📡 <b>Статус:</b> 🟢 Мониторинг 24/7 активен\n"
-        f"└ ⚡️ <b>Частота сканирования:</b> каждые ~15 секунд\n\n"
+        f"└ ⚡️ <b>Базовый интервал:</b> {config.CHECK_INTERVAL} сек. (с учётом тарифа и блокировок Авито)\n\n"
         "<i>Как только появится свежий лот — бот пришлёт фото в HD, цену, контакты и готовый отклик продавцу!</i>"
     )
 
@@ -508,10 +508,11 @@ async def cb_toggle_title_scope(call: CallbackQuery):
 @router.callback_query(F.data == "all_discounts_menu")
 async def cb_all_discounts_menu(call: CallbackQuery):
     user_id = call.from_user.id
+    if not await database.is_user_allowed(user_id):
+        await call.answer("Доступ истёк. Продлите подписку в меню «Тарифы».", show_alert=True)
+        return
     user = await database.get_or_create_user(user_id)
-    is_pro = (user_id in config.ADMIN_IDS or (user.get("tariff_plan") or "").lower() == "pro")
-
-    if not is_pro:
+    if not config.is_admin(user_id) and (user.get("tariff_plan") or "").lower() != "pro":
         await call.answer(
             "🔒 Отслеживание снижения цен доступно только на тарифе PRO!\n\n"
             "Оформите подписку PRO в меню «Мой профиль», чтобы бот моментально ловил скидки перекупов.",
@@ -525,8 +526,7 @@ async def cb_all_discounts_menu(call: CallbackQuery):
         return
 
     if len(searches) == 1:
-        call.data = f"set_discount:{searches[0]['id']}"
-        return await cb_set_discount_menu(call)
+        return await show_discount_menu(call, searches[0]["id"])
 
     text = (
         "📉 <b>НАСТРОЙКА АЛЕРТОВ НА СКИДКИ (PRO)</b> 💎\n"
@@ -563,21 +563,33 @@ async def cb_all_discounts_menu(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("set_discount:"))
 async def cb_set_discount_menu(call: CallbackQuery):
-    search_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
-    user = await database.get_or_create_user(user_id)
-    is_pro = (user_id in config.ADMIN_IDS or (user.get("tariff_plan") or "").lower() == "pro")
-
-    if not is_pro:
-        await call.answer(
-            "🔒 Отслеживание снижения цен доступно только на тарифе PRO!\n\n"
-            "Оформите подписку PRO в меню «Мой профиль», чтобы бот моментально ловил скидки перекупов.",
-            show_alert=True
-        )
+    try:
+        search_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная кнопка радара", show_alert=True)
         return
+    await show_discount_menu(call, search_id)
 
-    s = await database.get_search(search_id)
-    if not s or s.get("user_id") != user_id:
+
+async def get_discount_search(user_id: int, search_id: int):
+    if not await database.is_user_allowed(user_id):
+        return None, "Доступ истёк. Продлите подписку в меню «Тарифы»."
+    user = await database.get_or_create_user(user_id)
+    if not config.is_admin(user_id) and (user.get("tariff_plan") or "").lower() != "pro":
+        return None, "🔒 Отслеживание снижения цен доступно только на тарифе PRO!"
+    search = await database.get_search(search_id)
+    if not search or search.get("user_id") != user_id:
+        return None, "Радар не найден"
+    return search, None
+
+
+async def show_discount_menu(call: CallbackQuery, search_id: int):
+    """Shared view: CallbackQuery is immutable; the radar ID is an explicit argument."""
+    s, error = await get_discount_search(call.from_user.id, search_id)
+    if error:
+        await call.answer(error, show_alert=True)
+        return
+    if not call.message:
         await call.answer("Радар не найден", show_alert=True)
         return
 
@@ -625,12 +637,21 @@ async def cb_set_discount_menu(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("save_discount:"))
 async def cb_save_discount(call: CallbackQuery):
-    parts = call.data.split(":")
-    search_id = int(parts[1])
-    val = int(parts[2])
+    try:
+        parts = call.data.split(":")
+        search_id, val = int(parts[1]), int(parts[2])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные настройки скидки", show_alert=True)
+        return
     user_id = call.from_user.id
+    s, error = await get_discount_search(user_id, search_id)
+    if error or not 0 <= val <= 99:
+        await call.answer(error or "Процент должен быть от 0 до 99", show_alert=True)
+        return
 
-    await database.update_search_discount_percent(search_id, user_id, val)
+    if not await database.update_search_discount_percent(search_id, user_id, val):
+        await call.answer("Радар не найден", show_alert=True)
+        return
     status_text = f"скидки от -{val}%" if val > 0 else "отслеживание скидок отключено"
     log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Настройка скидки", f"Радар #{search_id} -> {status_text}", status="OK")
     await call.answer(f"✅ Сохранено: {status_text}!")
@@ -647,7 +668,15 @@ async def cb_save_discount(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("custom_discount:"))
 async def cb_prompt_custom_discount(call: CallbackQuery, state: FSMContext):
-    search_id = int(call.data.split(":")[1])
+    try:
+        search_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная кнопка радара", show_alert=True)
+        return
+    _, error = await get_discount_search(call.from_user.id, search_id)
+    if error:
+        await call.answer(error, show_alert=True)
+        return
     await state.set_state(SearchStates.waiting_for_custom_discount)
     await state.update_data(discount_search_id=search_id)
 
@@ -668,7 +697,7 @@ async def cb_prompt_custom_discount(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(SearchStates.waiting_for_custom_discount)
+@router.message(SearchStates.waiting_for_custom_discount, F.text)
 async def process_custom_discount_input(message: Message, state: FSMContext):
     raw_val = message.text.strip().replace("%", "")
     menu_buttons = {
@@ -706,7 +735,13 @@ async def process_custom_discount_input(message: Message, state: FSMContext):
     await state.clear()
 
     if search_id:
-        await database.update_search_discount_percent(search_id, message.from_user.id, percent)
+        _, error = await get_discount_search(message.from_user.id, search_id)
+        if error:
+            await message.answer(error)
+            return
+        if not await database.update_search_discount_percent(search_id, message.from_user.id, percent):
+            await message.answer("Радар не найден")
+            return
         log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Настройка скидки", f"Радар #{search_id} -> свой порог: {percent}%", status="OK")
         await message.answer(f"✅ <b>Отлично! Алерт установлен на снижение цены от -{percent}%!</b>", parse_mode="HTML")
 

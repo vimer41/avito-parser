@@ -12,6 +12,26 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "25"))
 MAX_SEARCHES_PER_USER = int(os.getenv("MAX_SEARCHES_PER_USER", "20"))
 # Количество параллельных воркеров мониторинга (по умолчанию 30)
 MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "30"))
+
+# Stars — единственный способ оплаты цифровой подписки. Включается явно.
+STARS_PAYMENTS_ENABLED = os.getenv("STARS_PAYMENTS_ENABLED", "0").strip() == "1"
+STARS_PRICE_STANDART = int(os.getenv("STARS_PRICE_STANDART", "170"))
+STARS_PRICE_PRO = int(os.getenv("STARS_PRICE_PRO", "470"))
+STARS_SUBSCRIPTION_DAYS = 30
+if STARS_PRICE_STANDART <= 0 or STARS_PRICE_PRO <= 0:
+    raise ValueError("Telegram Stars prices must be positive integers")
+if STARS_PRICE_PRO <= STARS_PRICE_STANDART:
+    raise ValueError("PRO must cost more Stars than Standart")
+
+
+def stars_price(plan: str) -> int:
+    if plan == "standart":
+        return STARS_PRICE_STANDART
+    if plan == "pro":
+        return STARS_PRICE_PRO
+    raise ValueError("Unknown tariff plan")
+
+
 def parse_proxy(raw_proxy: str | None) -> str | None:
     """
     Нормализует прокси в стандартный RFC-формат (http://LOGIN:PASS@IP:PORT).

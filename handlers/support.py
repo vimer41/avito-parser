@@ -33,6 +33,7 @@ class SupportStates(StatesGroup):
 
 @router.callback_query(F.data == "support_start_ticket")
 async def cb_support_start(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     await state.set_state(SupportStates.waiting_for_user_message)
     text = (
         "💬 <b>ОБРАЩЕНИЕ В СЛУЖБУ ПОДДЕРЖКИ</b>\n"
@@ -77,12 +78,13 @@ async def handle_user_support_message(message: Message, state: FSMContext, bot: 
         return
 
     text_content = message.text or message.caption or "(без текста, вложение)"
+    state_data = await state.get_data()
     clean_text = html.escape(text_content.strip())
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
     username_str = f"@{user.username}" if user.username else "без username"
 
     admin_caption = (
-        "📩 <b>НОВОЕ ОБРАЩЕНИЕ В ПОДДЕРЖКУ!</b>\n"
+        f"📩 <b>{'ОБРАЩЕНИЕ ПО ОПЛАТЕ / ВОЗВРАТУ' if state_data.get('payment_support') else 'НОВОЕ ОБРАЩЕНИЕ В ПОДДЕРЖКУ!'}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>От:</b> {html.escape(user.full_name)} ({username_str})\n"
         f"🆔 <b>ID:</b> <code>{user_id}</code>\n"

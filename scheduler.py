@@ -633,9 +633,11 @@ async def process_url_group(
         fetch_ms = int((time.monotonic() - fetch_t0) * 1000)
 
         if not html_content:
+            logger.info("Scan result: ok=0 elapsed_ms=%d items=0 blocked=%d", fetch_ms, int(bool(parser.is_blocked())))
             return False
 
         items = parser.parse_items(html_content)
+        logger.info("Scan result: ok=1 elapsed_ms=%d items=%d blocked=0", fetch_ms, len(items))
         w_tag = f"[W{worker_id}] " if config.MAX_CONCURRENT_WORKERS > 1 else ""
 
         if not items:

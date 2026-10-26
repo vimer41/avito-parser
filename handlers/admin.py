@@ -11,6 +11,25 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+@router.callback_query(F.data == "admin_probe")
+async def cb_admin_probe(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await call.answer("✅ Запрос получен, бот отвечает", show_alert=True)
+    await call.message.answer(
+        "✅ <b>Проверка реального запроса Telegram пройдена.</b>\n"
+        f"Stars: {'включены' if config.STARS_PAYMENTS_ENABLED else 'выключены'}, "
+        f"Standart {config.STARS_PRICE_STANDART} ⭐ / PRO {config.STARS_PRICE_PRO} ⭐.\n"
+        "Для проверки покупки нужен неадминистративный аккаунт: у администратора доступ бесплатный.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_refresh")],
+            [InlineKeyboardButton(text="💳 Тарифы", callback_data="open_subscription_menu")],
+        ]),
+    )
+    logger.info("Live Telegram probe completed by admin=%s", call.from_user.id)
+
+
 # ── Одобрение / Отклонение доступа администратором ─────────────────────
 
 @router.callback_query(F.data.startswith("admin_approve:"))
@@ -25,6 +44,7 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
     page = int(parts[2]) if is_panel else 0
 
     await database.set_user_allowed(target_user_id, 1)
+    max_radars = await database.get_user_max_radars(target_user_id)
 
     user = await database.get_or_create_user(target_user_id)
     username_str = f"@{user['username']}" if user.get("username") else f"ID {target_user_id}"
@@ -37,7 +57,7 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
             chat_id=target_user_id,
             text=(
                 "🎉 <b>Ваш доступ к AVITO RADAR успешно одобрен!</b>\n\n"
-                "Теперь вы можете отслеживать любые товары на Авито 24/7 без ограничений.\n"
+                f"Доступен мониторинг Авито 24/7: до {max_radars} радаров.\n"
                 "Нажмите кнопку ниже или отправьте ссылку на поиск, чтобы запустить первый радар!"
             ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -88,18 +108,48 @@ async def cb_admin_reject(call: CallbackQuery, bot: Bot):
 
 
 @router.callback_query(F.data.startswith("admin_grant_sub:"))
-async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
+async def cb_admin_grant_sub(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
 
     # Формат: admin_grant_sub:{user_id}:{plan}:{days}
-    parts = call.data.split(":")
-    target_user_id = int(parts[1])
-    plan = parts[2] if len(parts) > 2 else "standart"
-    days = int(parts[3]) if len(parts) > 3 else 30
+    try:
+        parts = call.data.split(":")
+        target_user_id, plan, days = int(parts[1]), parts[2], int(parts[3])
+        page = int(parts[4]) if len(parts) > 4 else 0
+        token = await database.create_admin_subscription_action(call.from_user.id, target_user_id, plan, days, page)
+    except (ValueError, IndexError, PermissionError) as exc:
+        await call.answer(str(exc) or "Неверная кнопка подписки", show_alert=True)
+        return
+    await call.message.edit_text(
+        f"💳 <b>ПОДТВЕРЖДЕНИЕ ВЫДАЧИ ПОДПИСКИ</b>\n\n"
+        f"Пользователь: <code>{target_user_id}</code>\nТариф: <b>{plan.upper()}</b>\nДобавить: <b>{days} дн.</b>\n\n"
+        "Срок добавится к текущей подписке или триалу; выбранный тариф применяется сразу. "
+        "Это ручная выдача доступа, а не подтверждение оплаты Stars.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить выдачу / продление", callback_data=f"admin_confirm_sub:{token}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_user_id}:{page}")],
+        ]),
+    )
+    await call.answer()
 
-    until = await database.grant_subscription(target_user_id, days=days, tariff_plan=plan)
+
+@router.callback_query(F.data.startswith("admin_confirm_sub:"))
+async def cb_admin_confirm_sub(call: CallbackQuery, bot: Bot):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        result = await database.apply_admin_subscription_action(call.data.split(":")[1], call.from_user.id)
+    except (ValueError, IndexError, PermissionError) as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
+    if not result["applied"]:
+        await call.answer("Эта выдача уже выполнена. Повторное нажатие не добавляет срок.", show_alert=True)
+        return
+    target_user_id, plan, days = result["user_id"], result["tariff_plan"], result["days"]
+    until = result["subscription_until"]
     max_radars = await database.get_user_max_radars(target_user_id)
     formatted_until = database.format_subscription_date(until)
 
@@ -111,11 +161,14 @@ async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
         f"👤 ID пользователя: <code>{target_user_id}</code>\n"
         f"📦 Тариф: <b>{plan_title}</b> (до {max_radars} радаров)\n"
         f"📅 Срок действия: <b>{formatted_until}</b> ({days} дн.)",
-        parse_mode="HTML"
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Карточка пользователя", callback_data=f"admin_user:{target_user_id}:{result['page']}")],
+            [InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{result['page']}")],
+        ]),
     )
     await call.answer(f"Подписка {plan_title} активирована!")
 
-    # Уведомляем пользователя об успешной оплате и активации
+    # Ручная выдача не является подтверждением финансовой операции.
     try:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt")],
@@ -125,11 +178,11 @@ async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
         await bot.send_message(
             chat_id=target_user_id,
             text=(
-                f"🎉 <b>Оплата подтверждена! Ваша подписка {plan_title} активирована!</b>\n"
+                f"🎉 <b>Администратор активировал подписку {plan_title}!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 Доступно активных радаров: <b>{max_radars} шт.</b>\n"
                 f"📅 Срок действия: <b>{formatted_until}</b> ({days} дн.)\n\n"
-                f"Все ограничения сняты! Теперь бот моментально присылает новые лоты с Авито с реальными HD фото. "
+                f"Радары доступны в пределах тарифа. Доставка новых лотов зависит от доступности Авито. "
                 f"Удачных и прибыльных покупок!"
             ),
             reply_markup=kb,
@@ -137,6 +190,79 @@ async def cb_admin_grant_sub(call: CallbackQuery, bot: Bot):
         )
     except Exception as e:
         logger.warning(f"Не удалось уведомить пользователя {target_user_id} об активации подписки: {e}")
+
+
+@router.callback_query(F.data.startswith(("admin_user:", "admin_sub_menu:", "admin_sub_days:")))
+async def cb_admin_user(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":")
+        target_id = int(parts[1])
+        plan = parts[2] if parts[0] == "admin_sub_days" else None
+        page = max(0, int(parts[3] if plan is not None else parts[2]))
+        if plan is not None and plan not in ("standart", "pro"):
+            raise ValueError("Неизвестный тариф")
+    except (ValueError, IndexError):
+        await call.answer("Некорректная кнопка пользователя", show_alert=True)
+        return
+    user = await database.get_user(target_id)
+    if not user:
+        await call.answer("Пользователь не найден", show_alert=True)
+        return
+    if config.is_admin(target_id):
+        await call.answer("Доступ администратора не требует подписки и не меняется здесь.", show_alert=True)
+        return
+    until = database.format_subscription_date(user["subscription_until"])
+    has_access = await database.is_user_allowed(target_id)
+    text = (f"👤 <b>{html.escape(user.get('first_name') or 'Пользователь')}</b>\n"
+            f"🆔 ID: <code>{target_id}</code>\n"
+            f"📦 Тариф: <b>{(user.get('tariff_plan') or 'standart').upper()}</b>\n"
+            f"🔑 Доступ: {'активен' if has_access else 'истёк / отозван'}\n📅 Срок: {until}\n\n")
+    if parts[0] == "admin_sub_menu":
+        text += "<b>Выберите тариф для выдачи / продления:</b>"
+        buttons = [
+            [InlineKeyboardButton(text="⚡️ Standart · 4 радара", callback_data=f"admin_sub_days:{target_id}:standart:{page}")],
+            [InlineKeyboardButton(text="🔥 PRO · 9 радаров и скидки", callback_data=f"admin_sub_days:{target_id}:pro:{page}")],
+        ]
+    elif parts[0] == "admin_sub_days":
+        text += f"<b>Добавить срок на тарифе {plan.upper()}:</b>"
+        buttons = [[InlineKeyboardButton(text=f"➕ {days} дн.", callback_data=f"admin_grant_sub:{target_id}:{plan}:{days}:{page}") for days in (1, 7, 30, 90)]]
+    else:
+        text += "Управление подпиской и оплатами:"
+        buttons = [
+            [InlineKeyboardButton(text="💳 Выдать / продлить → выбрать тариф", callback_data=f"admin_sub_menu:{target_id}:{page}")],
+            [InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
+            [InlineKeyboardButton(text="🚫 Отозвать доступ", callback_data=f"admin_revoke_prompt:{target_id}:{page}")],
+            [InlineKeyboardButton(text="✍️ Написать пользователю", callback_data=f"support_reply:{target_id}")],
+        ]
+    buttons.append([InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{page}")])
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_revoke_prompt:"))
+async def cb_admin_revoke_prompt(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        _, user_id, page = call.data.split(":")
+        user_id, page = int(user_id), int(page)
+    except (ValueError, IndexError):
+        await call.answer("Некорректная кнопка пользователя", show_alert=True)
+        return
+    if config.is_admin(user_id) or not await database.get_user(user_id):
+        await call.answer("Отзыв недоступен", show_alert=True)
+        return
+    await call.message.edit_text(f"🚫 Отозвать подписку / триал пользователя <code>{user_id}</code>?\n"
+                                 "Возврат Stars не выполняется автоматически.", parse_mode="HTML",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                     [InlineKeyboardButton(text="✅ Отозвать доступ", callback_data=f"admin_revoke:{user_id}:{page}")],
+                                     [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{user_id}:{page}")],
+                                 ]))
+    await call.answer()
 
 
 
@@ -198,6 +324,7 @@ async def cmd_admin_panel(event, page: int = 0):
         f"• 🛡 Защита: <b>TLS Chameleon / PoW Bypass</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>Пользователи и права доступа{page_info}:</b>\n"
+        "Нажмите «👤 Подписка» под пользователем → выдача / продление → тариф → срок → подтверждение.\n"
     ]
 
     buttons = []
@@ -223,22 +350,25 @@ async def cmd_admin_panel(event, page: int = 0):
         elif has_access and not is_allowed and trial_used:
             text_lines.append(f"{idx}. 🎁 <b>{fname}</b> ({uname}) — <i>[Триал 24ч · 1 радар] {sub_str}</i>")
             buttons.append([
-                InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke:{u_id}:{page}"),
+                InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke_prompt:{u_id}:{page}"),
                 InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")
             ])
-        elif has_access or is_allowed:
+        elif has_access:
             plan = (u.get("tariff_plan") or "standart").upper()
             text_lines.append(f"{idx}. 🟢 <b>{fname}</b> ({uname}) — <i>[{plan}] {sub_str}</i>")
             buttons.append([
-                InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke:{u_id}:{page}"),
+                InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke_prompt:{u_id}:{page}"),
                 InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")
             ])
         else:
             text_lines.append(f"{idx}. 🔴 <b>{fname}</b> ({uname}) — <i>Истёк доступ ({sub_str})</i>")
             buttons.append([
-                InlineKeyboardButton(text=f"✅ Одобрить {btn_tag}", callback_data=f"admin_approve:{u_id}:{page}"),
+                InlineKeyboardButton(text=f"💳 Выдать {btn_tag}", callback_data=f"admin_sub_menu:{u_id}:{page}"),
                 InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")
             ])
+
+        if not is_adm:
+            buttons.append([InlineKeyboardButton(text=f"👤 Подписка / платежи {btn_tag}", callback_data=f"admin_user:{u_id}:{page}")])
 
     # Панель постраничной навигации (только если пользователей > 5)
     if total_pages > 1:
@@ -289,6 +419,9 @@ async def cb_admin_revoke(call: CallbackQuery):
     target_user_id = int(parts[1])
     page = int(parts[2]) if len(parts) > 2 else 0
 
+    if config.is_admin(target_user_id):
+        await call.answer("Нельзя отозвать доступ администратора", show_alert=True)
+        return
     await database.set_user_allowed(target_user_id, 0)
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} отозвал доступ у пользователя ID:{target_user_id}")
     await call.answer("Доступ отозван")

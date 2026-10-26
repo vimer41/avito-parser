@@ -8,6 +8,10 @@ umask 077
 [[ "$DEPLOY_BRANCH" == main || "$DEPLOY_BRANCH" == feature/json-api ]] || { echo "Invalid deploy branch"; exit 1; }
 DEPLOY_FULL_TESTS="${DEPLOY_FULL_TESTS:-1}"
 [[ "$DEPLOY_FULL_TESTS" == 0 || "$DEPLOY_FULL_TESTS" == 1 ]] || { echo "DEPLOY_FULL_TESTS must be 0 or 1"; exit 1; }
+DEPLOY_STARS_PAYMENTS_ENABLED="${DEPLOY_STARS_PAYMENTS_ENABLED:-}"
+[[ -z "$DEPLOY_STARS_PAYMENTS_ENABLED" || "$DEPLOY_STARS_PAYMENTS_ENABLED" == 0 || "$DEPLOY_STARS_PAYMENTS_ENABLED" == 1 ]] || { echo "Invalid Stars enable flag"; exit 1; }
+DEPLOY_CLEANUP="${DEPLOY_CLEANUP:-1}"
+[[ "$DEPLOY_CLEANUP" == 0 || "$DEPLOY_CLEANUP" == 1 ]] || { echo "DEPLOY_CLEANUP must be 0 or 1"; exit 1; }
 
 TARGET_DIR=""
 for candidate in "${DEPLOY_TARGET_DIR:-}" /opt/avito_parser_bot /opt/avito-bot; do
@@ -36,6 +40,8 @@ ENV_CHANGED=0
 PREVIOUS_ENV=""
 WAS_ACTIVE=0
 CHANGED=0
+STARS_CONFIG_CHANGED=0
+HAD_ENV_FILE=0
 systemctl is-active --quiet avito-bot && WAS_ACTIVE=1
 
 cleanup() {
@@ -72,6 +78,13 @@ rollback() {
                 mv "$PREVIOUS_ENV" "$TARGET_DIR/venv" || true
             fi
         fi
+        if [[ "$STARS_CONFIG_CHANGED" == 1 ]]; then
+            if [[ "$HAD_ENV_FILE" == 1 ]]; then
+                cp -p "$STAGE_DIR/runtime.env.before" "$TARGET_DIR/.env" || true
+            else
+                rm -f "$TARGET_DIR/.env"
+            fi
+        fi
         if [[ "$WAS_ACTIVE" == 1 ]]; then
             systemctl start avito-bot || true
         fi
@@ -106,7 +119,14 @@ else
     echo "Minimal VPS checks passed: dependencies and syntax; full offline suite skipped (DEPLOY_FULL_TESTS=0)"
 fi
 
-# No automatic deletion or log scrubbing. Backup is read-only and precedes migrations.
+# No user deletion or log scrubbing. Backup is read-only and precedes migrations.
+if [[ -n "$DEPLOY_STARS_PAYMENTS_ENABLED" ]]; then
+    [[ ! -L "$TARGET_DIR/.env" ]] || { echo "Symlinked runtime .env cannot be changed"; exit 1; }
+    if [[ -f "$TARGET_DIR/.env" ]]; then
+        cp -p "$TARGET_DIR/.env" "$STAGE_DIR/runtime.env.before"
+        HAD_ENV_FILE=1
+    fi
+fi
 CHANGED=1
 systemctl stop avito-bot
 mkdir -p "$TARGET_DIR/backups"
@@ -138,6 +158,11 @@ if [[ -e "$TARGET_DIR/venv" || -L "$TARGET_DIR/venv" ]]; then
 fi
 ENV_CHANGED=1
 ln -s "$NEW_ENV" "$TARGET_DIR/venv"
+if [[ -n "$DEPLOY_STARS_PAYMENTS_ENABLED" ]]; then
+    STARS_CONFIG_CHANGED=1
+    "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/configure_stars.py" --env-file "$TARGET_DIR/.env" \
+        --enabled "$DEPLOY_STARS_PAYMENTS_ENABLED" --standart "${DEPLOY_STARS_PRICE_STANDART:-170}" --pro "${DEPLOY_STARS_PRICE_PRO:-470}"
+fi
 systemctl reset-failed avito-bot
 systemctl start avito-bot
 
@@ -150,3 +175,14 @@ done
 [[ "$(git rev-parse HEAD)" == "$DEPLOY_SHA" ]]
 report_state
 echo "Deployed tested commit $DEPLOY_SHA; service stayed active for 20 seconds"
+
+# Retention runs only after validation. Active/rollback environments and this
+# deployment's SQLite backup are pinned; failure never triggers a late rollback.
+if [[ "$DEPLOY_CLEANUP" == 1 ]]; then
+    if ! "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/cleanup_releases.py" --target "$TARGET_DIR" --apply \
+        --keep-releases "${DEPLOY_KEEP_RELEASES:-4}" --keep-backups "${DEPLOY_KEEP_BACKUPS:-7}" \
+        --release-age-days "${DEPLOY_RELEASE_MIN_AGE_DAYS:-7}" --backup-age-days "${DEPLOY_BACKUP_MIN_AGE_DAYS:-14}" \
+        --protect "$NEW_ENV" --protect "${PREVIOUS_ENV:-$NEW_ENV}" --protect "$BACKUP_PATH"; then
+        echo "Retention skipped/failed safely; deployed service remains active"
+    fi
+fi

@@ -1,0 +1,48 @@
+name: VPS production diagnostics
+
+on:
+  workflow_call:
+    inputs:
+      notify_admin:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      notify_admin:
+        description: Send a real Telegram diagnostic button to the primary administrator
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: avito-radar-vps-deploy
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare read-only production checks
+        run: |
+          printf "bash -s <<'AVITO_DIAGNOSTICS'\n" > .diagnostics-remote.sh
+          cat tools/diagnose.sh >> .diagnostics-remote.sh
+          printf "\nAVITO_DIAGNOSTICS\n" >> .diagnostics-remote.sh
+
+      - name: Check service, resources, SQLite, Avito and Telegram
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DIAGNOSTICS_NOTIFY_ADMIN: ${{ inputs.notify_admin && '1' || '' }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          command_timeout: 4m
+          envs: DIAGNOSTICS_NOTIFY_ADMIN
+          script_path: .diagnostics-remote.sh

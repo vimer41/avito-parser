@@ -27,4 +27,7 @@ os.environ.update({
     "LOGS_DIR": str(root / "logs"),
     "COMBINED_LOG": str(root / "bot.log"),
     "PROXY_URL": "",
+    "STARS_PAYMENTS_ENABLED": "0",
+    "STARS_PRICE_STANDART": "170",
+    "STARS_PRICE_PRO": "470",
 })

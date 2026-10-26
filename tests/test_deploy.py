@@ -29,12 +29,13 @@ class TestDeployScript(unittest.TestCase):
 
     def run_deploy(self, *, fail_tests=False, fail_service=False, stale=False,
                    posix_shell=False, test_timeout=False, python_fallback=False,
-                   unsupported_python=False, full_tests=None, preflight_failure=""):
+                    unsupported_python=False, full_tests=None, preflight_failure="", stars_enabled=None):
         with tempfile.TemporaryDirectory(prefix="avito-deploy-test-") as temporary:
             directory = Path(temporary)
             project = directory / "project"
             project.mkdir()
             (project / ".git").mkdir()
+            (project / ".env").write_text("BOT_TOKEN=fixture-secret\nSTARS_PAYMENTS_ENABLED=0\n", encoding="utf-8")
             (project / "venv").mkdir()
             (project / "venv" / "old-environment-marker").write_text("original", encoding="utf-8")
             (directory / "head").write_text(OLD_SHA, encoding="utf-8")
@@ -103,6 +104,13 @@ if [[ "$*" == *run_offline_tests.py* ]]; then
   echo "test-runtime testing=$AVITO_RADAR_TESTING no_pyc=$PYTHONDONTWRITEBYTECODE openblas=$OPENBLAS_NUM_THREADS omp=$OMP_NUM_THREADS mkl=$MKL_NUM_THREADS" >> "$MOCK_ROOT/events"
   exit "$TEST_EXIT_CODE"
 fi
+if [[ "$*" == *configure_stars.py* ]]; then
+  echo "BOT_TOKEN=fixture-secret" > "$DEPLOY_TARGET_DIR/.env"
+  echo "STARS_PAYMENTS_ENABLED=$DEPLOY_STARS_PAYMENTS_ENABLED" >> "$DEPLOY_TARGET_DIR/.env"
+fi
+if [[ "$*" == *cleanup_releases.py* ]]; then
+  echo "retention-executed" >> "$MOCK_ROOT/events"
+fi
 if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT/events"; fi
 """)
             prefix = bash_path(binary)
@@ -122,6 +130,9 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
                 env.pop("DEPLOY_FULL_TESTS", None)
             else:
                 env["DEPLOY_FULL_TESTS"] = full_tests
+            env.pop("DEPLOY_STARS_PAYMENTS_ENABLED", None)
+            if stars_enabled is not None:
+                env["DEPLOY_STARS_PAYMENTS_ENABLED"] = stars_enabled
             if posix_shell:
                 wrapper = directory / "wrapper.sh"
                 wrapper.write_text("bash -s <<'AVITO_DEPLOY_SCRIPT'\n" + (ROOT / "tools/deploy.sh").read_text(encoding="utf-8") + "\nAVITO_DEPLOY_SCRIPT\n", encoding="utf-8", newline="\n")
@@ -132,6 +143,7 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
             head = (directory / "head").read_text(encoding="utf-8").strip()
             events_path = directory / "events"
             events = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+            events += "\nruntime-env:" + (project / ".env").read_text(encoding="utf-8")
             old_environment = (project / "venv" / "old-environment-marker").is_file()
             release_count = len(list((project / ".releases").glob("venv-*")))
             return result, head, events, old_environment, release_count
@@ -257,6 +269,28 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
         self.assertEqual(release_count, 0)
         self.assertIn("DEPLOY_FULL_TESTS must be 0 or 1", result.stdout)
         self.assertNotIn("build-env", events)
+        self.assertNotIn("systemctl stop", events)
+
+    def test_stars_runtime_setting_is_applied_after_backup_and_before_start(self):
+        result, head, events, _, _ = self.run_deploy(full_tests="0", stars_enabled="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(head, TEST_SHA)
+        self.assertLess(events.index("backup-created"), events.index("configure_stars.py"))
+        self.assertLess(events.index("configure_stars.py"), events.index("systemctl start"))
+        self.assertIn("runtime-env:BOT_TOKEN=fixture-secret\nSTARS_PAYMENTS_ENABLED=1", events)
+        self.assertGreater(events.index("retention-executed"), events.rindex("systemctl show"))
+
+    def test_failed_stars_activation_restores_previous_runtime_setting(self):
+        result, head, events, _, _ = self.run_deploy(full_tests="0", stars_enabled="1", fail_service=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(head, OLD_SHA)
+        self.assertIn("runtime-env:BOT_TOKEN=fixture-secret\nSTARS_PAYMENTS_ENABLED=0", events)
+        self.assertNotIn("retention-executed", events)
+
+    def test_invalid_stars_setting_never_stops_running_bot(self):
+        result, head, events, _, _ = self.run_deploy(full_tests="0", stars_enabled="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(head, OLD_SHA)
         self.assertNotIn("systemctl stop", events)
 
 

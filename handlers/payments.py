@@ -1,0 +1,258 @@
+import asyncio
+import html
+import logging
+
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Message, PreCheckoutQuery
+
+import billing
+import config
+import database
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+@router.message(Command("terms"))
+@router.callback_query(F.data == "payment_terms")
+async def payment_terms(event):
+    message = event.message if isinstance(event, CallbackQuery) else event
+    text = (
+        "⭐ <b>УСЛОВИЯ ПОДПИСКИ</b>\n\n"
+        f"Standart: {config.STARS_PRICE_STANDART} ⭐, до 4 радаров.\n"
+        f"PRO: {config.STARS_PRICE_PRO} ⭐, до 9 радаров и алерты на скидки.\n\n"
+        "Разовая оплата за 30 дней, <b>без автосписания</b>. Подписка включается после подтверждения Telegram. "
+        "Неиспользованный срок подписки или триала сохраняется: 30 дней добавляются к дате окончания, "
+        "а выбранный тариф применяется сразу ко всему оставшемуся сроку.\n\n"
+        "Скорость и доступность объявлений зависят от Авито, его ограничений, сети и нагрузки сервера; "
+        "опережение других покупателей не гарантируется.\n\n"
+        "Проблема с оплатой или запрос возврата: <b>/paysupport</b>. Возврат рассматривает администратор "
+        "и выполняет через Telegram в Stars; доступ по возвращённому платежу отменяется. "
+        "При нескольких продлениях или ручных изменениях подписки срок сверяется поддержкой.\n\n"
+        "Нажимая «Согласен с условиями — оплатить», вы принимаете эти условия."
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Тарифы", callback_data="open_subscription_menu")],
+        [InlineKeyboardButton(text="💬 Поддержка платежей", callback_data="payment_support")],
+    ]))
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+
+
+@router.callback_query(F.data.startswith(("demo_tariff:", "pay_request:")))
+async def legacy_checkout(call: CallbackQuery):
+    # Old messages must not resurrect card/crypto payments or demo activation.
+    from handlers.common import cb_select_tariff
+    await cb_select_tariff(call)
+
+
+@router.callback_query(F.data.startswith("stars_buy:"))
+async def buy_stars(call: CallbackQuery, bot: Bot, state: FSMContext):
+    try:
+        _, plan, displayed_price = call.data.split(":")
+        if int(displayed_price) != config.stars_price(plan):
+            raise billing.PaymentValidationError("Цена изменилась. Откройте тариф заново и подтвердите новые условия.")
+        if not call.message or call.message.chat.type != "private" or call.message.chat.id != call.from_user.id:
+            raise billing.PaymentValidationError("Оплата доступна только в личном чате с ботом.")
+        order = await billing.create_order(call.from_user.id, plan)
+    except ValueError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
+    await state.clear()
+    await call.answer("Открываю счёт Telegram Stars")
+    try:
+        await bot.send_invoice(
+            chat_id=call.from_user.id,
+            title=f"AVITO RADAR · {plan.upper()} · 30 дней",
+            description=f"До {9 if plan == 'pro' else 4} радаров. Разовая подписка, без автосписания. Условия: /terms. Поддержка и возврат: /paysupport.",
+            payload=order["payload"], provider_token="", currency="XTR",
+            prices=[LabeledPrice(label="Подписка на 30 дней", amount=order["total_amount"])],
+            start_parameter="tariffs", protect_content=True,
+        )
+    except Exception as exc:
+        logger.warning("Stars invoice delivery failed: order=%s error=%s", order["id"], type(exc).__name__)
+        await call.message.answer("Не удалось отправить счёт. Деньги не списаны; попробуйте снова или откройте /paysupport.")
+
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery, bot: Bot):
+    try:
+        await asyncio.wait_for(billing.approve_checkout(
+            query.id, query.from_user.id, query.invoice_payload, query.currency, query.total_amount,
+        ), timeout=4)
+    except billing.PaymentValidationError as exc:
+        await bot.answer_pre_checkout_query(pre_checkout_query_id=query.id, ok=False, error_message=str(exc))
+    except Exception as exc:
+        logger.error("Stars precheckout unavailable: %s", type(exc).__name__)
+        await bot.answer_pre_checkout_query(pre_checkout_query_id=query.id, ok=False,
+                                           error_message="Не удалось проверить счёт. Списание отменено; попробуйте позже.")
+    else:
+        await bot.answer_pre_checkout_query(pre_checkout_query_id=query.id, ok=True)
+
+
+async def notify_admins(bot: Bot, text: str, user_id: int):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Пользователь / платежи", callback_data=f"admin_user:{user_id}:0")],
+        [InlineKeyboardButton(text="✍️ Ответить", callback_data=f"support_reply:{user_id}")],
+    ])
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
+        except Exception as exc:
+            logger.warning("Payment admin notification failed: %s", type(exc).__name__)
+
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message, bot: Bot):
+    payment = message.successful_payment
+    try:
+        order = await billing.complete_payment(
+            message.from_user.id, payment.invoice_payload, payment.currency, payment.total_amount,
+            payment.telegram_payment_charge_id, payment.provider_payment_charge_id,
+        )
+    except billing.PaymentValidationError as exc:
+        logger.error("Stars confirmed payment requires review: user=%s reason=%s", message.from_user.id, exc)
+        await message.answer("Telegram подтвердил оплату, но автоматическая сверка не прошла. Поддержка уведомлена; откройте /paysupport.")
+        await notify_admins(bot, f"⚠️ <b>Нужна сверка подтверждённого платежа</b>\nID: <code>{message.from_user.id}</code>\n"
+                            f"Charge: <code>{html.escape(payment.telegram_payment_charge_id)}</code>\n{html.escape(str(exc))}", message.from_user.id)
+        return
+    # The transaction is committed before any notification; re-delivery cannot add days twice.
+    if not order["applied"]:
+        await message.answer("Этот платёж уже обработан. Текущая подписка доступна в /profile; вопросы — /paysupport.")
+        return
+    await message.answer(
+        f"✅ <b>Оплата {order['total_amount']} ⭐ подтверждена!</b>\n"
+        f"Тариф: <b>{order['tariff_plan'].upper()}</b>, до {9 if order['tariff_plan'] == 'pro' else 4} радаров.\n"
+        f"Добавлено {order['days']} дней. Действует: {database.format_subscription_date(order['subscription_after'])}\n"
+        f"Номер заказа: <code>{order['id']}</code>. Без автосписания. Поддержка: /paysupport.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")],
+            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")],
+        ]),
+    )
+    logger.info("Stars payment fulfilled: order=%s user=%s plan=%s amount=%s", order["id"], order["user_id"], order["tariff_plan"], order["total_amount"])
+
+
+@router.message(Command("paysupport"))
+@router.callback_query(F.data == "payment_support")
+async def payment_support(event, state: FSMContext):
+    from handlers.support import SupportStates
+    user = event.from_user
+    orders = await billing.list_orders(user.id)
+    text = "💬 <b>ПОДДЕРЖКА ПЛАТЕЖЕЙ / ВОЗВРАТ</b>\n\n"
+    if orders:
+        text += "Последние платежи:\n" + "\n".join(
+            f"• #{o['id']} · {o['tariff_plan'].upper()} · {o['total_amount']} ⭐ · "
+            f"{'возвращён' if o['status'] == 'refunded' else 'возврат обрабатывается' if o['status'] == 'refunding' else 'оплачен'}"
+            for o in orders
+        ) + "\n\n"
+    text += "Опишите проблему или запрос возврата следующим сообщением; укажите номер заказа, если он известен. Администраторы ответят прямо здесь."
+    await state.set_state(SupportStates.waiting_for_user_message)
+    await state.update_data(payment_support=True)
+    message = event.message if isinstance(event, CallbackQuery) else event
+    await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="support_cancel")],
+    ]))
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+
+
+@router.callback_query(F.data.startswith("admin_payments:"))
+async def admin_payments(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        user_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректный пользователь", show_alert=True)
+        return
+    orders = await billing.list_orders(user_id)
+    lines = [f"⭐ <b>ПЛАТЕЖИ ПОЛЬЗОВАТЕЛЯ {user_id}</b>"]
+    buttons = []
+    for order in orders:
+        lines.append(f"#{order['id']} · {order['tariff_plan'].upper()} · {order['total_amount']} ⭐ · {order['status']}"
+                     + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else ""))
+        if order["status"] in ("paid", "refunding"):
+            buttons.append([InlineKeyboardButton(text=f"↩️ Вернуть #{order['id']} ({order['total_amount']} ⭐)", callback_data=f"admin_refund_prompt:{order['id']}")])
+    if not orders:
+        lines.append("Подтверждённых платежей пока нет.")
+    buttons.append([InlineKeyboardButton(text="« Карточка пользователя", callback_data=f"admin_user:{user_id}:0")])
+    await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_refund_prompt:"))
+async def refund_prompt(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        order = await billing.get_order(order_id=int(call.data.split(":")[1]))
+    except (ValueError, IndexError):
+        order = None
+    if not order or not order["telegram_payment_charge_id"] or order["status"] == "refunded":
+        await call.answer("Платёж не найден или уже возвращён", show_alert=True)
+        return
+    await call.message.edit_text(
+        f"↩️ Вернуть <b>{order['total_amount']} ⭐</b> по заказу #{order['id']} пользователю {order['user_id']}?\n\n"
+        "Оплаченное этим платежом продление будет отменено. Если после него были другие платежи или ручные изменения, "
+        "система не перезапишет их: потребуется сверить срок подписки вручную.", parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить возврат Stars", callback_data=f"admin_refund:{order['id']}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_payments:{order['user_id']}")],
+        ]),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_refund:"))
+async def refund_payment(call: CallbackQuery, bot: Bot):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        order = await billing.begin_refund(int(call.data.split(":")[1]), call.from_user.id)
+    except (ValueError, IndexError) as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
+    if not order["request"]:
+        await call.answer("Платёж уже возвращён", show_alert=True)
+        return
+    await call.answer("Выполняю возврат через Telegram")
+    try:
+        if not await bot.refund_star_payment(user_id=order["user_id"], telegram_payment_charge_id=order["telegram_payment_charge_id"]):
+            await billing.cancel_refund(order["id"])
+            await call.message.answer("Telegram не подтвердил возврат. Подписка не изменена.")
+            return
+    except TelegramBadRequest as exc:
+        if "CHARGE_ALREADY_REFUNDED" not in str(exc).upper():
+            await billing.cancel_refund(order["id"])
+            await call.message.answer("Telegram отклонил возврат. Проверьте платёж и баланс Stars; подписка не изменена.")
+            return
+    except Exception as exc:
+        logger.warning("Stars refund ambiguous: order=%s error=%s", order["id"], type(exc).__name__)
+        await call.message.answer("Ответ Telegram не получен. Подписка пока не изменена; повторите сверку через 5 минут.")
+        return
+    result = await billing.complete_refund(order["telegram_payment_charge_id"])
+    await call.message.answer(f"✅ Возврат {order['total_amount']} ⭐ подтверждён."
+                              + (" ⚠️ После платежа подписка менялась: сверить срок вручную в карточке пользователя." if result["refund_needs_review"] else " Продление по этому платежу отменено."))
+    try:
+        await bot.send_message(order["user_id"], f"↩️ Заказ #{order['id']}: Telegram подтвердил возврат {order['total_amount']} ⭐. Вопросы: /paysupport.")
+    except Exception:
+        logger.warning("Refund user notification failed: order=%s", order["id"])
+
+
+@router.message(F.refunded_payment)
+async def refunded_payment(message: Message, bot: Bot):
+    payment = message.refunded_payment
+    order = await billing.get_order(charge_id=payment.telegram_payment_charge_id)
+    if not order or payment.currency != "XTR" or payment.total_amount != order["total_amount"] or payment.invoice_payload != order["payload"]:
+        await notify_admins(bot, "⚠️ Возврат Telegram не совпадает с записью платежа. Нужна ручная сверка.", message.from_user.id)
+        return
+    result = await billing.complete_refund(payment.telegram_payment_charge_id)
+    if result["applied"] and result["refund_needs_review"]:
+        await notify_admins(bot, f"⚠️ Заказ #{order['id']} возвращён; подписка менялась после оплаты. Сверьте срок вручную.", order["user_id"])

@@ -30,6 +30,7 @@ avito_cookies.json
 backups/
 .deploy.lock
 .deploy-remote.sh
+.diagnostics-remote.sh
 
 # Local Documentation & Guides
 DEPLOY_AND_MONETIZATION_GUIDE.md

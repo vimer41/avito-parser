@@ -7,6 +7,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
@@ -67,7 +68,7 @@ async def setup_bot_profile(bot: Bot):
     bot_description = (
         "🔥 AVITO RADAR — перехватывай лучшие предложения с выгодой!\n\n"
         "📌 Мониторинг Авито 24/7!\n"
-        "Мгновенные оповещения о новых лотах за 1–3 секунды до конкурентов.\n\n"
+        "Оповещения о новых лотах после проверки Авито.\n\n"
         "🎯 Что умеет бот?\n"
         "✔️ Доставка новинок с реальными живыми HD фото\n"
         "✔️ 📉 Price Drop 💎: авто-алерт при снижении цен продавцом\n"
@@ -76,13 +77,21 @@ async def setup_bot_profile(bot: Bot):
         "🎁 Бонус! Нажмите «Старт» и получите 24 часа бесплатного тест-драйва прямо сейчас!"
     )
 
-    bot_short_description = "⚡️ Мгновенный перехват новых объявлений и скидок на Авито 24/7. HD фото и алерты раньше перекупов!"
+    bot_short_description = "⚡️ Мониторинг новых объявлений и скидок на Авито 24/7. Фото, стоп-слова и алерты на снижение цен."
 
     try:
         await bot.set_my_description(description=bot_description, language_code="ru")
         await bot.set_my_description(description=bot_description)
         await bot.set_my_short_description(short_description=bot_short_description, language_code="ru")
         await bot.set_my_short_description(short_description=bot_short_description)
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Главное меню"),
+            BotCommand(command="tariffs", description="Тарифы и оплата Telegram Stars"),
+            BotCommand(command="profile", description="Моя подписка и радары"),
+            BotCommand(command="help", description="Инструкция"),
+            BotCommand(command="terms", description="Условия подписки и возврата"),
+            BotCommand(command="paysupport", description="Помощь с оплатой / возврат Stars"),
+        ])
         logger.info("Презентационное описание бота (до /start) успешно обновлено в Telegram API!")
     except Exception as e:
         logger.warning(f"Не удалось обновить описание бота в Telegram API: {e}")
@@ -118,6 +127,9 @@ async def main():
         # A deploy must not discard unread Telegram updates.
         await bot.delete_webhook(drop_pending_updates=False)
         await setup_bot_profile(bot)
+        logger.info("Stars checkout: enabled=%s standart=%s pro=%s days=%s",
+                    config.STARS_PAYMENTS_ENABLED, config.STARS_PRICE_STANDART,
+                    config.STARS_PRICE_PRO, config.STARS_SUBSCRIPTION_DAYS)
         background_tasks = start_background_services(bot)
         logger.info("Бот успешно запущен и готов к работе!")
         await dp.start_polling(bot)

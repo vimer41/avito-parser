@@ -92,7 +92,54 @@ async def init_db():
         await ensure_columns(db, "users", {
             "is_allowed": "INTEGER DEFAULT 0", "subscription_until": "TIMESTAMP",
             "trial_used": "INTEGER DEFAULT 0", "tariff_plan": "TEXT DEFAULT 'standart'",
+            "subscription_revision": "INTEGER NOT NULL DEFAULT 0",
         })
+
+        # Финансовые записи не удаляются вместе с пользователем: они нужны для
+        # идемпотентности событий Telegram, поддержки и возвратов.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS stars_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                tariff_plan TEXT NOT NULL CHECK(tariff_plan IN ('standart', 'pro')),
+                total_amount INTEGER NOT NULL CHECK(total_amount > 0),
+                days INTEGER NOT NULL CHECK(days > 0),
+                status TEXT NOT NULL DEFAULT 'pending',
+                pre_checkout_query_id TEXT,
+                approved_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                telegram_payment_charge_id TEXT UNIQUE,
+                provider_payment_charge_id TEXT,
+                paid_at TIMESTAMP,
+                subscription_before TIMESTAMP,
+                tariff_before TEXT,
+                allowed_before INTEGER,
+                trial_before INTEGER,
+                subscription_after TIMESTAMP,
+                tariff_after TEXT,
+                revision_after INTEGER,
+                refund_requested_at TIMESTAMP,
+                refund_admin_id INTEGER,
+                refunded_at TIMESTAMP,
+                refund_needs_review INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS stars_orders_user ON stars_orders(user_id, id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_subscription_actions (
+                token TEXT PRIMARY KEY,
+                admin_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                tariff_plan TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                page INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                applied_at TIMESTAMP,
+                subscription_until TIMESTAMP
+            )
+        """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS searches (
@@ -264,7 +311,7 @@ async def set_user_allowed(user_id: int, is_allowed: int = 1):
     """Устанавливает статус разрешения доступа (1 = одобрен, 0 = заблокирован)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET is_allowed = ?, subscription_until = NULL, trial_used = 1 WHERE user_id = ?",
+            "UPDATE users SET is_allowed = ?, subscription_until = NULL, trial_used = 1, subscription_revision = subscription_revision + 1 WHERE user_id = ?",
             (int(bool(is_allowed)), user_id),
         )
         await db.commit()
@@ -277,6 +324,15 @@ async def get_all_users() -> List[Dict[str, Any]]:
         async with db.execute("SELECT * FROM users ORDER BY created_at DESC") as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+
+async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
+    """Read without registering an unknown user or activating a trial."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
 
 async def update_user_default_template(user_id: int, template: str):
@@ -734,41 +790,79 @@ async def activate_trial(user_id: int) -> Dict[str, Any]:
         return {"success": True, "message": "Пробный период 24 часа успешно активирован!", "until": until}
 
 
-async def grant_subscription(user_id: int, days: int = 30, tariff_plan: Optional[str] = None) -> str:
-    """Выдаёт или продлевает подписку на N дней и опционально обновляет тариф."""
+async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_plan: Optional[str] = None) -> str:
+    """Shared atomic update; the caller owns the transaction and commit."""
     if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
         raise ValueError("days must be a positive integer")
     if tariff_plan is not None and tariff_plan.lower() not in ("standart", "pro"):
         raise ValueError("Unknown tariff plan")
-    async with aiosqlite.connect(DB_PATH) as db:
-        if tariff_plan:
-            await db.execute("""
-                UPDATE users 
-                SET subscription_until = CASE 
-                    WHEN subscription_until > datetime('now') 
-                    THEN datetime(subscription_until, '+' || ? || ' days')
-                    ELSE datetime('now', '+' || ? || ' days')
-                END,
-                tariff_plan = ?,
-                is_allowed = 1
-                WHERE user_id = ?
-            """, (days, days, tariff_plan.lower(), user_id))
-        else:
-            await db.execute("""
-                UPDATE users 
-                SET subscription_until = CASE 
-                    WHEN subscription_until > datetime('now') 
-                    THEN datetime(subscription_until, '+' || ? || ' days')
-                    ELSE datetime('now', '+' || ? || ' days')
-                END,
-                is_allowed = 1
-                WHERE user_id = ?
-            """, (days, days, user_id))
-        await db.commit()
+    cursor = await db.execute("""
+        UPDATE users
+        SET subscription_until = datetime(
+                CASE WHEN subscription_until > datetime('now') THEN subscription_until ELSE datetime('now') END,
+                '+' || ? || ' days'),
+            tariff_plan = COALESCE(?, tariff_plan),
+            is_allowed = 1, trial_used = 1,
+            subscription_revision = subscription_revision + 1
+        WHERE user_id = ?
+    """, (days, tariff_plan.lower() if tariff_plan else None, user_id))
+    if cursor.rowcount != 1:
+        raise ValueError("Пользователь не найден")
+    async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        return (await cursor.fetchone())[0]
 
-        async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (user_id,)) as cur:
-            r = await cur.fetchone()
-            return r[0] if r else ""
+
+async def grant_subscription(user_id: int, days: int = 30, tariff_plan: Optional[str] = None) -> str:
+    """Выдаёт или продлевает подписку на N дней и опционально обновляет тариф."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        until = await grant_subscription_in_transaction(db, user_id, days, tariff_plan)
+        await db.commit()
+        return until
+
+
+async def create_admin_subscription_action(admin_id: int, user_id: int, plan: str, days: int, page: int = 0) -> str:
+    if admin_id not in ADMIN_IDS or user_id in ADMIN_IDS:
+        raise PermissionError("Нельзя изменять подписку администратора")
+    if plan not in ("standart", "pro") or days not in (1, 7, 30, 90):
+        raise ValueError("Неверный тариф или срок")
+    token = secrets.token_hex(16)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            INSERT INTO admin_subscription_actions(token, admin_id, user_id, tariff_plan, days, page)
+            SELECT ?, ?, user_id, ?, ?, ? FROM users WHERE user_id = ?
+        """, (token, admin_id, plan, days, max(0, page), user_id))
+        if cursor.rowcount != 1:
+            raise ValueError("Пользователь не найден")
+        await db.commit()
+    return token
+
+
+async def apply_admin_subscription_action(token: str, admin_id: int) -> Dict[str, Any]:
+    if admin_id not in ADMIN_IDS:
+        raise PermissionError("У вас нет прав администратора")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("""
+            SELECT * FROM admin_subscription_actions WHERE token = ? AND admin_id = ?
+              AND (applied_at IS NOT NULL OR created_at > datetime('now', '-1 day'))
+        """, (token, admin_id)) as cursor:
+            row = await cursor.fetchone()
+        if not row or row["user_id"] in ADMIN_IDS:
+            raise ValueError("Подтверждение истекло или недоступно")
+        result = dict(row)
+        result["applied"] = row["applied_at"] is None
+        if result["applied"]:
+            result["subscription_until"] = await grant_subscription_in_transaction(
+                db, row["user_id"], row["days"], row["tariff_plan"],
+            )
+            await db.execute("""
+                UPDATE admin_subscription_actions SET applied_at = datetime('now'), subscription_until = ?
+                WHERE token = ?
+            """, (result["subscription_until"], token))
+            await db.commit()
+        return result
 
 
 async def deactivate_user_searches(user_id: int):
@@ -953,6 +1047,7 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
             # Удаляем заблокированных продавцов
             await db.execute("DELETE FROM blocked_sellers WHERE user_id = ?", (uid,))
             # Удаляем самого пользователя
+            await db.execute("DELETE FROM admin_subscription_actions WHERE user_id = ? AND applied_at IS NULL", (uid,))
             await db.execute("DELETE FROM users WHERE user_id = ?", (uid,))
 
         await db.commit()

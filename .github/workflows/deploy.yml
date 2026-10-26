@@ -47,7 +47,9 @@ jobs:
         run: python -B tools/check_syntax.py
 
       - name: Validate deploy script syntax
-        run: bash -n tools/deploy.sh
+        run: |
+          bash -n tools/deploy.sh
+          bash -n tools/diagnose.sh
 
       - name: Run isolated offline regression suite
         env:
@@ -82,6 +84,15 @@ jobs:
           # Temporary fast VPS preflight; CI still runs the complete suite.
           # Set the Actions variable DEPLOY_FULL_TESTS=1 to restore VPS retests.
           DEPLOY_FULL_TESTS: ${{ vars.DEPLOY_FULL_TESTS || '0' }}
+          # Empty preserves runtime settings; set explicitly to enable/disable sales.
+          DEPLOY_STARS_PAYMENTS_ENABLED: ${{ vars.STARS_PAYMENTS_ENABLED }}
+          DEPLOY_STARS_PRICE_STANDART: ${{ vars.STARS_PRICE_STANDART || '170' }}
+          DEPLOY_STARS_PRICE_PRO: ${{ vars.STARS_PRICE_PRO || '470' }}
+          DEPLOY_CLEANUP: ${{ vars.DEPLOY_CLEANUP || '1' }}
+          DEPLOY_KEEP_RELEASES: ${{ vars.DEPLOY_KEEP_RELEASES || '4' }}
+          DEPLOY_KEEP_BACKUPS: ${{ vars.DEPLOY_KEEP_BACKUPS || '7' }}
+          DEPLOY_RELEASE_MIN_AGE_DAYS: ${{ vars.DEPLOY_RELEASE_MIN_AGE_DAYS || '7' }}
+          DEPLOY_BACKUP_MIN_AGE_DAYS: ${{ vars.DEPLOY_BACKUP_MIN_AGE_DAYS || '14' }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USERNAME }}
@@ -90,6 +101,15 @@ jobs:
           fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
           port: 22
           command_timeout: 18m
-          envs: DEPLOY_SHA,DEPLOY_BRANCH,DEPLOY_FULL_TESTS
+          envs: DEPLOY_SHA,DEPLOY_BRANCH,DEPLOY_FULL_TESTS,DEPLOY_STARS_PAYMENTS_ENABLED,DEPLOY_STARS_PRICE_STANDART,DEPLOY_STARS_PRICE_PRO,DEPLOY_CLEANUP,DEPLOY_KEEP_RELEASES,DEPLOY_KEEP_BACKUPS,DEPLOY_RELEASE_MIN_AGE_DAYS,DEPLOY_BACKUP_MIN_AGE_DAYS
           script_path: .deploy-remote.sh
+
+  diagnostics:
+    name: Check installed bot and production resources
+    needs: deploy
+    if: vars.PRODUCTION_DIAGNOSTICS == '1'
+    uses: ./.github/workflows/diagnostics.yml
+    with:
+      notify_admin: ${{ vars.DIAGNOSTICS_NOTIFY_ADMIN == '1' }}
+    secrets: inherit
 
