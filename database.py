@@ -335,6 +335,71 @@ async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
             return dict(row) if row else None
 
 
+async def find_users_by_query(query: str) -> List[Dict[str, Any]]:
+    """Поиск пользователей по ID, @username или имени (регистронезависимо)."""
+    clean_q = query.strip().lstrip("@")
+    if not clean_q:
+        return []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        results = []
+        if clean_q.isdigit():
+            target_id = int(clean_q)
+            async with db.execute("SELECT * FROM users WHERE user_id = ?", (target_id,)) as cur:
+                row = await cur.fetchone()
+                if row:
+                    results.append(dict(row))
+
+        like_str = f"%{clean_q}%"
+        async with db.execute("""
+            SELECT * FROM users 
+            WHERE username LIKE ? OR first_name LIKE ? OR CAST(user_id AS TEXT) LIKE ?
+            ORDER BY user_id DESC
+            LIMIT 20
+        """, (like_str, like_str, like_str)) as cur:
+            rows = await cur.fetchall()
+            existing_ids = {u["user_id"] for u in results}
+            for r in rows:
+                if r["user_id"] not in existing_ids:
+                    results.append(dict(r))
+        return results
+
+
+async def grant_vip_access(user_id: int, tariff_plan: str = "pro") -> Dict[str, Any]:
+    """Предоставляет бессрочный доступ (VIP) с указанным тарифом."""
+    plan = tariff_plan.lower() if tariff_plan in ("standart", "pro") else "pro"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE users 
+            SET is_allowed = 1,
+                subscription_until = NULL,
+                tariff_plan = ?,
+                trial_used = 1,
+                subscription_revision = subscription_revision + 1
+            WHERE user_id = ?
+        """, (plan, user_id))
+        await db.commit()
+    user = await get_user(user_id)
+    return user or {}
+
+
+async def reset_user_trial(user_id: int) -> Dict[str, Any]:
+    """Сбрасывает и активирует 5-часовой пробный период для пользователя."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE users 
+            SET trial_used = 1,
+                subscription_until = datetime('now', '+5 hours'),
+                tariff_plan = 'standart',
+                is_allowed = 0,
+                subscription_revision = subscription_revision + 1
+            WHERE user_id = ?
+        """, (user_id,))
+        await db.commit()
+    user = await get_user(user_id)
+    return user or {}
+
+
 async def update_user_default_template(user_id: int, template: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -824,7 +889,7 @@ async def grant_subscription(user_id: int, days: int = 30, tariff_plan: Optional
 async def create_admin_subscription_action(admin_id: int, user_id: int, plan: str, days: int, page: int = 0) -> str:
     if admin_id not in ADMIN_IDS or user_id in ADMIN_IDS:
         raise PermissionError("Нельзя изменять подписку администратора")
-    if plan not in ("standart", "pro") or days not in (1, 7, 30, 90):
+    if plan not in ("standart", "pro") or days not in (1, 7, 14, 30, 90, 180, 365):
         raise ValueError("Неверный тариф или срок")
     token = secrets.token_hex(16)
     async with aiosqlite.connect(DB_PATH) as db:

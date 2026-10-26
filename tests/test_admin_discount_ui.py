@@ -17,7 +17,7 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.db_patch.start()
         await database.init_db()
         self.user_id = 123456
-        await database.get_or_create_user(self.user_id)
+        await database.get_or_create_user(self.user_id, username="fixture_user", first_name="Fixture")
         await database.grant_subscription(self.user_id, 30, "pro")
         self.radar_id = await database.add_search(self.user_id, "Fixture radar", "https://www.avito.ru/search")
         self.setup_dispatcher()
@@ -147,3 +147,46 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback("admin_probe", config.ADMIN_ID)
         self.assertIn("Запрос получен", self.methods("AnswerCallbackQuery")[-1].text)
         self.assertIn("реального запроса Telegram", self.methods("SendMessage")[-1].text)
+
+    async def test_admin_search_user_by_id_and_username(self):
+        # 1. Поиск по ID через команду /find
+        await self.dispatch_message(text=f"/find {self.user_id}", user_id=config.ADMIN_ID)
+        self.assertIn("КАРТОЧКА ПОЛЬЗОВАТЕЛЯ", self.methods("SendMessage")[-1].text)
+        self.assertIn(str(self.user_id), self.methods("SendMessage")[-1].text)
+
+        # 2. Поиск по @username через интерактивную кнопку
+        await self.dispatch_callback("admin_search_user_prompt", config.ADMIN_ID)
+        self.assertIn("ПОИСК ПОЛЬЗОВАТЕЛЯ", self.methods("EditMessageText")[-1].text)
+        await self.dispatch_message(text="@fixture_user", user_id=config.ADMIN_ID)
+        self.assertIn("КАРТОЧКА ПОЛЬЗОВАТЕЛЯ", self.methods("SendMessage")[-1].text)
+
+        # 3. Поиск несуществующего пользователя
+        await self.dispatch_message(text="/find non_existent_user_99999", user_id=config.ADMIN_ID)
+        self.assertIn("не найден", self.methods("SendMessage")[-1].text)
+
+    async def test_admin_grant_vip_and_reset_trial_notifications(self):
+        # 1. Выдача бессрочного VIP
+        await self.dispatch_callback(f"admin_grant_vip_prompt:{self.user_id}:pro:0", config.ADMIN_ID)
+        self.assertIn(f"admin_confirm_vip:{self.user_id}:pro:0", self.callback_values())
+        await self.dispatch_callback(f"admin_confirm_vip:{self.user_id}:pro:0", config.ADMIN_ID)
+        self.assertTrue(await database.is_user_allowed(self.user_id))
+        user = await database.get_user(self.user_id)
+        self.assertIsNone(user["subscription_until"])
+        self.assertEqual(user["tariff_plan"], "pro")
+        notices = [m for m in self.methods("SendMessage") if m.chat_id == self.user_id]
+        self.assertTrue(any("VIP-доступ" in m.text for m in notices))
+
+        # 2. Активация 5-часового триала
+        await self.dispatch_callback(f"admin_reset_trial_prompt:{self.user_id}:0", config.ADMIN_ID)
+        self.assertIn(f"admin_confirm_trial:{self.user_id}:0", self.callback_values())
+        await self.dispatch_callback(f"admin_confirm_trial:{self.user_id}:0", config.ADMIN_ID)
+        user_trial = await database.get_user(self.user_id)
+        self.assertIsNotNone(user_trial["subscription_until"])
+        notices2 = [m for m in self.methods("SendMessage") if m.chat_id == self.user_id]
+        self.assertTrue(any("5 часов" in m.text for m in notices2))
+
+    async def test_admin_view_user_radars(self):
+        await self.dispatch_callback(f"admin_user_radars:{self.user_id}:0", config.ADMIN_ID)
+        text = self.methods("EditMessageText")[-1].text
+        self.assertIn("РАДАРЫ ПОЛЬЗОВАТЕЛЯ", text)
+        self.assertIn("Fixture radar", text)

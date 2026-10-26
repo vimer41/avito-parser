@@ -2,6 +2,8 @@ import html
 import logging
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 import config
@@ -9,6 +11,10 @@ import database
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+class AdminStates(StatesGroup):
+    waiting_for_user_query = State()
 
 
 @router.callback_query(F.data == "admin_probe")
@@ -192,6 +198,68 @@ async def cb_admin_confirm_sub(call: CallbackQuery, bot: Bot):
         logger.warning(f"Не удалось уведомить пользователя {target_user_id} об активации подписки: {e}")
 
 
+async def render_user_card_data(target_id: int, page: int = 0):
+    user = await database.get_user(target_id)
+    if not user:
+        return None, None
+    has_access = await database.is_user_allowed(target_id)
+    until = database.format_subscription_date(user.get("subscription_until"))
+    plan_name = (user.get("tariff_plan") or "standart").upper()
+    trial_used = bool(user.get("trial_used"))
+    is_allowed = bool(user.get("is_allowed"))
+
+    user_radars = await database.get_user_searches(target_id)
+    active_radars = sum(1 for r in user_radars if r.get("is_active", 1))
+    max_radars = await database.get_user_max_radars(target_id)
+    blocked_count = len(await database.get_user_blocked_sellers_list(target_id))
+
+    if has_access and not is_allowed and trial_used:
+        status_line = "🎁 <b>Бесплатный триал (5 ч)</b>"
+    elif has_access and is_allowed and user.get("subscription_until"):
+        status_line = f"🟢 <b>{plan_name} Подписка</b>"
+    elif has_access and is_allowed:
+        status_line = f"🟢 <b>Бессрочный VIP ({plan_name})</b>"
+    else:
+        status_line = "🔴 <b>Доступ истёк / отозван</b>"
+
+    uname = f"@{user['username']}" if user.get("username") else "—"
+    fname = html.escape(user.get("first_name") or "Без имени")
+
+    text = (
+        "👤 <b>КАРТОЧКА ПОЛЬЗОВАТЕЛЯ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"• Имя: <b>{fname}</b>\n"
+        f"• Username: <b>{uname}</b>\n"
+        f"• Telegram ID: <code>{target_id}</code>\n"
+        f"• Статус: {status_line}\n"
+        f"• Тариф: <b>{plan_name}</b> (лимит: до {max_radars} радаров)\n"
+        f"• Срок подписки: <i>{until}</i>\n"
+        f"• Радары: <b>{active_radars}</b> акт. / <b>{len(user_radars)}</b> всего\n"
+        f"• Чёрный список: <b>{blocked_count}</b> продавцов\n"
+        f"• Триал использован: <b>{'Да' if trial_used else 'Нет'}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Управление пользователем:"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(text="💳 Выдать / продлить → выбрать тариф", callback_data=f"admin_sub_menu:{target_id}:{page}")],
+        [InlineKeyboardButton(text="🎁 Выдать / обновить триал (5 ч)", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
+        [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}"),
+         InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
+    ]
+    if has_access:
+        buttons.append([InlineKeyboardButton(text="🚫 Отозвать доступ", callback_data=f"admin_revoke_prompt:{target_id}:{page}")])
+    buttons.append([
+        InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admin_purge_user:{target_id}:{page}"),
+        InlineKeyboardButton(text="✍️ Написать пользователю", callback_data=f"support_reply:{target_id}")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="🔍 Найти другого", callback_data="admin_search_user_prompt"),
+        InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{page}")
+    ])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @router.callback_query(F.data.startswith(("admin_user:", "admin_sub_menu:", "admin_sub_days:")))
 async def cb_admin_user(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
@@ -214,31 +282,199 @@ async def cb_admin_user(call: CallbackQuery):
     if config.is_admin(target_id):
         await call.answer("Доступ администратора не требует подписки и не меняется здесь.", show_alert=True)
         return
+
+    if parts[0] == "admin_user":
+        text, kb = await render_user_card_data(target_id, page)
+        if not text:
+            await call.answer("Пользователь не найден", show_alert=True)
+            return
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await call.answer()
+        return
+
     until = database.format_subscription_date(user["subscription_until"])
     has_access = await database.is_user_allowed(target_id)
     text = (f"👤 <b>{html.escape(user.get('first_name') or 'Пользователь')}</b>\n"
             f"🆔 ID: <code>{target_id}</code>\n"
             f"📦 Тариф: <b>{(user.get('tariff_plan') or 'standart').upper()}</b>\n"
             f"🔑 Доступ: {'активен' if has_access else 'истёк / отозван'}\n📅 Срок: {until}\n\n")
+
     if parts[0] == "admin_sub_menu":
         text += "<b>Выберите тариф для выдачи / продления:</b>"
         buttons = [
             [InlineKeyboardButton(text="⚡️ Standart · 4 радара", callback_data=f"admin_sub_days:{target_id}:standart:{page}")],
             [InlineKeyboardButton(text="🔥 PRO · 9 радаров и скидки", callback_data=f"admin_sub_days:{target_id}:pro:{page}")],
+            [InlineKeyboardButton(text="👑 Бессрочный Standart (VIP)", callback_data=f"admin_grant_vip_prompt:{target_id}:standart:{page}")],
+            [InlineKeyboardButton(text="👑 Бессрочный PRO (VIP)", callback_data=f"admin_grant_vip_prompt:{target_id}:pro:{page}")],
+            [InlineKeyboardButton(text="« Назад в карточку", callback_data=f"admin_user:{target_id}:{page}")]
         ]
     elif parts[0] == "admin_sub_days":
         text += f"<b>Добавить срок на тарифе {plan.upper()}:</b>"
-        buttons = [[InlineKeyboardButton(text=f"➕ {days} дн.", callback_data=f"admin_grant_sub:{target_id}:{plan}:{days}:{page}") for days in (1, 7, 30, 90)]]
-    else:
-        text += "Управление подпиской и оплатами:"
         buttons = [
-            [InlineKeyboardButton(text="💳 Выдать / продлить → выбрать тариф", callback_data=f"admin_sub_menu:{target_id}:{page}")],
-            [InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
-            [InlineKeyboardButton(text="🚫 Отозвать доступ", callback_data=f"admin_revoke_prompt:{target_id}:{page}")],
-            [InlineKeyboardButton(text="✍️ Написать пользователю", callback_data=f"support_reply:{target_id}")],
+            [InlineKeyboardButton(text=f"➕ {days} дн.", callback_data=f"admin_grant_sub:{target_id}:{plan}:{days}:{page}") for days in (1, 7, 14)],
+            [InlineKeyboardButton(text=f"➕ {days} дн.", callback_data=f"admin_grant_sub:{target_id}:{plan}:{days}:{page}") for days in (30, 90, 365)],
+            [InlineKeyboardButton(text="« Назад к выбору тарифа", callback_data=f"admin_sub_menu:{target_id}:{page}")]
         ]
-    buttons.append([InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{page}")])
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_grant_vip_prompt:"))
+async def cb_admin_grant_vip_prompt(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    parts = call.data.split(":")
+    target_id, plan, page = int(parts[1]), parts[2], int(parts[3])
+    plan_title = "🔥 PRO" if plan == "pro" else "⚡️ STANDART"
+    text = (
+        f"👑 <b>ВЫДАЧА БЕССРОЧНОГО VIP-ДОСТУПА</b>\n\n"
+        f"Пользователь: <code>{target_id}</code>\n"
+        f"Тариф: <b>{plan_title}</b>\n\n"
+        "Пользователю будет выдан постоянный бессрочный доступ к боту без ограничения по времени. "
+        "Пользователь получит мгновенное уведомление в чат."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить выдачу VIP", callback_data=f"admin_confirm_vip:{target_id}:{plan}:{page}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_id}:{page}")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_confirm_vip:"))
+async def cb_admin_confirm_vip(call: CallbackQuery, bot: Bot):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    parts = call.data.split(":")
+    target_id, plan, page = int(parts[1]), parts[2], int(parts[3])
+    await database.grant_vip_access(target_id, plan)
+    max_radars = await database.get_user_max_radars(target_id)
+    plan_title = "🔥 PRO" if plan == "pro" else "⚡️ STANDART"
+
+    logger.info("👑 [АДМИН] Администратор ID:%s выдал бессрочный VIP (%s) пользователю ID:%s", call.from_user.id, plan_title, target_id)
+
+    try:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt")],
+            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")]
+        ])
+        await bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"👑 <b>Администратор предоставил вам постоянный VIP-доступ к AVITO RADAR!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 Тариф: <b>{plan_title}</b>\n"
+                f"🎯 Лимит активных радаров: <b>{max_radars} шт.</b>\n"
+                f"📅 Срок действия: <b>Бессрочно</b> ♾️\n\n"
+                f"Вам открыт доступ ко всем возможностям тарифа без ограничений по времени. "
+                f"Удачных и выгодных находок!"
+            ),
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning("Не удалось уведомить пользователя %s о выдаче VIP: %s", target_id, e)
+
+    await call.answer(f"Бессрочный {plan_title} выдан!", show_alert=True)
+    text, kb = await render_user_card_data(target_id, page)
+    if text:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("admin_reset_trial_prompt:"))
+async def cb_admin_reset_trial_prompt(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    parts = call.data.split(":")
+    target_id, page = int(parts[1]), int(parts[2])
+    text = (
+        f"🎁 <b>АКТИВАЦИЯ ТРИАЛА (5 ЧАСОВ)</b>\n\n"
+        f"Пользователь: <code>{target_id}</code>\n\n"
+        "Пользователю будет выдан бесплатный пробный доступ на <b>5 часов</b> (1 радар, Standart). "
+        "Пользователь получит мгновенное уведомление в чат."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Активировать триал 5 ч", callback_data=f"admin_confirm_trial:{target_id}:{page}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_id}:{page}")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_confirm_trial:"))
+async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    parts = call.data.split(":")
+    target_id, page = int(parts[1]), int(parts[2])
+    user = await database.reset_user_trial(target_id)
+    until = database.format_subscription_date(user.get("subscription_until"))
+
+    logger.info("👑 [АДМИН] Администратор ID:%s активировал триал 5ч для пользователя ID:%s", call.from_user.id, target_id)
+
+    try:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Запустить радар", callback_data="start_approved")],
+            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")]
+        ])
+        await bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"🎁 <b>Администратор активировал вам бесплатный пробный период на 5 часов!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 Доступен: <b>1 активный радар</b> (Standart)\n"
+                f"📅 Срок действия: <b>{until}</b> (5 ч.)\n\n"
+                f"Отправьте ссылку на поиск с Авито прямо в чат или нажмите кнопку ниже:"
+            ),
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning("Не удалось уведомить пользователя %s об активации триала: %s", target_id, e)
+
+    await call.answer("Триал 5 часов активирован!", show_alert=True)
+    text, kb = await render_user_card_data(target_id, page)
+    if text:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("admin_user_radars:"))
+async def cb_admin_user_radars(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    parts = call.data.split(":")
+    target_id, page = int(parts[1]), int(parts[2])
+    radars = await database.get_user_searches(target_id)
+
+    text_lines = [
+        f"📁 <b>РАДАРЫ ПОЛЬЗОВАТЕЛЯ <code>{target_id}</code></b> (всего: {len(radars)})\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    ]
+    if not radars:
+        text_lines.append("<i>У пользователя пока нет созданных радаров.</i>")
+    else:
+        for idx, r in enumerate(radars, start=1):
+            is_active = bool(r.get("is_active", 1))
+            status_emoji = "🟢" if is_active else "⏸"
+            scope = "🏷 В заголовках" if r.get("search_in_title_only") else "📄 Заголовок+текст"
+            title = html.escape(r.get("title") or "Без названия")
+            url = html.escape(r.get("url") or "")
+            text_lines.append(
+                f"{idx}. {status_emoji} <b>{title}</b>\n"
+                f"   ├ Выборка: <i>{scope}</i>\n"
+                f"   └ <a href=\"{url}\">Ссылка на Авито</a>"
+            )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="« Назад в карточку пользователя", callback_data=f"admin_user:{target_id}:{page}")]
+    ])
+    await call.message.edit_text("\n".join(text_lines), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     await call.answer()
 
 
@@ -388,6 +624,9 @@ async def cmd_admin_panel(event, page: int = 0):
         buttons.append(nav_buttons)
 
     buttons.append([
+        InlineKeyboardButton(text="🔍 Поиск по ID / @username", callback_data="admin_search_user_prompt")
+    ])
+    buttons.append([
         InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup"),
         InlineKeyboardButton(text="📋 Скачать логи", callback_data="admin_logs_menu")
     ])
@@ -410,7 +649,7 @@ async def cmd_admin_panel(event, page: int = 0):
 
 
 @router.callback_query(F.data.startswith("admin_revoke:"))
-async def cb_admin_revoke(call: CallbackQuery):
+async def cb_admin_revoke(call: CallbackQuery, bot: Bot):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав", show_alert=True)
         return
@@ -425,6 +664,22 @@ async def cb_admin_revoke(call: CallbackQuery):
     await database.set_user_allowed(target_user_id, 0)
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} отозвал доступ у пользователя ID:{target_user_id}")
     await call.answer("Доступ отозван")
+
+    try:
+        await bot.send_message(
+            chat_id=target_user_id,
+            text=(
+                "⚠️ <b>Ваш доступ к AVITO RADAR был приостановлен администратором.</b>\n\n"
+                "Если у вас есть вопросы или возникла ошибка, свяжитесь со службой поддержки:"
+            ),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="support_start_ticket")]
+            ]),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning("Не удалось уведомить пользователя %s об отзыве доступа: %s", target_user_id, e)
+
     await cmd_admin_panel(call, page=page)
 
 
@@ -704,6 +959,125 @@ async def cb_admin_log_get(call: CallbackQuery):
         parse_mode="HTML"
     )
     logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил лог {send_name}")
+
+
+# ── Поиск пользователей администратором ───────────────────────────────
+
+@router.callback_query(F.data == "admin_search_user_prompt")
+async def cb_admin_search_user_prompt(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_user_query)
+    text = (
+        "🔍 <b>ПОИСК ПОЛЬЗОВАТЕЛЯ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Введите <b>@username</b>, <b>Telegram ID</b> или имя пользователя:\n\n"
+        "<i>Примеры:</i>\n"
+        "• <code>@username</code>\n"
+        "• <code>986832959</code>\n"
+        "• <code>Алексей</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_search_cancel")]
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_search_cancel")
+async def cb_admin_search_cancel(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await state.clear()
+    await call.answer("Поиск отменён")
+    await cmd_admin_panel(call, page=0)
+
+
+@router.message(Command("find"))
+@router.message(Command("user"))
+@router.message(Command("search_user"))
+async def cmd_admin_find_user(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        return
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        await state.set_state(AdminStates.waiting_for_user_query)
+        await message.answer(
+            "🔍 Введите <b>@username</b>, <b>Telegram ID</b> или имя пользователя для поиска:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_search_cancel")]
+            ])
+        )
+        return
+    await do_admin_user_search(message, args[1].strip(), state)
+
+
+@router.message(AdminStates.waiting_for_user_query)
+async def msg_admin_user_query(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    query = (message.text or "").strip()
+    await do_admin_user_search(message, query, state)
+
+
+async def do_admin_user_search(message: Message, query: str, state: FSMContext):
+    await state.clear()
+    if not query:
+        await message.answer("Запрос пуст. Попробуйте снова.")
+        return
+
+    users = await database.find_users_by_query(query)
+    if not users:
+        await message.answer(
+            f"❌ <b>Пользователь не найден</b>\n\n"
+            f"По запросу <code>{html.escape(query)}</code> в базе данных бота ничего не найдено.\n\n"
+            f"Убедитесь, что пользователь хотя бы раз отправлял <code>/start</code> в бот.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Искать снова", callback_data="admin_search_user_prompt")],
+                [InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_refresh")]
+            ])
+        )
+        return
+
+    if len(users) == 1:
+        u_id = users[0]["user_id"]
+        text, kb = await render_user_card_data(u_id, page=0)
+        if text:
+            await message.answer(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+    text = (
+        f"🔍 <b>РЕЗУЛЬТАТЫ ПОИСКА</b> (найдено: {len(users)})\n"
+        f"Запрос: <code>{html.escape(query)}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    buttons = []
+    for idx, u in enumerate(users[:10], start=1):
+        u_id = u["user_id"]
+        uname = f"@{u['username']}" if u.get("username") else f"ID: {u_id}"
+        fname = html.escape(u.get("first_name") or "Без имени")
+        plan = (u.get("tariff_plan") or "standart").upper()
+        has_access = await database.is_user_allowed(u_id)
+        status_icon = "🟢" if has_access else "🔴"
+        text += f"{idx}. {status_icon} <b>{fname}</b> ({uname}) — <i>[{plan}]</i> [ID: <code>{u_id}</code>]\n"
+        buttons.append([
+            InlineKeyboardButton(text=f"👤 Карточка {uname}", callback_data=f"admin_user:{u_id}:0"),
+            InlineKeyboardButton(text="💳 Выдать", callback_data=f"admin_sub_menu:{u_id}:0")
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(text="🔍 Новый поиск", callback_data="admin_search_user_prompt"),
+        InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_refresh")
+    ])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 
 
