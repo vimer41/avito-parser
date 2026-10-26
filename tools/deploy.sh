@@ -106,8 +106,10 @@ trap rollback ERR
 trap 'rollback 130' INT
 trap 'rollback 143' TERM
 
-# Clean up pip cache and temporary pip files to free disk space on constrained systems
-rm -rf /root/.cache/pip /home/*/.cache/pip ~/.cache/pip /tmp/pip-* 2>/dev/null || true
+# Clean up temporary pip build artifacts and VPS pip cache to free disk space
+if [[ -z "${MOCK_ROOT:-}" ]]; then
+    rm -rf /root/.cache/pip ~/.cache/pip /tmp/pip-* 2>/dev/null || true
+fi
 
 # Free RAM on constrained systems (e.g. 600MB VPS) by stopping old bot before pip install
 if [[ "$DEPLOY_STOP_BEFORE_PREFLIGHT" == 1 && "$WAS_ACTIVE" == 1 ]]; then
