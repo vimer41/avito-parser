@@ -34,9 +34,9 @@ logger = logging.getLogger(__name__)
 
 COOKIE_FILE = DATA_DIR / "avito_cookies.json"
 
-# Пауза при блокировке сессии Авито: 15 сек → 30 сек → 60 сек
-BLOCK_BASE_COOLDOWN = 15
-BLOCK_MAX_COOLDOWN = 5 * 60
+# Пауза при ошибке воркера: без общих задержек, мгновенный переход к другим воркерам
+BLOCK_BASE_COOLDOWN = 1
+BLOCK_MAX_COOLDOWN = 2
 COOKIE_IO_LOCK = Lock()
 
 
@@ -113,7 +113,7 @@ class AvitoItem:
 class AvitoParser:
     def __init__(self, proxy: Optional[str] = None, *, block_state: Optional[NetworkBlockState] = None):
         self.current_proxy: Optional[str] = proxy
-        self.network_block = block_state if block_state is not None else get_network_block_state(proxy)
+        self.network_block = block_state if block_state is not None else NetworkBlockState()
         self._session_lock = RLock()
         self._async_fetch_lock = asyncio.Lock()
         self._proxy_key = hashlib.sha256((proxy or "direct").encode()).hexdigest()
@@ -140,8 +140,7 @@ class AvitoParser:
         cooldown, self.block_streak = self.network_block.register_block(parse_retry_after(headers))
         self.blocked_until = time.time() + cooldown
         logger.warning(
-            f"🛑 Авито ограничил доступ (статус {status}). "
-            f"Общая пауза {cooldown:g} сек., сессия сохранена (блок #{self.block_streak} подряд)"
+            f"⚠️ Авито вернул статус {status}. Задача передаётся следующему воркеру конвейера (попытка #{self.block_streak})"
         )
 
     @staticmethod

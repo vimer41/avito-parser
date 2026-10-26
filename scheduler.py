@@ -884,13 +884,6 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
             await asyncio.sleep((worker_id - 1) * 1.2)
 
         while True:
-            # Если воркер в кулдауне из-за антибота, ждем
-            while w_parser.is_blocked():
-                wait_s = min(w_parser.block_remaining(), 5)
-                if wait_s <= 0:
-                    break
-                await asyncio.sleep(wait_s)
-
             try:
                 task, is_urgent = await get_next_task()
             except asyncio.CancelledError:
@@ -939,31 +932,25 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
                 else:
                     await asyncio.sleep(0.3)
             else:
-                # ОШИБКА: Immediate Priority Failover!
-                if w_parser.is_blocked():
-                    # All sessions share this external connection; failover would hammer the same IP.
-                    url_next_check[clean_url] = time.time() + max(15, w_parser.block_remaining())
-                    in_flight_urls.discard(clean_url)
-                    stats["exhausted_fails"] += 1
-                    stats["consecutive_failures"] += 1
-                elif retry_attempt < 3:
+                # ОШИБКА: Мгновенная передача задачи другому воркеру без ожидания и кулдаунов!
+                if retry_attempt < 3:
                     next_attempt = retry_attempt + 1
                     stats["failover_retries"] += 1
                     logger.warning(
-                        f"  [W{worker_id}] ⚡️ [PRIORITY FAILOVER #{next_attempt}/3] Ошибка на «{human_name}» -> передано в приоритетный стек первому освободившемуся воркеру!"
+                        f"  [W{worker_id}] ⚡️ [PRIORITY FAILOVER #{next_attempt}/3] Ошибка на «{human_name}» -> мгновенно передано в приоритетный стек другому воркеру!"
                     )
                     # Задача остается в in_flight_urls, отдается в LIFO стек первому свободному воркеру
                     await urgent_failover_queue.put((clean_url, radars_for_url, next_attempt))
-                    # Краткая пауза для смены состояния
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                 else:
                     # 3 попытки исчерпаны
                     stats["exhausted_fails"] += 1
                     stats["consecutive_failures"] += 1
                     logger.error(
-                        f"  [W{worker_id}] ❌ [FAILOVER EXHAUSTED] «{human_name}» не ответил после 3 попыток обхода. Отложено на короткий кулдаун (30 сек)."
+                        f"  [W{worker_id}] ❌ [FAILOVER EXHAUSTED] «{human_name}» не ответил после 3 попыток. Отложено на следующий плановый интервал."
                     )
-                    url_next_check[clean_url] = time.time() + 30.0
+                    base_interval = url_intervals.get(clean_url, config.CHECK_INTERVAL)
+                    url_next_check[clean_url] = time.time() + base_interval
                     in_flight_urls.discard(clean_url)
 
                     if stats["consecutive_failures"] >= FAILURE_THRESHOLD and not alert_sent:
@@ -1070,11 +1057,15 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
                 stats["success"] = 0
                 stats["failover_retries"] = 0
 
-            # 4. Техническое обслуживание раз в 45 минут (очистка БД и RAM)
+            # 4. Техническое обслуживание раз в 45 минут (очистка БД, старых логов и RAM)
             if now - last_maintenance >= 2700.0:
                 last_maintenance = now
                 try:
                     await database.cleanup_old_seen_items(days=5)
+                    from logger_setup import cleanup_logs
+                    cleaned_logs = cleanup_logs(max_total_mb=40, keep_days=3)
+                    if cleaned_logs > 0:
+                        logger.info(f"🧹 [КОНВЕЙЕР] Удалено {cleaned_logs} старых архивных файлов логов")
                     gc.collect()
                     logger.info("🧹 [КОНВЕЙЕР] Очистка старых объявлений и сборка мусора (gc.collect) выполнены")
                 except Exception as maint_err:

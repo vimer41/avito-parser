@@ -9,8 +9,8 @@ WorkingDirectory=/opt/avito_parser_bot
 ExecStart=/opt/avito_parser_bot/venv/bin/python bot.py
 Restart=always
 RestartSec=5
-StandardOutput=append:/opt/avito_parser_bot/bot.log
-StandardError=append:/opt/avito_parser_bot/bot.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

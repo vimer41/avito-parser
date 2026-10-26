@@ -53,17 +53,29 @@ def setup_logging():
     for h in list(root_logger.handlers):
         root_logger.removeHandler(h)
 
-    # 1. Вывод в консоль (stdout)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(std_formatter)
-    console_handler.setLevel(logging.INFO)
-    root_logger.addHandler(console_handler)
+    # Проверяем, не перенаправлен ли stdout напрямую в bot.log (например, systemd StandardOutput=append:.../bot.log)
+    is_stdout_same_as_combined = False
+    try:
+        if COMBINED_LOG.exists() and hasattr(sys.stdout, "fileno"):
+            stdout_stat = os.fstat(sys.stdout.fileno())
+            log_stat = COMBINED_LOG.stat()
+            if stdout_stat.st_ino == log_stat.st_ino and stdout_stat.st_dev == log_stat.st_dev:
+                is_stdout_same_as_combined = True
+    except Exception:
+        pass
+
+    # 1. Вывод в консоль (stdout) — только если stdout не дублирует bot.log
+    if not is_stdout_same_as_combined:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(std_formatter)
+        console_handler.setLevel(logging.INFO)
+        root_logger.addHandler(console_handler)
 
     # 2. Общий файл bot.log (все события)
     combined_handler = RotatingFileHandler(
         COMBINED_LOG,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=3,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=2,
         encoding="utf-8"
     )
     combined_handler.setFormatter(std_formatter)
@@ -73,8 +85,8 @@ def setup_logging():
     # 3. Файл только для ошибок (logs/errors.log)
     errors_handler = RotatingFileHandler(
         ERRORS_LOG,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
+        maxBytes=3 * 1024 * 1024,
+        backupCount=2,
         encoding="utf-8"
     )
     errors_handler.setFormatter(std_formatter)
@@ -84,8 +96,8 @@ def setup_logging():
     # 4. Файл действий пользователей (logs/user_actions.log)
     user_actions_handler = RotatingFileHandler(
         USER_ACTIONS_LOG,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=2,
         encoding="utf-8"
     )
     user_actions_handler.setFormatter(user_formatter)
@@ -99,8 +111,8 @@ def setup_logging():
     # 5. Файл мониторинга и парсера (logs/parser.log)
     parser_handler = RotatingFileHandler(
         PARSER_LOG,
-        maxBytes=15 * 1024 * 1024,
-        backupCount=5,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=2,
         encoding="utf-8"
     )
     parser_handler.setFormatter(std_formatter)
@@ -181,4 +193,56 @@ def sanitize_logs_for_user(pattern: str):
                         f.writelines(filtered)
             except Exception as e:
                 logging.getLogger(__name__).warning(f"Не удалось очистить лог {lf}: {e}")
+
+
+def cleanup_logs(max_total_mb: int = 40, keep_days: int = 3) -> int:
+    """
+    Автоматическая очистка старых ротированных логов (*.log.1, *.log.2).
+    Удаляет файлы старше keep_days или самые старые ротации при превышении max_total_mb.
+    """
+    import time
+    removed_count = 0
+    now = time.time()
+    cutoff = now - (keep_days * 86400)
+
+    target_dirs = {LOGS_DIR, COMBINED_LOG.parent}
+    log_files: list[Path] = []
+
+    for d in target_dirs:
+        if not d.is_dir():
+            continue
+        for p in d.glob("*.log.*"):
+            if p.is_file():
+                log_files.append(p)
+
+    # 1. Удаление ротированных архивов логов старше keep_days
+    for p in list(log_files):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink(missing_ok=True)
+                log_files.remove(p)
+                removed_count += 1
+        except Exception:
+            pass
+
+    # 2. Если общий объем оставшихся ротаций превышает max_total_mb — удаляем самые старые
+    try:
+        total_bytes = sum(p.stat().st_size for p in log_files if p.is_file())
+        max_bytes = max_total_mb * 1024 * 1024
+        if total_bytes > max_bytes:
+            log_files.sort(key=lambda f: f.stat().st_mtime)
+            for p in log_files:
+                if total_bytes <= max_bytes:
+                    break
+                try:
+                    sz = p.stat().st_size
+                    p.unlink(missing_ok=True)
+                    total_bytes -= sz
+                    removed_count += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return removed_count
 
