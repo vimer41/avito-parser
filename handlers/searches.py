@@ -97,6 +97,7 @@ async def process_avito_url(message: Message, state: FSMContext):
         "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
         "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
         "📖 Инструкция", "❓ Помощь", "Инструкция",
+        "📄 Документы", "Документы",
         "👑 Админ-панель", "👑 Админка",
         "❌ Отмена", "Отмена"
     }
@@ -110,6 +111,9 @@ async def process_avito_url(message: Message, state: FSMContext):
         if raw_url in {"💳 Тарифы", "💳 Тарифы и подписка", "Тарифы", "Подписка", "💳 Подписка"}:
             from handlers.common import cmd_subscription_menu
             return await cmd_subscription_menu(message)
+        if raw_url in {"📄 Документы", "Документы"}:
+            from handlers.common import cmd_docs_hub
+            return await cmd_docs_hub(message)
         return
 
     # Проверяем, что ссылка действительно с avito.ru

@@ -107,17 +107,22 @@ class AccessControlMiddleware(BaseMiddleware):
                 "open_subscription_menu", "activate_trial_btn", "support_start_ticket", "support_cancel",
                 "start_approved", "refresh_profile", "open_help_menu", "cancel_fsm",
                 "payment_terms", "payment_support", "other_payment_methods",
+                "open_docs_menu", "doc_agreement", "doc_privacy",
             }
             if event.data in allowed_exact or any(event.data.startswith(prefix) for prefix in allowed_callbacks):
                 return await handler(event, data)
 
         if isinstance(event, Message) and event.text:
-            public_commands = {"/start", "/help", "/profile", "/subscribe", "/tariffs", "/cancel", "/paysupport", "/terms"}
+            public_commands = {
+                "/start", "/help", "/profile", "/subscribe", "/tariffs", "/cancel",
+                "/paysupport", "/terms", "/agreement", "/privacy", "/policy", "/offer", "/docs",
+            }
             command = (event.text.split(maxsplit=1) or [""])[0].split("@", 1)[0]
             public_menu = {
                 "💳 Тарифы", "💳 Тарифы и подписка", "Тарифы", "Подписка", "💳 Подписка",
                 "💬 Поддержка", "Поддержка", "Контакты", "Помощь", "SOS",
                 "👤 Мой профиль", "📊 Мой статус", "📖 Инструкция", "❓ Помощь", "❌ Отмена",
+                "📄 Документы", "Документы",
             }
             if command in public_commands or event.text.strip() in public_menu:
                 state = data.get("state")
@@ -147,6 +152,7 @@ class AccessControlMiddleware(BaseMiddleware):
                     "💬 Поддержка", "Поддержка", "Помощь",
                     "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
                     "📖 Инструкция", "Инструкция",
+                    "📄 Документы", "Документы",
                     "👑 Админ-панель", "👑 Админка",
                     "❌ Отмена", "Отмена"
                 }
