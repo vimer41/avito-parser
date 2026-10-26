@@ -98,42 +98,28 @@ async def main():
 
     # Запуск легковесного сервера для Render Web Service (если передан PORT)
     web_runner = await start_health_server()
-
-    # Инициализация базы данных
-    await database.init_db()
-
-    # Инициализация бота и диспетчера
-    bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
-    dp = Dispatcher(storage=MemoryStorage())
-    
-    # Регистрация детального логирования действий каждого пользователя
-    dp.message.middleware(ActionLoggingMiddleware())
-    dp.callback_query.middleware(ActionLoggingMiddleware())
-
-    # Регистрация проверки прав доступа (вайтлист с одобрением админом)
-    access_middleware = AccessControlMiddleware()
-    dp.message.middleware(access_middleware)
-    dp.callback_query.middleware(access_middleware)
-
-    dp.include_router(main_router)
-
-
-    # Удаляем вебхуки перед началом поллинга
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    # Устанавливаем официальную презентацию и описание бота в Telegram API (до нажатия /start)
-    await setup_bot_profile(bot)
-
-    # Запуск фоновых сервисов мониторинга и очереди уведомлений под супервизором
-    background_tasks = start_background_services(bot)
-
-    logger.info("Бот успешно запущен и готов к работе!")
-
+    bot = None
+    background_tasks = []
 
     try:
+        await database.init_db()
+        bot = Bot(
+            token=config.BOT_TOKEN,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+        dp = Dispatcher(storage=MemoryStorage())
+        dp.message.middleware(ActionLoggingMiddleware())
+        dp.callback_query.middleware(ActionLoggingMiddleware())
+        access_middleware = AccessControlMiddleware()
+        dp.message.middleware(access_middleware)
+        dp.callback_query.middleware(access_middleware)
+        dp.include_router(main_router)
+
+        # A deploy must not discard unread Telegram updates.
+        await bot.delete_webhook(drop_pending_updates=False)
+        await setup_bot_profile(bot)
+        background_tasks = start_background_services(bot)
+        logger.info("Бот успешно запущен и готов к работе!")
         await dp.start_polling(bot)
     finally:
         logger.info("Завершение работы бота...")
@@ -141,7 +127,8 @@ async def main():
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
         await close_image_session()
-        await bot.session.close()
+        if bot is not None:
+            await bot.session.close()
         if web_runner:
             await web_runner.cleanup()
         logger.info("Бот остановлен.")

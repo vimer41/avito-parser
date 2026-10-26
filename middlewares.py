@@ -87,15 +87,36 @@ class AccessControlMiddleware(BaseMiddleware):
         user_id = user.id
         bot: Bot = data.get("bot")
 
-        # 1. Разрешаем технические callback-запросы (админка, служба поддержки, меню тарифов, оплата)
+        # Административные действия никогда не обходят проверку роли.
+        if isinstance(event, CallbackQuery) and event.data and event.data.startswith(("admin_", "support_reply:")):
+            if not config.is_admin(user_id):
+                await event.answer("У вас нет прав администратора", show_alert=True)
+                return
+
+        # Публичные меню доступны и после истечения подписки.
         if isinstance(event, CallbackQuery) and event.data:
             allowed_callbacks = (
-                "admin_approve:", "admin_reject:", "admin_revoke:", "admin_grant_sub:",
-                "support_reply:", "admin_reply_cancel",
-                "open_subscription_menu", "buy_tariff:", "pay_request:", "activate_trial_btn",
-                "support_start_ticket", "support_cancel"
+                "buy_tariff:", "pay_request:", "demo_tariff:",
             )
-            if any(event.data.startswith(prefix) for prefix in allowed_callbacks):
+            allowed_exact = {
+                "open_subscription_menu", "activate_trial_btn", "support_start_ticket", "support_cancel",
+                "start_approved", "refresh_profile", "open_help_menu", "cancel_fsm",
+            }
+            if event.data in allowed_exact or any(event.data.startswith(prefix) for prefix in allowed_callbacks):
+                return await handler(event, data)
+
+        if isinstance(event, Message) and event.text:
+            public_commands = {"/start", "/help", "/profile", "/subscribe", "/tariffs", "/cancel"}
+            command = (event.text.split(maxsplit=1) or [""])[0].split("@", 1)[0]
+            public_menu = {
+                "💳 Тарифы", "💳 Тарифы и подписка", "Тарифы", "Подписка", "💳 Подписка",
+                "💬 Поддержка", "Поддержка", "Контакты", "Помощь", "SOS",
+                "👤 Мой профиль", "📊 Мой статус", "📖 Инструкция", "❓ Помощь", "❌ Отмена",
+            }
+            if command in public_commands or event.text.strip() in public_menu:
+                state = data.get("state")
+                if state is not None:
+                    await state.clear()
                 return await handler(event, data)
 
         # Разрешаем отправку сообщений, если пользователь пишет обращение в поддержку

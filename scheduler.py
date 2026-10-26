@@ -2,12 +2,13 @@ import asyncio
 import datetime
 import gc
 import html
+import json
 import logging
 import random
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import urlparse, parse_qs
 import aiohttp
@@ -35,6 +36,11 @@ class NotificationTask:
     is_price_drop: bool = False
     old_price: Optional[int] = None
     drop_percent: Optional[int] = None
+
+
+async def enqueue_notification_task(task: NotificationTask) -> bool:
+    event_key = f"drop:{task.old_price}:{task.item.raw_price}" if task.is_price_drop else "new"
+    return await database.enqueue_notification(task.radar_id, task.user_id, task.item.item_id, event_key, asdict(task))
 
 
 # ── 2. Высокопроизводительный TTL/LRU кэш Telegram file_id (RAM) ─────────
@@ -95,7 +101,7 @@ async def get_item_lock(item_id: str) -> asyncio.Lock:
         if lock is None:
             if len(ITEM_LOCKS) >= 3000:
                 # Безопасная ротация: удаляем только неактивные (разблокированные) локи
-                unlocked_keys = [k for k, l in ITEM_LOCKS.items() if not l.locked()]
+                unlocked_keys = [k for k, l in ITEM_LOCKS.items() if not l.locked() and not getattr(l, "_waiters", None)]
                 for k in unlocked_keys[:1000]:
                     ITEM_LOCKS.pop(k, None)
             lock = asyncio.Lock()
@@ -173,8 +179,18 @@ async def download_image_bytes(raw_url: str) -> Optional[bytes]:
 
     return None
 
-# ── 5. Асинхронная очередь доставки уведомлений (Outbox Queue) ───────────
-NOTIFICATION_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=3000)
+# ── 5. Доставка из постоянной SQLite Outbox, ограничение 20 отправок/сек ──
+NOTIFICATION_SEND_LOCK = asyncio.Lock()
+NEXT_NOTIFICATION_SEND = 0.0
+
+
+async def limit_notification_send_rate():
+    global NEXT_NOTIFICATION_SEND
+    async with NOTIFICATION_SEND_LOCK:
+        wait = NEXT_NOTIFICATION_SEND - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        NEXT_NOTIFICATION_SEND = time.monotonic() + 0.05
 
 
 def get_last_scan_info() -> str:
@@ -420,6 +436,29 @@ def get_user_display_name(radar: Dict) -> str:
     return f"ID:{user_id}"
 
 
+async def get_next_pipeline_task(urgent_queue: asyncio.Queue, pipeline_queue: asyncio.Queue):
+    """Priority dequeue without leaving orphaned queue.get tasks on cancellation."""
+    try:
+        return urgent_queue.get_nowait(), True
+    except asyncio.QueueEmpty:
+        pass
+    urgent_get = asyncio.create_task(urgent_queue.get())
+    pipeline_get = asyncio.create_task(pipeline_queue.get())
+    tasks = (urgent_get, pipeline_get)
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    if not urgent_get.cancelled() and urgent_get.exception() is None:
+        if not pipeline_get.cancelled() and pipeline_get.exception() is None:
+            pipeline_queue.put_nowait(pipeline_get.result())
+        return urgent_get.result(), True
+    return pipeline_get.result(), False
+
+
 async def send_ad_to_user(
     bot: Bot,
     parser: AvitoParser,
@@ -450,11 +489,18 @@ async def send_ad_to_user(
     owner_str = f" [{user_label}]" if user_label else f" ID:{user_id}"
     delivery_tag = f"СНИЖЕНИЕ ЦЕНЫ (-{drop_percent}%)" if is_price_drop else "Доставлено"
 
+    async def prepare_send() -> bool:
+        await limit_notification_send_rate()
+        # Downloading an image or waiting for its lock may outlive the radar/access.
+        return await database.can_deliver_to_search(search_id, user_id)
+
     # 1. Быстрая попытка через кэш telegram file_id (без блокировки)
     cached_fid = get_cached_photo_file_id(it.item_id)
     if cached_fid:
         for attempt in range(2):
             try:
+                if not await prepare_send():
+                    return False
                 await bot.send_photo(
                     chat_id=user_id,
                     photo=cached_fid,
@@ -467,9 +513,7 @@ async def send_ad_to_user(
             except TelegramForbiddenError:
                 raise
             except TelegramRetryAfter as retry_err:
-                logger.warning(f"⏳ [FLOODWAIT] Telegram лимит для ID:{user_id}: пауза {retry_err.retry_after} сек.")
-                await asyncio.sleep(retry_err.retry_after + 0.5)
-                continue
+                raise
             except Exception as cache_err:
                 logger.debug(f"file_id кэш сбой ({cache_err}), пробуем скачать фото...")
                 break
@@ -482,6 +526,8 @@ async def send_ad_to_user(
         if cached_fid:
             for attempt in range(2):
                 try:
+                    if not await prepare_send():
+                        return False
                     await bot.send_photo(
                         chat_id=user_id,
                         photo=cached_fid,
@@ -494,8 +540,7 @@ async def send_ad_to_user(
                 except TelegramForbiddenError:
                     raise
                 except TelegramRetryAfter as retry_err:
-                    await asyncio.sleep(retry_err.retry_after + 0.5)
-                    continue
+                    raise
                 except Exception:
                     break
 
@@ -509,6 +554,8 @@ async def send_ad_to_user(
             for attempt in range(2):
                 try:
                     photo_file = BufferedInputFile(photo_bytes, filename=f"{it.item_id}.jpg")
+                    if not await prepare_send():
+                        return False
                     sent_msg = await bot.send_photo(
                         chat_id=user_id,
                         photo=photo_file,
@@ -523,8 +570,7 @@ async def send_ad_to_user(
                 except TelegramForbiddenError:
                     raise
                 except TelegramRetryAfter as retry_err:
-                    await asyncio.sleep(retry_err.retry_after + 0.5)
-                    continue
+                    raise
                 except Exception as photo_send_err:
                     logger.warning(f"⚠️ [РАДАР #{search_id}] Сбой send_photo: {photo_send_err}, отправляем текстом...")
                     break
@@ -532,6 +578,8 @@ async def send_ad_to_user(
     # 3. Фолбэк: отправляем текстом (если фото недоступно или Telegram отклонил фото)
     for attempt in range(2):
         try:
+            if not await prepare_send():
+                return False
             await bot.send_message(
                 chat_id=user_id,
                 text=caption,
@@ -544,8 +592,7 @@ async def send_ad_to_user(
         except TelegramForbiddenError:
             raise
         except TelegramRetryAfter as retry_err:
-            await asyncio.sleep(retry_err.retry_after + 0.5)
-            continue
+            raise
         except Exception as text_err:
             logger.error(f"❌ [РАДАР #{search_id}] Не удалось доставить лот #{it.item_id}: {text_err}")
             return False
@@ -582,7 +629,7 @@ async def process_url_group(
     try:
         # Выполняем 1 сетевой запрос к Авито на всю группу радаров с этим URL
         fetch_t0 = time.monotonic()
-        html_content = await asyncio.to_thread(parser.fetch_page, clean_url)
+        html_content = await parser.fetch_page_async(clean_url)
         fetch_ms = int((time.monotonic() - fetch_t0) * 1000)
 
         if not html_content:
@@ -617,7 +664,7 @@ async def process_url_group(
             search_title = radar["title"]
 
             # 🛡 Защита от фантомного спама: проверяем, что радар не был удален во время скачивания
-            if not await database.is_search_active(radar_id):
+            if not await database.is_search_active(radar_id) or not await database.is_user_allowed(user_id):
                 continue
 
             stop_words = radar.get("stop_words", [])
@@ -628,7 +675,8 @@ async def process_url_group(
             blocked_sellers = await database.get_blocked_sellers(user_id)
 
             seen_dict = await database.get_seen_items_with_prices(radar_id)
-            new_items = [it for it in items if it.item_id not in seen_dict]
+            pending_ids = await database.get_pending_new_item_ids(radar_id)
+            new_items = [it for it in items if it.item_id not in seen_dict and it.item_id not in pending_ids]
 
             # 📉 Проверка снижения цены (Price Drop Alert) для PRO-тарифа и администраторов
             user_plan = (radar.get("tariff_plan") or "").lower()
@@ -655,11 +703,8 @@ async def process_url_group(
                                     f"  {w_tag}📉 [СНИЖЕНИЕ ЦЕНЫ] Радар #{radar_id} [{user_str}] «{search_title}»: "
                                     f"«{it.title[:30]}» {old_p:,} -> {new_p:,} ₽ (-{drop_pct}%, порог {min_drop}%)"
                                 )
-                                # Фиксируем новую цену в БД, чтобы не слать повторно
-                                await database.update_seen_item_price(radar_id, it.item_id, new_p)
-                                seen_dict[it.item_id] = new_p
-
-                                await NOTIFICATION_QUEUE.put(NotificationTask(
+                                # Цена фиксируется только после подтверждённой доставки.
+                                await enqueue_notification_task(NotificationTask(
                                     user_id=user_id,
                                     radar_id=radar_id,
                                     search_title=search_title,
@@ -674,8 +719,8 @@ async def process_url_group(
                 logger.info(f"  {w_tag}🔹 Радар #{radar_id} [{user_str}] «{search_title}»: проверено {len(items)} лотов [{source_tag}] (новых нет)")
                 continue
 
-            # ВАЖНО: Записываем ВСЕ новые ID в базу СРАЗУ ЖЕ с ценой, чтобы они не всплывали повторно
-            await database.mark_items_seen_bulk(radar_id, [(it.item_id, it.raw_price or 0) for it in new_items])
+            # Rejected items may be marked seen; deliverable items remain pending in SQLite.
+            candidates = {it.item_id: it.raw_price or 0 for it in new_items}
 
             # 🏷 Проверка области выборки (Только в названиях)
             title_only = bool(radar.get("search_in_title_only", 0))
@@ -697,6 +742,7 @@ async def process_url_group(
                         new_items = matching_title_items
 
             if not new_items:
+                await database.mark_items_seen_bulk(radar_id, list(candidates.items()))
                 continue
 
             # 1. Отбираем только действительно свежие объявления с учетом настройки max_age_minutes радара (1..30 мин, дефолт 5)
@@ -710,6 +756,16 @@ async def process_url_group(
                 it for it in new_items 
                 if is_ad_fresh_enough(it.date, getattr(it, "timestamp", None), max_age_minutes=max_age_min)
             ]
+            deliverable_items = [
+                it for it in fresh_items
+                if not is_stop_word_matched(it, stop_words)
+                and not (it.seller_name and it.seller_name.lower().strip() in blocked_sellers)
+            ]
+            deliverable_ids = {it.item_id for it in deliverable_items}
+            rejected = [(item_id, price) for item_id, price in candidates.items() if item_id not in deliverable_ids]
+            if rejected:
+                await database.mark_items_seen_bulk(radar_id, rejected)
+            fresh_items = deliverable_items
 
             if not fresh_items:
                 ages = [format_item_age(it.date, getattr(it, "timestamp", None)) for it in new_items[:2]]
@@ -749,7 +805,7 @@ async def process_url_group(
                     continue
 
                 # Помещаем задачу в асинхронную очередь Outbox (мониторинг не ждёт отправки!)
-                await NOTIFICATION_QUEUE.put(NotificationTask(
+                await enqueue_notification_task(NotificationTask(
                     user_id=user_id,
                     radar_id=radar_id,
                     search_title=search_title,
@@ -782,8 +838,9 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
        Первый освободившийся воркер немедленно забирает её со своим чистым сетевым контекстом (до 3 попыток).
     """
     pool_size = max(1, config.MAX_CONCURRENT_WORKERS)
-    parser_pool = ParserPool(pool_size, proxy_url=None)
+    parser_pool = ParserPool(pool_size, proxy_url=config.PROXY_URL)
     if parser is not None and parser_pool.parsers:
+        parser_pool.parsers[0].close()
         parser_pool.parsers[0] = parser
 
     logger.info(f"🚀 Запуск непрерывного конвейера мониторинга Авито (Worker Pool: {pool_size} воркеров, Continuous Queue)...")
@@ -815,30 +872,7 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
         Если задач нет, ждет появления либо срочной, либо конвейерной задачи.
         Возвращает: ((clean_url, radars, retry_attempt), is_urgent)
         """
-        # 1. Проверяем приоритетный стек мгновенного перехвата без ожидания
-        try:
-            return urgent_failover_queue.get_nowait(), True
-        except asyncio.QueueEmpty:
-            pass
-
-        # 2. Ждем задачу из любой из очередей
-        urgent_get = asyncio.create_task(urgent_failover_queue.get())
-        pipeline_get = asyncio.create_task(pipeline_queue.get())
-
-        done, pending = await asyncio.wait(
-            [urgent_get, pipeline_get],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        for p in pending:
-            p.cancel()
-
-        if urgent_get in done and not urgent_get.cancelled() and not urgent_get.exception():
-            # Если плановая тоже успела выполниться в этот же квант времени, возвращаем ее обратно
-            if pipeline_get in done and not pipeline_get.cancelled() and not pipeline_get.exception():
-                pipeline_queue.put_nowait(pipeline_get.result())
-            return urgent_get.result(), True
-        else:
-            return pipeline_get.result(), False
+        return await get_next_pipeline_task(urgent_failover_queue, pipeline_queue)
 
     async def worker_loop(worker_id: int):
         """Индивидуальный параллельный воркер-обработчик конвейера."""
@@ -904,7 +938,13 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
                     await asyncio.sleep(0.3)
             else:
                 # ОШИБКА: Immediate Priority Failover!
-                if retry_attempt < 3:
+                if w_parser.is_blocked():
+                    # All sessions share this external connection; failover would hammer the same IP.
+                    url_next_check[clean_url] = time.time() + max(15, w_parser.block_remaining())
+                    in_flight_urls.discard(clean_url)
+                    stats["exhausted_fails"] += 1
+                    stats["consecutive_failures"] += 1
+                elif retry_attempt < 3:
                     next_attempt = retry_attempt + 1
                     stats["failover_retries"] += 1
                     logger.warning(
@@ -926,7 +966,7 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
 
                     if stats["consecutive_failures"] >= FAILURE_THRESHOLD and not alert_sent:
                         alert_sent = True
-                        current_p = config.PROXY_URL or "Прямое соединение (без прокси)"
+                        current_p = "Настроенный прокси (реквизиты скрыты)" if config.PROXY_URL else "Прямое соединение (без прокси)"
                         alert_msg = (
                             f"🚨 <b>ВНИМАНИЕ: Сбой мониторинга Авито!</b>\n\n"
                             f"Конвейер зафиксировал <b>{stats['consecutive_failures']} отказов подряд</b>.\n"
@@ -1047,59 +1087,91 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
 
     try:
         await asyncio.gather(dispatcher_task, *worker_tasks)
-    except asyncio.CancelledError:
-        logger.info("🛑 Непрерывный конвейер мониторинга останавливается...")
+    finally:
         dispatcher_task.cancel()
         for wt in worker_tasks:
             wt.cancel()
         await asyncio.gather(dispatcher_task, *worker_tasks, return_exceptions=True)
+        for owned_parser in parser_pool.parsers:
+            if owned_parser is not parser:
+                owned_parser.close()
+
+
+async def deliver_notification(bot: Bot, parser: AvitoParser, row: dict) -> bool:
+    """Deliver a leased row once; failed deliveries stay in the persistent queue."""
+    notification_id, token = row["id"], row["lease_token"]
+    try:
+        payload = json.loads(row["payload"])
+        payload["item"] = AvitoItem(**payload["item"])
+        task = NotificationTask(**payload)
+    except (ValueError, KeyError, TypeError):
+        logger.error("Invalid outbox payload #%s", notification_id)
+        await database.discard_notification(notification_id, token)
+        return False
+
+    try:
+        search = await database.get_search(task.radar_id)
+        if not search or search["user_id"] != task.user_id or not await database.is_user_allowed(task.user_id):
+            await database.discard_notification(notification_id, token)
+            return False
+        if not search["is_active"]:
+            await database.release_notification(notification_id, token, 30)
+            return False
+        if task.is_price_drop:
+            user = await database.get_or_create_user(task.user_id)
+            if not config.is_admin(task.user_id) and (user.get("tariff_plan") or "").lower() != "pro":
+                await database.discard_notification(notification_id, token)
+                return False
+            threshold = int(search.get("min_discount_percent") or 0)
+            if threshold <= 0 or (task.drop_percent or 0) < threshold:
+                await database.discard_notification(notification_id, token)
+                return False
+        if not task.is_price_drop and not is_ad_fresh_enough(task.item.date, task.item.timestamp, search.get("max_age_minutes")):
+            await database.discard_notification(notification_id, token)
+            await database.mark_item_seen(task.radar_id, task.item.item_id, task.item.raw_price or 0)
+            return False
+        blocked = await database.get_blocked_sellers(task.user_id)
+        if is_stop_word_matched(task.item, search.get("stop_words", [])) or (task.item.seller_name and task.item.seller_name.lower().strip() in blocked):
+            await database.discard_notification(notification_id, token)
+            return False
+        delivered = await send_ad_to_user(
+            bot, parser, task.user_id, task.radar_id, task.search_title, task.item,
+            user_label=task.user_label, is_price_drop=task.is_price_drop,
+            old_price=task.old_price, drop_percent=task.drop_percent,
+        )
+        if delivered:
+            return await database.acknowledge_notification(notification_id, token, task.item.raw_price or 0)
+        await database.release_notification(notification_id, token, min(300, 2 ** min(row["attempts"], 8)))
+        return False
+    except asyncio.CancelledError:
+        await asyncio.shield(database.release_notification(notification_id, token))
         raise
+    except TelegramForbiddenError:
+        await database.deactivate_user_searches(task.user_id)
+        await database.discard_notification(notification_id, token)
+        return False
+    except TelegramRetryAfter as exc:
+        await database.release_notification(notification_id, token, exc.retry_after + 1)
+        return False
+    except Exception:
+        logger.exception("Outbox delivery failed #%s", notification_id)
+        await database.release_notification(notification_id, token, 10)
+        return False
 
 
 async def notification_worker(bot: Bot, parser: AvitoParser, worker_id: int = 1):
-    """
-    Фоновый воркер асинхронной очереди уведомлений (Outbox Worker).
-    Отправляет уведомления в Telegram независимо от цикла сканирования радаров.
-    Соблюдает безопасный лимит скорости (~20 сообщений/сек) и обрабатывает ошибки Telegram.
-    """
-    logger.info(f"📬 Фоновый сервис очереди уведомлений [Outbox #{worker_id}] запущен")
+    logger.info("📬 Persistent Outbox #%s started", worker_id)
     while True:
         try:
-            task: NotificationTask = await NOTIFICATION_QUEUE.get()
-            try:
-                # 🛡 Контрольная проверка: если радар был удален пока задача стояла в Outbox очереди
-                if not await database.is_search_active(task.radar_id):
-                    logger.debug(f"[Outbox #{worker_id}] Радар #{task.radar_id} удален, отмена отправки лота #{task.item.item_id}")
-                else:
-                    await send_ad_to_user(
-                        bot=bot,
-                        parser=parser,
-                        user_id=task.user_id,
-                        search_id=task.radar_id,
-                        search_title=task.search_title,
-                        it=task.item,
-                        user_label=task.user_label,
-                        is_price_drop=task.is_price_drop,
-                        old_price=task.old_price,
-                        drop_percent=task.drop_percent
-                    )
-            except TelegramForbiddenError:
-                logger.warning(f"🚫 [БЛОКИРОВКА] Пользователь ID:{task.user_id} заблокировал бота. Отключаем его радары.")
-                await database.deactivate_user_searches(task.user_id)
-            except TelegramRetryAfter as retry_err:
-                logger.warning(f"⏳ [FLOODWAIT] Telegram лимит: пауза {retry_err.retry_after} сек.")
-                await asyncio.sleep(retry_err.retry_after + 1)
-            except Exception as e:
-                logger.error(f"❌ [Outbox #{worker_id}] Ошибка отправки уведомления для ID:{task.user_id}: {e}")
-            finally:
-                NOTIFICATION_QUEUE.task_done()
-                # Мягкое квантование для каждого воркера
-                await asyncio.sleep(0.04)
+            row = await database.claim_notification()
+            if row is None:
+                await asyncio.sleep(0.5)
+                continue
+            await deliver_notification(bot, parser, row)
         except asyncio.CancelledError:
-            logger.info(f"🛑 Сервис очереди уведомлений [Outbox #{worker_id}] остановлен.")
-            break
-        except Exception as loop_err:
-            logger.error(f"Неожиданный сбой в notification_worker #{worker_id}: {loop_err}")
+            raise
+        except Exception:
+            logger.exception("Outbox worker #%s failed", worker_id)
             await asyncio.sleep(1)
 
 
@@ -1109,24 +1181,27 @@ async def supervised_monitoring_worker(bot: Bot, parser: AvitoParser):
     - Запускает бесконечный мониторинг;
     - При любом непредвиденном падении отправляет алерт администраторам и перезапускает процесс.
     """
-    while True:
-        try:
-            await monitoring_worker(bot, parser)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.critical(f"💥 [СУПЕРВИЗОР] Фатальное падение сервиса мониторинга: {e}", exc_info=True)
-            alert_text = (
-                f"🚨 <b>Критический сбой сервиса мониторинга!</b>\n\n"
-                f"<code>{html.escape(str(e)[:300])}</code>\n\n"
-                f"<i>Автоматический перезапуск мониторинга через 15 секунд...</i>"
-            )
-            for aid in config.ADMIN_IDS:
-                try:
-                    await bot.send_message(chat_id=aid, text=alert_text, parse_mode="HTML")
-                except Exception:
-                    pass
-            await asyncio.sleep(15)
+    try:
+        while True:
+            try:
+                await monitoring_worker(bot, parser)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.critical(f"💥 [СУПЕРВИЗОР] Фатальное падение сервиса мониторинга: {e}", exc_info=True)
+                alert_text = (
+                    f"🚨 <b>Критический сбой сервиса мониторинга!</b>\n\n"
+                    f"<code>{html.escape(str(e)[:300])}</code>\n\n"
+                    f"<i>Автоматический перезапуск мониторинга через 15 секунд...</i>"
+                )
+                for aid in config.ADMIN_IDS:
+                    try:
+                        await bot.send_message(chat_id=aid, text=alert_text, parse_mode="HTML")
+                    except Exception:
+                        pass
+                await asyncio.sleep(15)
+    finally:
+        parser.close()
 
 
 def start_background_services(bot: Bot) -> List[asyncio.Task]:
@@ -1136,7 +1211,7 @@ def start_background_services(bot: Bot) -> List[asyncio.Task]:
     2. Мониторинг Авито под супервизором (supervised_monitoring_worker)
     Возвращает список фоновых задач для управления их жизненным циклом.
     """
-    shared_parser = AvitoParser()
+    shared_parser = AvitoParser(proxy=config.PROXY_URL)
     NUM_NOTIF_WORKERS = 6
     notif_tasks = [
         asyncio.create_task(notification_worker(bot, shared_parser, worker_id=i + 1))

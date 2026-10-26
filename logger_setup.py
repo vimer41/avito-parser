@@ -1,17 +1,17 @@
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
 # Базовая директория логов
-LOGS_DIR = Path(__file__).resolve().parent / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
+LOGS_DIR = Path(os.getenv("LOGS_DIR", str(Path(__file__).resolve().parent / "logs")))
 
 USER_ACTIONS_LOG = LOGS_DIR / "user_actions.log"
 PARSER_LOG = LOGS_DIR / "parser.log"
 ERRORS_LOG = LOGS_DIR / "errors.log"
-COMBINED_LOG = Path(__file__).resolve().parent / "bot.log"
+COMBINED_LOG = Path(os.getenv("COMBINED_LOG", str(Path(__file__).resolve().parent / "bot.log")))
 
 # Логгер для действий пользователей
 user_logger = logging.getLogger("user_action")
@@ -26,6 +26,15 @@ def setup_logging():
     4. bot.log — общий консольный лог (для обратной совместимости и docker logs)
     5. sys.stdout — вывод в терминал
     """
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    COMBINED_LOG.parent.mkdir(parents=True, exist_ok=True)
+    # Повторная инициализация не должна оставлять открытые файлы и дублировать записи.
+    for name in ("", "user_action", "parser", "scheduler", "anti_bot", "anti_bot.manager"):
+        current_logger = logging.getLogger(name)
+        for handler in list(current_logger.handlers):
+            current_logger.removeHandler(handler)
+            handler.close()
+
     # Общий форматтер
     std_formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -97,7 +106,7 @@ def setup_logging():
     parser_handler.setFormatter(std_formatter)
     parser_handler.setLevel(logging.INFO)
 
-    for logger_name in ("parser", "scheduler", "anti_bot", "anti_bot.manager"):
+    for logger_name in ("parser", "scheduler", "anti_bot"):
         pl = logging.getLogger(logger_name)
         pl.addHandler(parser_handler)
 

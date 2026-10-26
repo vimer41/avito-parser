@@ -28,6 +28,7 @@ import secrets
 import sys
 import time
 from pathlib import Path
+from threading import Event
 from typing import Any, Optional
 from urllib.parse import urljoin, urlsplit
 
@@ -44,10 +45,18 @@ from anti_bot.generate_qrator_variants import (
     load_f_base,
     load_s_base,
 )
+from anti_bot.pow_budget import (
+    DEFAULT_POW_MAX_ITERATIONS,
+    DEFAULT_POW_TIMEOUT,
+    PowSearchError,
+    check_cancelled,
+)
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.avito.ru"
+BROWSER_VERSION = "147"
+BROWSER_PROFILE = f"firefox{BROWSER_VERSION}"
 POW_GET_URL = f"{BASE_URL}/web/3/firewallPow/get"
 POW_VERIFY_URL = f"{BASE_URL}/web/3/firewallPow/verify"
 FIREWALL_CAPTCHA_GET_URL = f"{BASE_URL}/web/5/firewallCaptcha/get"
@@ -66,14 +75,14 @@ if str(GEEKED_TEST_ROOT) not in sys.path:
 
 
 def get_browser_user_agent() -> str:
-    """Возвращает актуальный заголовок User-Agent для Firefox 152."""
+    """User-Agent с той же версией, что и TLS/HTTP-профиль curl_cffi."""
     if sys.platform.startswith("win"):
         platform_token = "Windows NT 10.0; Win64; x64"
     elif sys.platform == "darwin":
         platform_token = "Macintosh; Intel Mac OS X 10.15"
     else:
         platform_token = "X11; Linux x86_64"
-    return f"Mozilla/5.0 ({platform_token}; rv:152.0) Gecko/20100101 Firefox/152.0"
+    return f"Mozilla/5.0 ({platform_token}; rv:{BROWSER_VERSION}.0) Gecko/20100101 Firefox/{BROWSER_VERSION}.0"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -87,7 +96,7 @@ def is_qrator_challenge_response(response: Any) -> bool:
 
     status = response.status_code
     headers = getattr(response, "headers", {}) or {}
-    server = headers.get("server", "").strip().upper()
+    server = next((str(value).strip().upper() for key, value in headers.items() if key.lower() == "server"), "")
     text = getattr(response, "text", "") or ""
 
     has_meta_refresh = bool(
@@ -101,8 +110,8 @@ def is_qrator_challenge_response(response: Any) -> bool:
         if has_meta_refresh or has_fingerprint_script:
             return True
 
-    # Дополнительная проверка на случай нестандартных кодов или проксирования
-    if (server == "QRATOR" or "qrator" in server.lower()) and has_fingerprint_script:
+    # Прокси может убрать Server, но характерный script + refresh останутся.
+    if has_fingerprint_script and ("QRATOR" in server or has_meta_refresh):
         return True
 
     return False
@@ -144,32 +153,42 @@ def solve_qrator_challenge(
     response: Any,
     page_url: str,
     timeout: int = 15,
+    *,
+    cancel_event: Event | None = None,
 ) -> bool:
     """
-    Выполняет полный цикл подтверждения браузера перед QRATOR:
+    Best-effort обмен QRATOR с эталонным отпечатком (JS не исполняется):
     1. Загружает JS-скрипт отпечатка и favicon
     2. Генерирует XTEA-зашифрованные поля 'f' и 's' на базе эталонных отпечатков
     3. Отправляет /web/2/ft и сохраняет куки 'f' и 'ft'
     4. Запрашивает проверочный пиксель /web/1/u
     """
+    check_cancelled(cancel_event)
     qrator_html = getattr(response, "text", "") or ""
     logger.info("🛡 Обнаружен челлендж QRATOR. Запуск протокола обхода...")
     sequence_start = time.monotonic()
 
     # 1. Загрузка fingerprint-скрипта
     script_url = extract_qrator_script_url(qrator_html, page_url)
-    if script_url:
-        try:
-            session.get(
-                script_url,
-                headers={"Referer": page_url, "Accept": "*/*"},
-                timeout=timeout,
-                allow_redirects=False,
-            )
-        except Exception as e:
-            logger.debug(f"Ошибка загрузки Qrator JS скрипта: {e}")
+    if not script_url:
+        logger.warning("QRATOR challenge has no supported fingerprint script")
+        return False
+    try:
+        script_resp = session.get(
+            script_url,
+            headers={"Referer": page_url, "Accept": "*/*"},
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        if script_resp.status_code != 200:
+            logger.warning("QRATOR script rejected: HTTP %s", script_resp.status_code)
+            return False
+    except Exception as e:
+        logger.debug(f"Ошибка загрузки Qrator JS скрипта: {e}")
+        return False
 
     # 2. Загрузка favicon
+    check_cancelled(cancel_event)
     try:
         session.get(
             QRATOR_FAVICON_URL,
@@ -183,9 +202,13 @@ def solve_qrator_challenge(
     # Имитация времени выполнения JS в браузере (1 сек)
     elapsed = time.monotonic() - sequence_start
     if elapsed < 1.0:
-        time.sleep(1.0 - elapsed)
+        if cancel_event is not None:
+            cancel_event.wait(1.0 - elapsed)
+        else:
+            time.sleep(1.0 - elapsed)
+    check_cancelled(cancel_event)
 
-    # 3. Генерация валидных полей 'f' и 's'
+    # 3. Синтетические поля 'f' и 's'; валидность определяет только сервер.
     try:
         f_base = load_f_base(DEFAULT_BASE_F)
         s_base = load_s_base(DEFAULT_BASE_S)
@@ -202,8 +225,9 @@ def solve_qrator_challenge(
         return False
 
     # Устанавливаем куку f
-    session.cookies.set("f", f_value, domain=".avito.ru", path="/")
-    session.cookies.set("f", f_value, domain="www.avito.ru", path="/")
+    session.cookies.delete("f")
+    session.cookies.set("f", f_value, domain=".avito.ru", path="/", secure=True)
+    check_cancelled(cancel_event)
 
     # 4. Отправка multipart в /web/2/ft
     content_type, multipart_body = build_qrator_multipart(f_value, s_value)
@@ -237,14 +261,15 @@ def solve_qrator_challenge(
 
         # Важно: JS Qrator помещает в куку токен с обрамляющими кавычками
         ft_cookie_val = json.dumps(token, ensure_ascii=False, separators=(",", ":"))
-        session.cookies.set("ft", ft_cookie_val, domain=".avito.ru", path="/")
-        session.cookies.set("ft", ft_cookie_val, domain="www.avito.ru", path="/")
+        session.cookies.delete("ft")
+        session.cookies.set("ft", ft_cookie_val, domain=".avito.ru", path="/", secure=True)
 
     except Exception as e:
         logger.error(f"Исключение при запросе к Qrator /web/2/ft: {e}")
         return False
 
     # 5. Запрос проверочного пикселя /web/1/u?{pixel_id}
+    check_cancelled(cancel_event)
     pixel_id = secrets.randbelow(0xFFFFFFFF)
     pixel_headers = {
         "Accept": "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
@@ -254,18 +279,21 @@ def solve_qrator_challenge(
         "Sec-Fetch-Site": "same-origin",
     }
     try:
-        session.get(
+        pixel_resp = session.get(
             f"{QRATOR_PIXEL_URL}?{pixel_id}",
             headers=pixel_headers,
             timeout=timeout,
             allow_redirects=False,
         )
+        if pixel_resp.status_code not in (200, 204):
+            logger.warning("Qrator pixel rejected: HTTP %s", pixel_resp.status_code)
+            return False
     except Exception as e:
         logger.debug(f"Ошибка запроса пикселя Qrator: {e}")
+        return False
 
-    # Задержка после пикселя для синхронизации кэша защиты
-    time.sleep(1.5)
-    logger.info("✅ Защита QRATOR успешно пройдена, куки f и ft установлены!")
+    check_cancelled(cancel_event)
+    logger.info("🍪 QRATOR выдал токен; доступ подтвердит только повторный запрос целевой страницы")
     return True
 
 
@@ -307,6 +335,10 @@ def solve_pow_challenge(
     pow_challenge: str,
     referer: str = "https://www.avito.ru/",
     timeout: int = 15,
+    *,
+    cancel_event: Event | None = None,
+    pow_timeout: float = DEFAULT_POW_TIMEOUT,
+    max_iterations: int = DEFAULT_POW_MAX_ITERATIONS,
 ) -> bool:
     """
     Решает криптографический Proof-of-Work (PoW) Авито:
@@ -314,8 +346,9 @@ def solve_pow_challenge(
     2. Декодирует сложность (compl) и ID задания из полезной нагрузки JWT
     3. Подбирает nonce, при котором sha256(f"{cid}:{nonce}") начинается с N нулей
     4. Отправляет решение на /web/3/firewallPow/verify
-    5. Проверяет подтверждение и устанавливает куку pow_solved
+    5. Проверяет серверное подтверждение; cookie и их TTL задаёт сервер
     """
+    check_cancelled(cancel_event)
     try:
         headers = {
             "Content-Type": "application/json",
@@ -345,7 +378,10 @@ def solve_pow_challenge(
 
         # 2. Вычисление SHA-256 PoW
         logger.info("🧩 firewallPow/get получен, вычисляем SHA-256 PoW...")
-        verify_payload = build_verify_payload(challenge_jwt)
+        verify_payload = build_verify_payload(
+            challenge_jwt, timeout=pow_timeout, max_iterations=max_iterations, cancel_event=cancel_event,
+        )
+        check_cancelled(cancel_event)
 
         # 3. Отправка решения на проверку
         verify_resp = session.post(
@@ -355,6 +391,7 @@ def solve_pow_challenge(
             timeout=timeout,
             allow_redirects=False,
         )
+        check_cancelled(cancel_event)
         if verify_resp.status_code != 200:
             logger.error(f"firewallPow/verify ответил статусом {verify_resp.status_code}")
             return False
@@ -363,19 +400,20 @@ def solve_pow_challenge(
         result = verify_json.get("success", {}).get("result", {})
         if result.get("verified") is True:
             unblock_ttl = result.get("unblock_ttl")
-            session.cookies.set("pow_solved", "1", domain=".avito.ru", path="/")
-            session.cookies.set("pow_solved", "1", domain="www.avito.ru", path="/")
+            # Только сервер задаёт время жизни cookie; локальная метка не является пропуском.
             # Очищаем временный вызов pow_challenge, чтобы исключить ложные срабатывания
             try:
-                session.cookies.pop("pow_challenge", None)
+                session.cookies.delete("pow_challenge")
             except Exception:
                 pass
-            logger.info(f"✅ PoW успешно решен! (unblock_ttl: {unblock_ttl} сек)")
+            logger.info(f"🧩 Сервер принял PoW (unblock_ttl: {unblock_ttl} сек); проверяем целевую страницу")
             return True
         else:
             logger.warning(f"PoW отклонен сервером: {verify_resp.text[:200]}")
             return False
 
+    except PowSearchError:
+        raise
     except Exception as e:
         logger.error(f"Исключение при решении PoW: {e}")
         return False
@@ -408,12 +446,15 @@ def solve_geetest_if_available(
     session: requests.Session,
     response: Any,
     page_url: str,
+    *,
+    cancel_event: Event | None = None,
 ) -> bool:
     """
     Пытается решить GeeTest v4 локально с помощью модуля GeekedTest.
     Если ML-библиотеки (opencv, ddddocr, pycryptodome) не установлены,
     выводит понятное предупреждение в лог без падения бота.
     """
+    check_cancelled(cancel_event)
     geeked_root_str = str(GEEKED_TEST_ROOT)
     if geeked_root_str not in sys.path:
         sys.path.insert(0, geeked_root_str)
@@ -451,7 +492,11 @@ def solve_geetest_if_available(
             },
             headers={"Referer": BASE_URL + "/"},
             timeout=15,
+            allow_redirects=False,
         )
+        check_cancelled(cancel_event)
+        if load_resp.status_code != 200:
+            return False
 
         match = re.fullmatch(rf"\s*{re.escape(callback)}\((.*)\)\s*;?\s*", load_resp.text, re.DOTALL)
         if not match:
@@ -468,6 +513,7 @@ def solve_geetest_if_available(
             lang="rus",
             session=session,
             request_headers={"Referer": BASE_URL + "/"},
+            cancel_event=cancel_event,
         )
         solver.lot_number = task_data.get("lot_number")
         solver.base_url = GEETEST_BASE_URL
@@ -477,6 +523,7 @@ def solve_geetest_if_available(
             return False
 
         # Отправляем подтверждение на Авито
+        check_cancelled(cancel_event)
         cube_val = str(10 + secrets.randbelow(90))
         verify_payload = {
             "captcha": "",
@@ -493,16 +540,22 @@ def solve_geetest_if_available(
                 "Content-Type": "application/json",
             },
             timeout=15,
+            allow_redirects=False,
         )
+        check_cancelled(cancel_event)
+        if verify_resp.status_code != 200:
+            return False
 
         v_body = verify_resp.json()
         if v_body.get("success", {}).get("result", {}).get("verified") is True:
-            logger.info("🎉 GeeTest v4 капча успешно решена и подтверждена Авито!")
+            logger.info("🧩 Авито принял решение GeeTest; проверяем целевую страницу")
             return True
 
         logger.warning("GeeTest: Авито отклонил решение капчи")
         return False
 
+    except PowSearchError:
+        raise
     except Exception as e:
         logger.error(f"Исключение при решении GeeTest: {e}")
         return False
@@ -516,24 +569,28 @@ def handle_anti_bot_challenge(
     session: requests.Session,
     response: Any,
     page_url: str,
+    *,
+    cancel_event: Event | None = None,
 ) -> bool:
     """
     Универсальный обработчик защиты Авито.
     Проверяет тип защиты (QRATOR, PoW 439, GeeTest) и решает её.
-    Возвращает True, если защита успешно пройдена и можно повторить запрос.
+    True означает, что этап решения принят и можно повторить запрос.
+    Это НЕ подтверждение доступа: вызывающий код обязан проверить исходную страницу.
     """
+    check_cancelled(cancel_event)
     # 1. QRATOR 302/429
     if is_qrator_challenge_response(response):
-        return solve_qrator_challenge(session, response, page_url)
+        return solve_qrator_challenge(session, response, page_url, cancel_event=cancel_event)
 
     # 2. Firewall PoW (439, 429 или в куках)
     pow_challenge = extract_pow_challenge(response, session)
     if pow_challenge:
         logger.info("🧩 Обнаружен челлендж Firewall PoW, запускаем решение...")
-        return solve_pow_challenge(session, pow_challenge, referer=page_url)
+        return solve_pow_challenge(session, pow_challenge, referer=page_url, cancel_event=cancel_event)
 
     # 3. GeeTest v4 Captcha
     if is_geetest_challenge(response):
-        return solve_geetest_if_available(session, response, page_url)
+        return solve_geetest_if_available(session, response, page_url, cancel_event=cancel_event)
 
     return False

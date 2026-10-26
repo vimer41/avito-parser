@@ -5,78 +5,84 @@ on:
     branches:
       - main
       - feature/json-api
+  pull_request:
+    branches:
+      - main
+      - feature/json-api
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: avito-radar-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
-    name: 🧪 Automated Tests & Quality Check
+    name: Offline regression tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout repository
+      - name: Checkout exact commit
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
+          python -m pip check
 
-      - name: Check code syntax & compilation
-        run: |
-          python -m py_compile config.py database.py middlewares.py parser.py scheduler.py logger_setup.py bot.py handlers/*.py
+      - name: Check all Python sources without starting the bot
+        run: python -B tools/check_syntax.py
 
-      - name: Run Unit Tests Suite
+      - name: Validate deploy script syntax
+        run: bash -n tools/deploy.sh
+
+      - name: Run isolated offline regression suite
         env:
-          BOT_TOKEN: "1234567890:MOCK_TOKEN_FOR_CI_CD"
-          ADMIN_ID: "986832959"
-          ADMIN_IDS: "986832959,455386428"
-        run: |
-          python -m unittest discover -s tests -p "test_*.py"
+          AVITO_RADAR_TESTING: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: timeout 180 python -B tools/run_offline_tests.py
 
   deploy:
-    name: 🚀 Automated Deploy to VPS
+    name: Deploy tested commit to VPS
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/feature/json-api' || github.ref == 'refs/heads/main'
+    timeout-minutes: 20
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/feature/json-api' || github.ref == 'refs/heads/main')
+    concurrency:
+      group: avito-radar-vps-deploy
+      cancel-in-progress: false
     steps:
-      - name: SSH and deploy bot
-        uses: appleboy/ssh-action@master
+      - name: Checkout tested deploy script
+        uses: actions/checkout@v4
+
+      - name: Wrap remote script in Bash regardless of the SSH login shell
+        run: |
+          printf "bash -s <<'AVITO_DEPLOY_SCRIPT'\n" > .deploy-remote.sh
+          cat tools/deploy.sh >> .deploy-remote.sh
+          printf "\nAVITO_DEPLOY_SCRIPT\n" >> .deploy-remote.sh
+
+      - name: SSH and deploy exact tested SHA
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_BRANCH: ${{ github.ref_name }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USERNAME }}
           password: ${{ secrets.VPS_PASSWORD }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
           port: 22
-          script: |
-            set -e
-            echo "🚀 Начало автоматического деплоя Avito Radar..."
-            TARGET_DIR=""
-            if [ -d "/opt/avito_parser_bot" ]; then
-              TARGET_DIR="/opt/avito_parser_bot"
-            elif [ -d "/opt/avito-bot" ]; then
-              TARGET_DIR="/opt/avito-bot"
-            fi
-
-            if [ -n "$TARGET_DIR" ]; then
-              cd "$TARGET_DIR"
-              git fetch origin feature/json-api
-              git checkout -B feature/json-api origin/feature/json-api || git reset --hard origin/feature/json-api
-              source venv/bin/activate
-              pip install --no-cache-dir -r requirements.txt
-              # Стираем пользователя johnpeterson92 из БД и логов на сервере
-              python -c "import database, asyncio; asyncio.run(database.purge_user_by_pattern('johnpeterson92'))" || true
-              sed -i '/johnpeterson/d' logs/user_actions.log 2>/dev/null || true
-              sed -i '/johnpeterson/d' bot.log 2>/dev/null || true
-              systemctl restart avito-bot
-              echo "✅ Бот успешно обновлен и перезапущен!"
-              systemctl is-active --quiet avito-bot && echo "🟢 Статус сервиса: ACTIVE"
-            else
-              echo "⚠️ Директория проекта не найдена (/opt/avito_parser_bot или /opt/avito-bot)!"
-              exit 1
-            fi
+          command_timeout: 18m
+          envs: DEPLOY_SHA,DEPLOY_BRANCH
+          script_path: .deploy-remote.sh
 

@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import requests
-import random
 from typing import List, Dict, Union, Optional, Any
 
 
@@ -52,14 +51,20 @@ class IconSolver:
         """Extract directions from question icons using the predefined mapping."""
         return [{'direction': self.ICON_MAPPING.get(q.split('/')[-1], '')} for q in self.ques]
 
-    def _process_bbox(self, bbox: List[int], im: np.ndarray) -> Optional[Dict[str, Union[str, List[float]]]]:
+    def _process_bbox(self, bbox: List[int], im: np.ndarray) -> Optional[str]:
         """Process a single bounding box and return direction and coordinates if matched."""
-        from .dddd_server import dddd_service
+        from .dddd_server import get_dddd_service
         x1, y1, x2, y2 = bbox
         img = im[y1:y2, x1:x2]
-        _, img_bytes = cv2.imencode(".png", img)
-        res = dddd_service.classification(img_bytes.tobytes())
-        res = res.split('_')[1]
+        if img.size == 0:
+            return None
+        encoded, img_bytes = cv2.imencode(".png", img)
+        if not encoded:
+            return None
+        res = get_dddd_service().classification(img_bytes.tobytes())
+        if not isinstance(res, str) or '_' not in res:
+            return None
+        res = res.split('_', 1)[1]
         return res if res in self.ICON_MAPPING.values() else None
 
     def find_icon_position(self) -> List[List[float]]:
@@ -67,12 +72,15 @@ class IconSolver:
         Find icon positions based on the question directions.
         Returns a list of coordinates for each required direction.
         """
-        from .dddd_server import dddd_service
-        bboxes = dddd_service.detection(self.imgs)
+        from .dddd_server import get_dddd_service
+        bboxes = get_dddd_service().detection(self.imgs)
         im = cv2.imdecode(np.frombuffer(self.imgs, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if im is None:
+            raise ValueError("GeeTest returned an invalid icon image")
 
         box_directions = self._get_directions()
-        unused_boxes = []
+        if not box_directions or any(not boxd['direction'] for boxd in box_directions):
+            raise ValueError("GeeTest contains an unknown question icon")
         results = []
 
         for bbox in bboxes:
@@ -84,22 +92,17 @@ class IconSolver:
             center = [(x1 + (x2 - x1) / 2) * 33, (y1 + (y2 - y1) / 2) * 49]
 
             # Try to match with required directions
-            matched = False
             for boxd in box_directions:
                 if boxd['direction'] == processed and 'bbox' not in boxd:
                     boxd['bbox'] = center
-                    matched = True
                     break
 
-            if not matched:
-                unused_boxes.append(center)
-
-        # Prepare results, using unused boxes if needed
+        # Do not submit random coordinates when recognition is incomplete.
         for boxd in box_directions:
             if 'bbox' in boxd:
                 results.append(boxd['bbox'])
-            elif unused_boxes:
-                results.append(unused_boxes.pop(random.randint(0, len(unused_boxes) - 1)))
+            else:
+                raise ValueError("GeeTest icon recognition is incomplete")
 
         return results
 

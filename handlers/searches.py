@@ -84,6 +84,9 @@ async def cb_cancel_fsm(call: CallbackQuery, state: FSMContext):
 @router.message(F.text.regexp(r"(?i)avito\.ru"))
 @router.message(SearchStates.waiting_for_url)
 async def process_avito_url(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Отправьте текстовую ссылку на поиск Авито.")
+        return
     raw_url = message.text.strip()
     user_id = message.from_user.id
 
@@ -166,8 +169,11 @@ async def process_avito_url(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-    parser = AvitoParser()
-    html_content = await asyncio.to_thread(parser.fetch_page, normalized_url)
+    parser = AvitoParser(proxy=config.PROXY_URL)
+    try:
+        html_content = await parser.fetch_page_async(normalized_url)
+    finally:
+        parser.close()
 
     if not html_content:
         log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Калибровка радара", f"Ошибка: Авито не вернул HTML («{normalized_url[:80]}»)", status="ERROR")
@@ -185,10 +191,15 @@ async def process_avito_url(message: Message, state: FSMContext):
     is_title_only = 1 if "bt=1" in normalized_url else 0
 
     # Сохраняем в БД
-    search_id = await database.add_search(user_id, search_title, normalized_url, search_in_title_only=is_title_only)
+    try:
+        search_id = await database.add_search(user_id, search_title, normalized_url, search_in_title_only=is_title_only)
+    except (database.RadarLimitError, PermissionError) as exc:
+        await status_msg.edit_text(f"⚠️ {html.escape(str(exc))}", parse_mode="HTML")
+        await state.clear()
+        return
 
     # Запоминаем текущие объявления, чтобы не спамить старыми
-    item_ids = [it.item_id for it in items]
+    item_ids = [(it.item_id, it.raw_price or 0) for it in items]
     if item_ids:
         await database.mark_items_seen_bulk(search_id, item_ids)
 
@@ -979,6 +990,10 @@ async def cb_manage_stops(call: CallbackQuery):
 @router.callback_query(F.data.startswith("add_stop_from_item:"))
 async def cb_add_stop_word_prompt(call: CallbackQuery, state: FSMContext):
     search_id = int(call.data.split(":")[1])
+    search = await database.get_search(search_id)
+    if not search or search["user_id"] != call.from_user.id:
+        await call.answer("Радар не найден", show_alert=True)
+        return
     await state.set_state(SearchStates.waiting_for_stop_word)
     await state.update_data(search_id=search_id)
 
@@ -996,7 +1011,7 @@ async def cb_add_stop_word_prompt(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(SearchStates.waiting_for_stop_word)
+@router.message(SearchStates.waiting_for_stop_word, F.text)
 async def process_stop_word_input(message: Message, state: FSMContext):
     raw_text = message.text.strip()
     menu_buttons = {
@@ -1020,7 +1035,7 @@ async def process_stop_word_input(message: Message, state: FSMContext):
     words = [w.strip() for w in raw_text.split(",") if w.strip()]
     added = []
     for w in words:
-        if await database.add_stop_word_to_search(search_id, w):
+        if await database.add_stop_word_to_search(search_id, w, message.from_user.id):
             added.append(w)
 
     await state.clear()
@@ -1045,7 +1060,9 @@ async def cb_remove_stop_word(call: CallbackQuery):
     search_id = int(parts[1])
     word = parts[2]
 
-    await database.remove_stop_word_from_search(search_id, word)
+    if not await database.remove_stop_word_from_search(search_id, word, call.from_user.id):
+        await call.answer("Радар или стоп-слово не найдено", show_alert=True)
+        return
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Удаление стоп-слова", f"Удалено «{word}» из радара #{search_id}", status="OK")
     logger.info(f"🛡 [СТОП-СЛОВА] Пользователь ID:{call.from_user.id} удалил «{word}» из радара #{search_id}")
     await call.answer(f"Слово «{word}» удалено")

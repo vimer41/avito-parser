@@ -1,7 +1,8 @@
 from uuid import uuid4
 from curl_cffi import requests
-import random, time, json
+import random, time, json, re
 from geeked.sign import Signer
+from anti_bot.pow_budget import check_cancelled
 
 
 class CaptchaSolveRejected(Exception):
@@ -21,6 +22,7 @@ class Geeked:
         session=None,
         request_headers=None,
         exchange_logger=None,
+        cancel_event=None,
         **kwargs,
     ):
         self.pass_token = None
@@ -28,8 +30,9 @@ class Geeked:
         self.captcha_id = captcha_id
         self.challenge = str(uuid4())
         self.lang = lang
+        self.cancel_event = cancel_event
         self.callback = Geeked.random()
-        self.session = session or requests.Session(
+        self.session = session if session is not None else requests.Session(
             impersonate="chrome124",
             **kwargs,
         )
@@ -56,10 +59,16 @@ class Geeked:
         return f"geetest_{int(random.random() * 10000) + int(time.time() * 1000)}"
 
     def format_response(self, response: str) -> dict:
-        # print(json.loads(response.split(f"{self.callback}(")[1][:-1]))
-        return json.loads(response.split(f"{self.callback}(")[1][:-1])["data"]
+        match = re.fullmatch(rf"\s*{re.escape(self.callback)}\((.*)\)\s*;?\s*", response, re.DOTALL)
+        if not match:
+            raise ValueError("GeeTest returned invalid JSONP")
+        payload = json.loads(match.group(1))
+        if not isinstance(payload, dict) or payload.get("status") != "success" or not isinstance(payload.get("data"), dict):
+            raise ValueError("GeeTest returned an unsuccessful response")
+        return payload["data"]
 
     def load_captcha(self):
+        check_cancelled(self.cancel_event)
         params = {
             "captcha_id": self.captcha_id,
             "challenge": self.challenge,
@@ -71,28 +80,35 @@ class Geeked:
             f"{self.base_url}/load",
             params=params,
             headers=self.request_headers,
+            timeout=15,
+            allow_redirects=False,
         )
+        check_cancelled(self.cancel_event)
+        res.raise_for_status()
         return self.format_response(res.text)
 
     def submit_captcha(self, data: dict) -> dict:
+        check_cancelled(self.cancel_event)
         self.callback = Geeked.random()
 
         params = {
             "callback": self.callback,
             "captcha_id": self.captcha_id,
             "client_type": "web",
-            "lot_number": self.lot_number,
+            "lot_number": data["lot_number"],
             "payload": data["payload"],
             "process_token": data["process_token"],
-            "payload_protocol": "1",
-            "pt": "1",
+            "payload_protocol": str(data.get("payload_protocol", "1")),
+            "pt": str(data["pt"]),
             "w": Signer.generate_w(
                 data,
                 self.captcha_id,
                 data["captcha_type"],
                 session=self.session,
+                cancel_event=self.cancel_event,
             ),
         }
+        check_cancelled(self.cancel_event)
         verify_url = f"{self.base_url}/verify"
         request_cookies = [
             {
@@ -108,7 +124,11 @@ class Geeked:
             verify_url,
             params=params,
             headers=self.request_headers,
+            timeout=15,
+            allow_redirects=False,
         )
+        check_cancelled(self.cancel_event)
+        response.raise_for_status()
         if self.exchange_logger is not None:
             self.exchange_logger(
                 context="GeeTest-verify",

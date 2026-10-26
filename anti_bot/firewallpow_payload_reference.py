@@ -16,7 +16,10 @@ import base64
 import hashlib
 import json
 from dataclasses import dataclass
+from threading import Event
 from typing import Any
+
+from anti_bot.pow_budget import DEFAULT_POW_MAX_ITERATIONS, DEFAULT_POW_TIMEOUT, SearchBudget
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,12 @@ class PowParameters:
 
     challenge_id: str
     complexity: int
+
+    def __post_init__(self):
+        if not isinstance(self.challenge_id, str) or not self.challenge_id:
+            raise ValueError("challenge id must be a non-empty string")
+        if isinstance(self.complexity, bool) or not isinstance(self.complexity, int) or not 0 <= self.complexity <= 64:
+            raise ValueError("complexity must be an integer between 0 and 64 hex digits")
 
 
 def build_get_payload(pow_challenge: str) -> dict[str, str]:
@@ -46,6 +55,8 @@ def decode_challenge_jwt(challenge_jwt: str) -> PowParameters:
     number. It does not validate the JWT signature; server-side verification is
     still required when a real browser sends the verify request.
     """
+    if not isinstance(challenge_jwt, str) or not challenge_jwt:
+        raise ValueError("challenge_jwt must be a non-empty string")
     parts = challenge_jwt.split(".")
     if len(parts) < 2:
         raise ValueError("invalid JWT: expected at least header and payload")
@@ -53,11 +64,13 @@ def decode_challenge_jwt(challenge_jwt: str) -> PowParameters:
     encoded_payload = parts[1]
     padded_payload = encoded_payload + "=" * (-len(encoded_payload) % 4)
     try:
-        raw_payload = base64.urlsafe_b64decode(padded_payload)
+        raw_payload = base64.b64decode(padded_payload, altchars=b"-_", validate=True)
         payload: dict[str, Any] = json.loads(raw_payload)
-    except (ValueError, json.JSONDecodeError) as exc:
+    except (ValueError, UnicodeError) as exc:
         raise ValueError("invalid JWT payload") from exc
 
+    if not isinstance(payload, dict):
+        raise ValueError("invalid JWT payload: expected an object")
     challenge_id = payload.get("id")
     complexity = payload.get("compl")
     if not isinstance(challenge_id, str) or isinstance(complexity, bool) or not isinstance(complexity, (int, float)):
@@ -78,7 +91,14 @@ def sha256_hex(challenge_id: str, nonce: int) -> str:
     return hashlib.sha256(candidate).hexdigest()
 
 
-def find_nonce(parameters: PowParameters, *, start: int = 0) -> int:
+def find_nonce(
+    parameters: PowParameters,
+    *,
+    start: int = 0,
+    timeout: float = DEFAULT_POW_TIMEOUT,
+    max_iterations: int = DEFAULT_POW_MAX_ITERATIONS,
+    cancel_event: Event | None = None,
+) -> int:
     """Find the first nonce whose hash starts with ``compl`` zero hex digits.
 
     JavaScript equivalent:
@@ -87,24 +107,36 @@ def find_nonce(parameters: PowParameters, *, start: int = 0) -> int:
         nonce = 0
         while (!sha256(`${id}:${nonce}`).startsWith(target)) nonce += 1
     """
-    if start < 0:
-        raise ValueError("start must be non-negative")
+    if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+        raise ValueError("start must be a non-negative integer")
+
+    budget = SearchBudget(timeout=timeout, max_iterations=max_iterations, cancel_event=cancel_event)
 
     target_prefix = "0" * parameters.complexity
     nonce = start
-    while not sha256_hex(parameters.challenge_id, nonce).startswith(target_prefix):
+    iteration = 0
+    while True:
+        budget.check(iteration)
+        if sha256_hex(parameters.challenge_id, nonce).startswith(target_prefix):
+            return nonce
         nonce += 1
-    return nonce
+        iteration += 1
 
 
-def build_verify_payload(challenge_jwt: str) -> dict[str, str | int]:
+def build_verify_payload(
+    challenge_jwt: str,
+    *,
+    timeout: float = DEFAULT_POW_TIMEOUT,
+    max_iterations: int = DEFAULT_POW_MAX_ITERATIONS,
+    cancel_event: Event | None = None,
+) -> dict[str, str | int]:
     """Build the JSON object that the captured code sends to ``verify``.
 
     ``challenge`` is the original JWT string, unchanged.  Only ``nonce`` is
     derived locally from its decoded ``id`` and ``compl`` fields.
     """
     parameters = decode_challenge_jwt(challenge_jwt)
-    nonce = find_nonce(parameters)
+    nonce = find_nonce(parameters, timeout=timeout, max_iterations=max_iterations, cancel_event=cancel_event)
     return {"challenge": challenge_jwt, "nonce": nonce}
 
 

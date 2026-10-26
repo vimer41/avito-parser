@@ -3,7 +3,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+TESTING = os.getenv("AVITO_RADAR_TESTING") == "1"
+if not TESTING:
+    load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "25"))
@@ -44,21 +46,19 @@ def parse_proxy(raw_proxy: str | None) -> str | None:
 RAW_PROXY = os.getenv("PROXY_URL", "").strip() or None
 PROXY_URL = parse_proxy(RAW_PROXY)
 
-# Список администраторов бота (Захар @vimerd и Арсений @prostatock)
-ADMIN_IDS = [986832959, 455386428]
-env_admin = os.getenv("ADMIN_ID", "986832959")
+# Значение ADMIN_IDS имеет приоритет; ADMIN_ID поддерживается для совместимости.
+raw_admin_ids = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "986832959,455386428"
 try:
-    for aid in env_admin.split(","):
-        if aid.strip() and int(aid.strip()) not in ADMIN_IDS:
-            ADMIN_IDS.append(int(aid.strip()))
-except Exception:
-    pass
+    ADMIN_IDS = list(dict.fromkeys(int(aid.strip()) for aid in raw_admin_ids.split(",") if aid.strip()))
+except ValueError as exc:
+    raise ValueError("ADMIN_IDS / ADMIN_ID must contain comma-separated integer IDs") from exc
+if not ADMIN_IDS or any(aid <= 0 for aid in ADMIN_IDS):
+    raise ValueError("At least one positive administrator ID is required")
 ADMIN_ID = ADMIN_IDS[0]
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 # Database path
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = DATA_DIR / "bot.db"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).expanduser().resolve()
+DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "bot.db"))).expanduser().resolve()

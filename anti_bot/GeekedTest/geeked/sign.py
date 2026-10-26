@@ -10,9 +10,13 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from Crypto.PublicKey.RSA import construct
 from Crypto.Cipher import PKCS1_v1_5
-from geeked.slide import SlideSolver
 from geeked.gobang import GobangSolver
-from geeked.icon import IconSolver
+from anti_bot.pow_budget import (
+    DEFAULT_POW_MAX_ITERATIONS,
+    DEFAULT_POW_TIMEOUT,
+    SearchBudget,
+    has_leading_zero_bits,
+)
 
 class LotParser:
     def __init__(self):
@@ -124,8 +128,12 @@ function encrypt_asymmetric_2(input, key) {
 
     @staticmethod
     def encrypt_w(raw_input, pt) -> str:
-        if not pt or '0' == pt:
+        pt = str(pt or "0")
+        if pt == "0":
             return urllib.parse.quote_plus(raw_input)
+
+        if pt != "1":
+            raise NotImplementedError(f"Unsupported GeeTest encryption protocol: pt={pt}")
 
         random_uid = Signer.rand_uid()
         enc_key: str
@@ -140,42 +148,29 @@ function encrypt_asymmetric_2(input, key) {
         return binascii.hexlify(enc_input).decode() + enc_key
 
     @staticmethod
-    def generate_pow(lot_number_pow, captcha_id_pow, hash_func, hash_version, bits, date, empty) -> dict:
-        """Generate the pow_msg & pow_sign | translated directly from the .js"""
-        bit_remainder = bits % 4
-        bit_division = bits // 4
-
-        prefix = '0' * bit_division
+    def generate_pow(
+        lot_number_pow, captcha_id_pow, hash_func, hash_version, bits, date, empty,
+        *, timeout=DEFAULT_POW_TIMEOUT, max_iterations=DEFAULT_POW_MAX_ITERATIONS, cancel_event=None,
+    ) -> dict:
+        """Generate a bounded PoW with a correct partial-nibble bit check."""
+        hashers = {"md5": hashlib.md5, "sha1": hashlib.sha1, "sha256": hashlib.sha256}
+        if hash_func not in hashers:
+            raise ValueError(f"Unsupported GeeTest hash function: {hash_func}")
+        hasher = hashers[hash_func]
+        if isinstance(bits, bool) or not isinstance(bits, int) or not 0 <= bits <= hasher().digest_size * 8:
+            raise ValueError("GeeTest difficulty must fit the hash digest")
+        budget = SearchBudget(timeout=timeout, max_iterations=max_iterations, cancel_event=cancel_event)
         pow_string = f"{hash_version}|{bits}|{hash_func}|{date}|{captcha_id_pow}|{lot_number_pow}|{empty}|"
 
+        iteration = 0
         while True:
+            budget.check(iteration)
             h = Signer.rand_uid()
             combined = pow_string + h
-            hashed_value = None
-
-            if hash_func == 'md5':
-                hashed_value = hashlib.md5(combined.encode('utf-8')).hexdigest()
-            elif hash_func == 'sha1':
-                hashed_value = hashlib.sha1(combined.encode('utf-8')).hexdigest()
-            elif hash_func == 'sha256':
-                hashed_value = hashlib.sha256(combined.encode('utf-8')).hexdigest()
-
-            if bit_remainder == 0:
-                if hashed_value.startswith(prefix):
-                    return {'pow_msg': pow_string + h, 'pow_sign': hashed_value}
-            else:
-                if hashed_value.startswith(prefix):
-                    length = len(prefix)
-                    threshold = None
-                    if bit_remainder == 1:
-                        threshold = 7
-                    elif bit_remainder == 2:
-                        threshold = 3
-                    elif bit_remainder == 3:
-                        threshold = 1
-
-                    if length <= threshold:
-                        return {'pow_msg': pow_string + h, 'pow_sign': hashed_value}
+            hashed_value = hasher(combined.encode('utf-8')).hexdigest()
+            if has_leading_zero_bits(hashed_value, bits):
+                return {'pow_msg': combined, 'pow_sign': hashed_value}
+            iteration += 1
 
     @staticmethod
     def generate_w(
@@ -184,13 +179,16 @@ function encrypt_asymmetric_2(input, key) {
         captcha_type: str,
         *,
         session=None,
+        cancel_event=None,
     ):
+        if str(data.get("pt", "0")) not in ("0", "1"):
+            raise NotImplementedError(f"Unsupported GeeTest encryption protocol: pt={data.get('pt')}")
         lot_number = data['lot_number']
         pow_detail = data['pow_detail']
         abo = {"YYhg":"BjI0"}
         base = abo | {
             **Signer.generate_pow(lot_number, captcha_id, pow_detail['hashfunc'], pow_detail['version'],
-                                  pow_detail['bits'], pow_detail['datetime'], ""),
+                                  pow_detail['bits'], pow_detail['datetime'], "", cancel_event=cancel_event),
             **lotParser.get_dict(lot_number),
             "biht": "1426265548",  # static
             "device_id": "",  # why is this empty!!
@@ -224,6 +222,7 @@ function encrypt_asymmetric_2(input, key) {
         if captcha_type in ("ai", "invisible"):
             pass
         elif captcha_type == "slide":
+            from geeked.slide import SlideSolver
             http_get = session.get if session is not None else requests.get
             left = SlideSolver(
                 http_get(
@@ -245,6 +244,7 @@ function encrypt_asymmetric_2(input, key) {
                 "userresponse": GobangSolver(data["ques"]).find_four_in_line()
             }
         elif captcha_type == "icon":
+            from geeked.icon import IconSolver
             base |= {
                 "passtime": random.randint(600, 1200),  # time in ms it took to solve
                 "userresponse": IconSolver(

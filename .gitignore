@@ -26,6 +26,10 @@ Thumbs.db
 # Cookies & Local Sessions
 avito_cookies.json
 *.session
+.releases/
+backups/
+.deploy.lock
+.deploy-remote.sh
 
 # Local Documentation & Guides
 DEPLOY_AND_MONETIZATION_GUIDE.md

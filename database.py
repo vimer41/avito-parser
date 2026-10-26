@@ -1,6 +1,8 @@
 import json
 import logging
+import secrets
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 import aiosqlite
 from config import DB_PATH, ADMIN_ID, ADMIN_IDS, MAX_SEARCHES_PER_USER
@@ -10,6 +12,19 @@ logger = logging.getLogger(__name__)
 MSK_TZ = timezone(timedelta(hours=3))
 
 DEFAULT_SELLER_MESSAGE = "Здравствуйте! Товар ещё продаётся? Готов забрать сегодня."
+
+
+class RadarLimitError(ValueError):
+    """The user's radar quota was reached during an atomic insert."""
+
+
+async def ensure_columns(db, table: str, columns: dict[str, str]):
+    """Idempotent additive migrations; real SQLite errors must fail startup."""
+    async with db.execute(f"PRAGMA table_info({table})") as cursor:
+        existing = {row[1] for row in await cursor.fetchall()}
+    for name, definition in columns.items():
+        if name not in existing:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def format_subscription_date(dt_val) -> str:
@@ -55,6 +70,7 @@ def format_subscription_date(dt_val) -> str:
 
 async def init_db():
     """Инициализация базы данных и создание таблиц."""
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous = NORMAL;")
@@ -73,23 +89,10 @@ async def init_db():
             );
         """)
 
-        # Миграция: добавляем is_allowed, subscription_until, trial_used если таблица уже создана
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN is_allowed INTEGER DEFAULT 0;")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN subscription_until TIMESTAMP;")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN trial_used INTEGER DEFAULT 0;")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN tariff_plan TEXT DEFAULT 'standart';")
-        except Exception:
-            pass
+        await ensure_columns(db, "users", {
+            "is_allowed": "INTEGER DEFAULT 0", "subscription_until": "TIMESTAMP",
+            "trial_used": "INTEGER DEFAULT 0", "tariff_plan": "TEXT DEFAULT 'standart'",
+        })
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS searches (
@@ -108,24 +111,14 @@ async def init_db():
             );
         """)
 
-        try:
-            await db.execute("ALTER TABLE searches ADD COLUMN min_discount_percent INTEGER DEFAULT 0;")
-        except Exception:
-            pass
-
-        try:
-            await db.execute("ALTER TABLE searches ADD COLUMN search_in_title_only INTEGER DEFAULT 0;")
-        except Exception:
-            pass
-
-        try:
-            await db.execute("ALTER TABLE searches ADD COLUMN max_age_minutes INTEGER DEFAULT 5;")
-        except Exception:
-            pass
+        await ensure_columns(db, "searches", {
+            "min_discount_percent": "INTEGER DEFAULT 0", "search_in_title_only": "INTEGER DEFAULT 0",
+            "max_age_minutes": "INTEGER DEFAULT 5",
+        })
 
         # Отключаем отслеживание скидок по дефолту на всех радарах (0% = выключено),
         # скидки работают только если пользователь сам явно включает их в меню радара.
-        await db.execute("UPDATE searches SET min_discount_percent = 0 WHERE min_discount_percent IS NULL OR min_discount_percent = 5;")
+        await db.execute("UPDATE searches SET min_discount_percent = 0 WHERE min_discount_percent IS NULL;")
 
         # По дефолту фильтр свежести на всех радарах до 5 минут (максимум 30 минут, без ограничений убрано)
         await db.execute("UPDATE searches SET max_age_minutes = 5 WHERE max_age_minutes IS NULL OR max_age_minutes <= 0 OR max_age_minutes > 30;")
@@ -157,19 +150,32 @@ async def init_db():
             );
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                search_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                claimed_at TIMESTAMP,
+                lease_token TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(search_id, item_id, event_key),
+                FOREIGN KEY (search_id) REFERENCES searches (id) ON DELETE CASCADE
+            );
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS outbox_ready ON notification_outbox(available_at, claimed_at);")
+        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS outbox_one_pending_item ON notification_outbox(search_id, item_id);")
+
         await db.commit()
         logger.info("База данных успешно инициализирована")
 
-    # Автоматическая очистка по запросу: удаляем johnpeterson92
-    try:
-        await purge_user_by_pattern("johnpeterson92")
-    except Exception as e:
-        logger.debug(f"Автоочистка johnpeterson92: {e}")
-
-
-
 async def get_or_create_user(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> Dict[str, Any]:
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
@@ -238,7 +244,7 @@ async def is_user_allowed(user_id: int) -> bool:
     """
     Проверяет, есть ли у пользователя активный доступ к функциям бота:
     1. Администратор (всегда полный доступ)
-    2. Ручное одобрение (is_allowed = 1 для тестов/друзей)
+    2. Ручное бессрочное одобрение (is_allowed = 1, subscription_until IS NULL)
     3. Действующая подписка или пробный период (subscription_until > datetime('now'))
     """
     if user_id in ADMIN_IDS:
@@ -247,7 +253,7 @@ async def is_user_allowed(user_id: int) -> bool:
         async with db.execute("""
             SELECT 1 FROM users 
             WHERE user_id = ? 
-              AND (is_allowed = 1 OR subscription_until > datetime('now'))
+              AND ((is_allowed = 1 AND subscription_until IS NULL) OR subscription_until > datetime('now'))
         """, (user_id,)) as cursor:
             row = await cursor.fetchone()
             return bool(row)
@@ -257,7 +263,10 @@ async def is_user_allowed(user_id: int) -> bool:
 async def set_user_allowed(user_id: int, is_allowed: int = 1):
     """Устанавливает статус разрешения доступа (1 = одобрен, 0 = заблокирован)."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET is_allowed = ? WHERE user_id = ?", (is_allowed, user_id))
+        await db.execute(
+            "UPDATE users SET is_allowed = ?, subscription_until = NULL, trial_used = 1 WHERE user_id = ?",
+            (int(bool(is_allowed)), user_id),
+        )
         await db.commit()
 
 
@@ -280,7 +289,24 @@ async def update_user_default_template(user_id: int, template: str):
 
 
 async def add_search(user_id: int, title: str, url: str, search_in_title_only: int = 0, max_age_minutes: int = 5) -> int:
+    max_radars = await get_user_max_radars(user_id)
+    max_age_minutes = min(30, max(1, int(max_age_minutes)))
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        db.row_factory = aiosqlite.Row
+        if user_id not in ADMIN_IDS:
+            async with db.execute("""
+                SELECT * FROM users WHERE user_id = ?
+                  AND ((is_allowed = 1 AND subscription_until IS NULL) OR subscription_until > datetime('now'))
+            """, (user_id,)) as cursor:
+                user = await cursor.fetchone()
+                if user is None:
+                    raise PermissionError("Доступ к мониторингу истёк или отозван")
+                plan = (user["tariff_plan"] or "standart").lower()
+                max_radars = 9 if plan == "pro" else 4 if user["is_allowed"] else 1 if user["trial_used"] else 4
+        async with db.execute("SELECT COUNT(*) FROM searches WHERE user_id = ?", (user_id,)) as cursor:
+            if (await cursor.fetchone())[0] >= max_radars:
+                raise RadarLimitError(f"Достигнут лимит радаров ({max_radars})")
         cursor = await db.execute(
             "INSERT INTO searches (user_id, title, url, stop_words, search_in_title_only, min_discount_percent, max_age_minutes) VALUES (?, ?, ?, ?, ?, 0, ?)",
             (user_id, title, url, json.dumps([], ensure_ascii=False), search_in_title_only, max_age_minutes)
@@ -370,6 +396,19 @@ async def is_search_active(search_id: int) -> bool:
             return row is not None
 
 
+async def can_deliver_to_search(search_id: int, user_id: int) -> bool:
+    placeholders = ",".join("?" for _ in ADMIN_IDS)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(f"""
+            SELECT 1 FROM searches s JOIN users u ON u.user_id = s.user_id
+            WHERE s.id = ? AND s.user_id = ? AND s.is_active = 1
+              AND (u.user_id IN ({placeholders})
+                   OR (u.is_allowed = 1 AND u.subscription_until IS NULL)
+                   OR u.subscription_until > datetime('now'))
+        """, (search_id, user_id, *ADMIN_IDS)) as cursor:
+            return await cursor.fetchone() is not None
+
+
 async def delete_search(search_id: int, user_id: int) -> bool:
     """
     Удаляет радар пользователя и связанные просмотренные лоты.
@@ -379,17 +418,19 @@ async def delete_search(search_id: int, user_id: int) -> bool:
         cursor = await db.execute("DELETE FROM searches WHERE id = ? AND user_id = ?", (search_id, user_id))
         if cursor.rowcount > 0:
             await db.execute("DELETE FROM seen_items WHERE search_id = ?", (search_id,))
+            await db.execute("DELETE FROM notification_outbox WHERE search_id = ?", (search_id,))
             await db.commit()
             return True
         return False
 
 
-async def add_stop_word_to_search(search_id: int, word: str) -> bool:
+async def add_stop_word_to_search(search_id: int, word: str, user_id: int) -> bool:
     word = word.strip().lower()
     if not word:
         return False
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT stop_words FROM searches WHERE id = ?", (search_id,)) as cursor:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT stop_words FROM searches WHERE id = ? AND user_id = ?", (search_id, user_id)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return False
@@ -398,17 +439,18 @@ async def add_stop_word_to_search(search_id: int, word: str) -> bool:
         if word not in stop_words:
             stop_words.append(word)
             await db.execute(
-                "UPDATE searches SET stop_words = ? WHERE id = ?",
-                (json.dumps(stop_words, ensure_ascii=False), search_id)
+                "UPDATE searches SET stop_words = ? WHERE id = ? AND user_id = ?",
+                (json.dumps(stop_words, ensure_ascii=False), search_id, user_id)
             )
             await db.commit()
         return True
 
 
-async def remove_stop_word_from_search(search_id: int, word: str) -> bool:
+async def remove_stop_word_from_search(search_id: int, word: str, user_id: int) -> bool:
     word = word.strip().lower()
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT stop_words FROM searches WHERE id = ?", (search_id,)) as cursor:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT stop_words FROM searches WHERE id = ? AND user_id = ?", (search_id, user_id)) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return False
@@ -417,8 +459,8 @@ async def remove_stop_word_from_search(search_id: int, word: str) -> bool:
         if word in stop_words:
             stop_words.remove(word)
             await db.execute(
-                "UPDATE searches SET stop_words = ? WHERE id = ?",
-                (json.dumps(stop_words, ensure_ascii=False), search_id)
+                "UPDATE searches SET stop_words = ? WHERE id = ? AND user_id = ?",
+                (json.dumps(stop_words, ensure_ascii=False), search_id, user_id)
             )
             await db.commit()
             return True
@@ -450,7 +492,7 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
             JOIN users u ON s.user_id = u.user_id 
             WHERE s.is_active = 1
               AND (u.user_id IN ({admin_placeholders}) 
-                   OR u.is_allowed = 1 
+                    OR (u.is_allowed = 1 AND u.subscription_until IS NULL)
                    OR u.subscription_until > datetime('now'))
         """
         async with db.execute(query, ADMIN_IDS) as cursor:
@@ -640,7 +682,7 @@ async def get_system_stats() -> Dict[str, int]:
         query_allowed = f"""
             SELECT COUNT(*) FROM users 
             WHERE user_id IN ({admin_placeholders}) 
-               OR is_allowed = 1 
+               OR (is_allowed = 1 AND subscription_until IS NULL)
                OR subscription_until > datetime('now')
         """
         async with db.execute(query_allowed, ADMIN_IDS) as cur:
@@ -668,6 +710,7 @@ async def get_system_stats() -> Dict[str, int]:
 async def activate_trial(user_id: int) -> Dict[str, Any]:
     """Активирует пробный период 24 часа. Строго 1 раз на пользователя."""
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT trial_used, subscription_until FROM users WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
@@ -693,6 +736,10 @@ async def activate_trial(user_id: int) -> Dict[str, Any]:
 
 async def grant_subscription(user_id: int, days: int = 30, tariff_plan: Optional[str] = None) -> str:
     """Выдаёт или продлевает подписку на N дней и опционально обновляет тариф."""
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+        raise ValueError("days must be a positive integer")
+    if tariff_plan is not None and tariff_plan.lower() not in ("standart", "pro"):
+        raise ValueError("Unknown tariff plan")
     async with aiosqlite.connect(DB_PATH) as db:
         if tariff_plan:
             await db.execute("""
@@ -731,6 +778,107 @@ async def deactivate_user_searches(user_id: int):
         await db.commit()
 
 
+async def enqueue_notification(search_id: int, user_id: int, item_id: str, event_key: str, payload: dict) -> bool:
+    """Persist a notification before delivery; never mark it seen on enqueue."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        admin_placeholders = ",".join("?" for _ in ADMIN_IDS)
+        async with db.execute(f"""
+            SELECT 1 FROM searches s JOIN users u ON u.user_id = s.user_id
+            WHERE s.id = ? AND s.user_id = ? AND s.is_active = 1
+              AND (u.user_id IN ({admin_placeholders})
+                   OR (u.is_allowed = 1 AND u.subscription_until IS NULL)
+                   OR u.subscription_until > datetime('now'))
+        """, (search_id, user_id, *ADMIN_IDS)) as cursor:
+            if await cursor.fetchone() is None:
+                return False
+        if event_key == "new":
+            async with db.execute("SELECT 1 FROM seen_items WHERE search_id = ? AND item_id = ?", (search_id, str(item_id))) as cursor:
+                if await cursor.fetchone() is not None:
+                    return False
+        else:
+            async with db.execute("SELECT last_price FROM seen_items WHERE search_id = ? AND item_id = ?", (search_id, str(item_id))) as cursor:
+                seen = await cursor.fetchone()
+            if seen is None or seen[0] != payload.get("old_price"):
+                return False
+        async with db.execute("SELECT COUNT(*) FROM notification_outbox") as cursor:
+            if (await cursor.fetchone())[0] >= 3000:
+                logger.warning("Outbox is full; the item remains unseen for a later scan")
+                return False
+        cursor = await db.execute("""
+            INSERT OR IGNORE INTO notification_outbox (search_id, user_id, item_id, event_key, payload)
+            VALUES (?, ?, ?, ?, ?)
+        """, (search_id, user_id, str(item_id), event_key, json.dumps(payload, ensure_ascii=False)))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_pending_new_item_ids(search_id: int) -> set[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT item_id FROM notification_outbox WHERE search_id = ? AND event_key = 'new'", (search_id,)) as cursor:
+            return {row[0] for row in await cursor.fetchall()}
+
+
+async def claim_notification(lease_seconds: int = 300) -> Optional[Dict[str, Any]]:
+    """Atomically lease one ready row, recovering abandoned deliveries after a crash."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("""
+            SELECT * FROM notification_outbox
+            WHERE available_at <= datetime('now')
+              AND (claimed_at IS NULL OR claimed_at <= datetime('now', '-' || ? || ' seconds'))
+            ORDER BY id LIMIT 1
+        """, (lease_seconds,)) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        token = secrets.token_hex(16)
+        await db.execute("""
+            UPDATE notification_outbox
+            SET claimed_at = datetime('now'), lease_token = ?, attempts = attempts + 1 WHERE id = ?
+        """, (token, row["id"]))
+        await db.commit()
+        result = dict(row)
+        result.update(lease_token=token, attempts=row["attempts"] + 1)
+        return result
+
+
+async def acknowledge_notification(notification_id: int, lease_token: str, price: int) -> bool:
+    """Commit the seen/price state only after Telegram acknowledged delivery."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT search_id, user_id, item_id FROM notification_outbox WHERE id = ? AND lease_token = ?", (notification_id, lease_token)) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return False
+        await db.execute("""
+            INSERT INTO seen_items (search_id, item_id, last_price)
+            SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM searches WHERE id = ? AND user_id = ?)
+            ON CONFLICT(search_id, item_id) DO UPDATE SET last_price = excluded.last_price
+        """, (row[0], row[2], int(price or 0), row[0], row[1]))
+        await db.execute("DELETE FROM notification_outbox WHERE id = ? AND lease_token = ?", (notification_id, lease_token))
+        await db.commit()
+        return True
+
+
+async def release_notification(notification_id: int, lease_token: str, delay_seconds: float = 0):
+    delay = min(86400, max(0, int(delay_seconds) + (delay_seconds % 1 > 0)))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE notification_outbox SET claimed_at = NULL, lease_token = NULL,
+                available_at = datetime('now', '+' || ? || ' seconds')
+            WHERE id = ? AND lease_token = ?
+        """, (delay, notification_id, lease_token))
+        await db.commit()
+
+
+async def discard_notification(notification_id: int, lease_token: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM notification_outbox WHERE id = ? AND lease_token = ?", (notification_id, lease_token))
+        await db.commit()
+
+
 def create_database_backup_file() -> Optional[str]:
     """
     Создает консистентный бинарный бэкап базы данных SQLite через встроенный API backup().
@@ -761,13 +909,14 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
     """
     Полностью и безвозвратно удаляет пользователя и все его данные из БД
     (аккаунт, радары, историю лотов, стоп-слова, черный список продавцов).
-    Поиск ведется по user_id, username (@...) или first_name.
+    Удаление только по точному user_id или username, без LIKE и имени человека.
     """
     clean = pattern.strip().lstrip("@").lower()
     if not clean:
         return {"success": False, "deleted": 0, "message": "Паттерн не может быть пустым"}
 
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
         db.row_factory = aiosqlite.Row
         if clean.isdigit():
             async with db.execute("SELECT * FROM users WHERE user_id = ?", (int(clean),)) as cur:
@@ -775,14 +924,16 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
         else:
             async with db.execute("""
                 SELECT * FROM users 
-                WHERE LOWER(COALESCE(username, '')) = ? 
-                   OR LOWER(COALESCE(username, '')) LIKE ? 
-                   OR LOWER(COALESCE(first_name, '')) LIKE ?
-            """, (clean, f"%{clean}%", f"%{clean}%")) as cur:
+                WHERE LOWER(COALESCE(username, '')) = ?
+            """, (clean,)) as cur:
                 rows = await cur.fetchall()
 
         if not rows:
             return {"success": False, "deleted": 0, "message": f"Пользователь '{pattern}' не найден в базе данных."}
+        if len(rows) != 1:
+            return {"success": False, "deleted": 0, "message": "Несколько пользователей с этим username. Укажите точный ID."}
+        if rows[0]["user_id"] in ADMIN_IDS:
+            return {"success": False, "deleted": 0, "message": "Удаление администратора запрещено."}
 
         deleted_users = []
         for r in rows:
@@ -797,6 +948,7 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
                 WHERE search_id IN (SELECT id FROM searches WHERE user_id = ?)
             """, (uid,))
             # Удаляем радары пользователя
+            await db.execute("DELETE FROM notification_outbox WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM searches WHERE user_id = ?", (uid,))
             # Удаляем заблокированных продавцов
             await db.execute("DELETE FROM blocked_sellers WHERE user_id = ?", (uid,))

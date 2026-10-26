@@ -3,11 +3,9 @@ import os
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
-# Устанавливаем тестовое окружение до импорта модулей
-os.environ["BOT_TOKEN"] = "1234567890:TEST_TOKEN_FOR_CI_CD_MOCK"
-os.environ["ADMIN_ID"] = "986832959"
-os.environ["ADMIN_IDS"] = "986832959,455386428"
+from tests import _environment
 
 import config
 import database
@@ -20,10 +18,12 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         # Используем отдельную изолированную тестовую базу в tempfile
         self.temp_dir = tempfile.TemporaryDirectory()
         self.test_db_path = Path(self.temp_dir.name) / "test_bot.db"
-        database.DB_PATH = self.test_db_path
+        self.db_patch = patch.object(database, "DB_PATH", self.test_db_path)
+        self.db_patch.start()
         await database.init_db()
 
     async def asyncTearDown(self):
+        self.db_patch.stop()
         self.temp_dir.cleanup()
 
     async def test_admin_and_trial_limits(self):
