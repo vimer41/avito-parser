@@ -8,6 +8,8 @@ umask 077
 [[ "$DEPLOY_BRANCH" == main || "$DEPLOY_BRANCH" == feature/json-api ]] || { echo "Invalid deploy branch"; exit 1; }
 DEPLOY_FULL_TESTS="${DEPLOY_FULL_TESTS:-1}"
 [[ "$DEPLOY_FULL_TESTS" == 0 || "$DEPLOY_FULL_TESTS" == 1 ]] || { echo "DEPLOY_FULL_TESTS must be 0 or 1"; exit 1; }
+DEPLOY_STOP_BEFORE_PREFLIGHT="${DEPLOY_STOP_BEFORE_PREFLIGHT:-0}"
+[[ "$DEPLOY_STOP_BEFORE_PREFLIGHT" == 0 || "$DEPLOY_STOP_BEFORE_PREFLIGHT" == 1 ]] || { echo "DEPLOY_STOP_BEFORE_PREFLIGHT must be 0 or 1"; exit 1; }
 DEPLOY_STARS_PAYMENTS_ENABLED="${DEPLOY_STARS_PAYMENTS_ENABLED:-}"
 [[ -z "$DEPLOY_STARS_PAYMENTS_ENABLED" || "$DEPLOY_STARS_PAYMENTS_ENABLED" == 0 || "$DEPLOY_STARS_PAYMENTS_ENABLED" == 1 ]] || { echo "Invalid Stars enable flag"; exit 1; }
 DEPLOY_CLEANUP="${DEPLOY_CLEANUP:-1}"
@@ -39,6 +41,7 @@ STAGE_DIR="$(mktemp -d)"
 ENV_CHANGED=0
 PREVIOUS_ENV=""
 WAS_ACTIVE=0
+STOPPED_EARLY=0
 CHANGED=0
 STARS_CONFIG_CHANGED=0
 HAD_ENV_FILE=0
@@ -90,6 +93,10 @@ rollback() {
         fi
     else
         echo "Deploy failed before activation (exit $status); running code/environment were not changed"
+        if [[ "$STOPPED_EARLY" == 1 && "$WAS_ACTIVE" == 1 ]]; then
+            echo "Restarting original bot after preflight failure"
+            systemctl start avito-bot || true
+        fi
     fi
     report_state
     exit "$status"
@@ -99,17 +106,27 @@ trap rollback ERR
 trap 'rollback 130' INT
 trap 'rollback 143' TERM
 
-# Build and validate in isolation. The running bot keeps its existing environment.
+# Clean up pip cache and temporary pip files to free disk space on constrained systems
+rm -rf /root/.cache/pip /home/*/.cache/pip ~/.cache/pip /tmp/pip-* 2>/dev/null || true
+
+# Free RAM on constrained systems (e.g. 600MB VPS) by stopping old bot before pip install
+if [[ "$DEPLOY_STOP_BEFORE_PREFLIGHT" == 1 && "$WAS_ACTIVE" == 1 ]]; then
+    echo "Stopping existing bot before preflight to free RAM (DEPLOY_STOP_BEFORE_PREFLIGHT=1)"
+    systemctl stop avito-bot || true
+    STOPPED_EARLY=1
+fi
+
+# Build and validate in isolation.
 report_state
 git archive "$DEPLOY_SHA" | tar -x -C "$STAGE_DIR"
 mkdir -p "$TARGET_DIR/.releases"
 NEW_ENV="$(mktemp -d "$TARGET_DIR/.releases/venv-$DEPLOY_SHA-XXXXXX")"
 python3.11 -m venv "$NEW_ENV" 2>/dev/null || python3 -m venv "$NEW_ENV"
 "$NEW_ENV/bin/python" -B -c 'import sys; print("Deploy Python:", sys.version.split()[0], flush=True); sys.exit(0 if sys.version_info[:2] in ((3, 11), (3, 12)) else "Unsupported deploy Python; expected 3.11 or 3.12")'
-"$NEW_ENV/bin/python" -m pip install --disable-pip-version-check -r "$STAGE_DIR/requirements.txt"
+"$NEW_ENV/bin/python" -m pip install --no-cache-dir --disable-pip-version-check -r "$STAGE_DIR/requirements.txt"
 "$NEW_ENV/bin/python" -m pip check
 "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/check_syntax.py"
-echo "Resources before activation (the existing bot is still running):"
+echo "Resources before activation:"
 if command -v free >/dev/null 2>&1; then free -m || true; fi
 if [[ "$DEPLOY_FULL_TESTS" == 1 ]]; then
     echo "Running offline tests: timeout=600s, native_threads=1"
@@ -128,7 +145,9 @@ if [[ -n "$DEPLOY_STARS_PAYMENTS_ENABLED" ]]; then
     fi
 fi
 CHANGED=1
-systemctl stop avito-bot
+if [[ "$STOPPED_EARLY" == 0 ]]; then
+    systemctl stop avito-bot
+fi
 mkdir -p "$TARGET_DIR/backups"
 BACKUP_PATH="$TARGET_DIR/backups/bot-before-$DEPLOY_SHA-$(date -u +%Y%m%dT%H%M%SZ).db"
 export BACKUP_PATH TARGET_DIR

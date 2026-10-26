@@ -29,7 +29,8 @@ class TestDeployScript(unittest.TestCase):
 
     def run_deploy(self, *, fail_tests=False, fail_service=False, stale=False,
                    posix_shell=False, test_timeout=False, python_fallback=False,
-                    unsupported_python=False, full_tests=None, preflight_failure="", stars_enabled=None):
+                   unsupported_python=False, full_tests=None, preflight_failure="", stars_enabled=None,
+                   stop_before_preflight=None):
         with tempfile.TemporaryDirectory(prefix="avito-deploy-test-") as temporary:
             directory = Path(temporary)
             project = directory / "project"
@@ -130,6 +131,9 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
                 env.pop("DEPLOY_FULL_TESTS", None)
             else:
                 env["DEPLOY_FULL_TESTS"] = full_tests
+            env.pop("DEPLOY_STOP_BEFORE_PREFLIGHT", None)
+            if stop_before_preflight is not None:
+                env["DEPLOY_STOP_BEFORE_PREFLIGHT"] = stop_before_preflight
             env.pop("DEPLOY_STARS_PAYMENTS_ENABLED", None)
             if stars_enabled is not None:
                 env["DEPLOY_STARS_PAYMENTS_ENABLED"] = stars_enabled
@@ -291,6 +295,35 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
         result, head, events, _, _ = self.run_deploy(full_tests="0", stars_enabled="yes")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(head, OLD_SHA)
+        self.assertNotIn("systemctl stop", events)
+
+    def test_stop_before_preflight_stops_service_early_and_deploys_successfully(self):
+        result, head, events, old_environment, release_count = self.run_deploy(full_tests="0", stop_before_preflight="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(head, TEST_SHA)
+        self.assertFalse(old_environment)
+        self.assertEqual(release_count, 1)
+        self.assertIn("Stopping existing bot before preflight to free RAM", result.stdout)
+        self.assertLess(events.index("systemctl stop"), events.index("build-env"))
+
+    def test_stop_before_preflight_restarts_service_on_preflight_failure(self):
+        result, head, events, old_environment, release_count = self.run_deploy(
+            full_tests="0", stop_before_preflight="1", preflight_failure="pip check"
+        )
+        self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+        self.assertEqual(head, OLD_SHA)
+        self.assertTrue(old_environment)
+        self.assertEqual(release_count, 0)
+        self.assertIn("Stopping existing bot before preflight to free RAM", result.stdout)
+        self.assertIn("Restarting original bot after preflight failure", result.stdout)
+        self.assertLess(events.index("systemctl stop"), events.index("pip check"))
+        self.assertLess(events.index("pip check"), events.index("systemctl start"))
+
+    def test_invalid_stop_before_preflight_setting_fails_validation(self):
+        result, head, events, _, _ = self.run_deploy(stop_before_preflight="invalid")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(head, OLD_SHA)
+        self.assertIn("DEPLOY_STOP_BEFORE_PREFLIGHT must be 0 or 1", result.stdout)
         self.assertNotIn("systemctl stop", events)
 
 
