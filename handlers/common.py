@@ -233,9 +233,9 @@ async def cmd_profile(event):
     )
 
     buttons = []
-    # Если нет подписки и триал еще не использован — предлагаем бесплатный триал 5 часов
+    # Если нет подписки и триал еще не использован — предлагаем бесплатный триал 6 часов
     if not is_adm and not sub_until and not trial_used:
-        buttons.append([InlineKeyboardButton(text="🎁 Попробовать 5 часов бесплатно", callback_data="activate_trial_btn")])
+        buttons.append([InlineKeyboardButton(text="🎁 Попробовать 6 часов бесплатно", callback_data="activate_trial_btn")])
 
     # Кнопка подписки/тарифов (видна и пользователям, и администраторам)
     if is_adm:
@@ -279,7 +279,7 @@ async def cb_activate_trial(call: CallbackQuery):
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Активация триала", res["message"], status="OK" if res["success"] else "WARN")
     if res["success"]:
         formatted_until = database.format_subscription_date(res.get("until"))
-        await call.answer(f"🎉 Пробный период 5 часов активирован!\nДействует: {formatted_until}", show_alert=True)
+        await call.answer(f"🎉 Пробный период 6 часов активирован!\nДействует: {formatted_until}", show_alert=True)
         await cmd_profile(call)
     else:
         await call.answer(res["message"], show_alert=True)
@@ -336,7 +336,7 @@ async def cmd_subscription_menu(event):
     # Если триал ещё не использован (для старых аккаунтов)
     if not is_adm and not sub_until and not trial_used:
         buttons.append([
-            InlineKeyboardButton(text="🎁 Активировать 5 часов БЕСПЛАТНО", callback_data="activate_trial_btn")
+            InlineKeyboardButton(text="🎁 Активировать 6 часов БЕСПЛАТНО", callback_data="activate_trial_btn")
         ])
 
     buttons.append([
@@ -345,6 +345,10 @@ async def cmd_subscription_menu(event):
     buttons.append([
         InlineKeyboardButton(text=f"🔥 PRO — {config.STARS_PRICE_PRO} ⭐ / 30 дней", callback_data="buy_tariff:pro")
     ])
+    if config.STARS_PAYMENTS_ENABLED:
+        buttons.append([
+            InlineKeyboardButton(text=f"🧪 Тестовая покупка — {config.STARS_PRICE_TEST} ⭐ (1 день)", callback_data="buy_tariff:test")
+        ])
     buttons.append([
         InlineKeyboardButton(text="⏳ Другие способы оплаты (в настройке)", callback_data="other_payment_methods")
     ])
@@ -370,10 +374,22 @@ async def cmd_subscription_menu(event):
 @router.callback_query(F.data.startswith("buy_tariff:"))
 async def cb_select_tariff(call: CallbackQuery):
     tariff_key = call.data.split(":")[1]
-    if tariff_key not in ("standart", "pro"):
+    if tariff_key not in ("standart", "pro", "test"):
         await call.answer("Неизвестный тариф", show_alert=True)
         return
     tariffs = {
+        "test": {
+            "name": "🧪 Тестовый доступ",
+            "radars": 4,
+            "price": f"{config.STARS_PRICE_TEST} ⭐ / 1 день",
+            "price_num": f"{config.STARS_PRICE_TEST} ⭐",
+            "perks": (
+                "✔️ Тестовый доступ на <b>1 день</b> для проверки оплаты\n"
+                "✔️ До <b>4 активных радаров</b> одновременно\n"
+                "✔️ Моментальные оповещения с фото товара в HD\n"
+                "✔️ Проверка списания и возврата Telegram Stars"
+            )
+        },
         "standart": {
             "name": "⚡️ Standart",
             "radars": 4,
@@ -394,7 +410,6 @@ async def cb_select_tariff(call: CallbackQuery):
             "price_num": f"{config.STARS_PRICE_PRO} ⭐",
             "perks": (
                 "✔️ До <b>9 активных радаров</b> одновременно\n"
-                "✔️ ⚡️ <b>Приоритетная очередь доставки</b>\n"
                 "✔️ 📉 <b>Алерты на снижение цены (Price Drop Alert) 💎</b>\n"
                 "✔️ Точный поиск строго в названиях\n"
                 "✔️ Моментальные оповещения с фото товара в HD\n"

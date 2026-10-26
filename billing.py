@@ -17,6 +17,7 @@ async def create_order(user_id: int, plan: str) -> dict[str, Any]:
     if not config.STARS_PAYMENTS_ENABLED:
         raise PaymentValidationError("Приём платежей временно выключен.")
     amount = config.stars_price(plan)
+    days = 1 if plan == "test" else config.STARS_SUBSCRIPTION_DAYS
     user = await database.get_user(user_id)
     if not user:
         raise PaymentValidationError("Сначала откройте /start.")
@@ -27,7 +28,7 @@ async def create_order(user_id: int, plan: str) -> dict[str, Any]:
         await db.execute("""
             INSERT INTO stars_orders(payload, user_id, tariff_plan, total_amount, days, expires_at)
             VALUES (?, ?, ?, ?, ?, datetime('now', '+1 hour'))
-        """, (payload, user_id, plan, amount, config.STARS_SUBSCRIPTION_DAYS))
+        """, (payload, user_id, plan, amount, days))
         await db.commit()
     return await get_order(payload=payload)
 

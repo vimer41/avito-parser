@@ -304,7 +304,7 @@ class AvitoParser:
         query_params = parse_qs(parsed.query)
 
         # Удаляем мусорные / сессионные параметры, меняющиеся между запросами
-        junk_keys = {"context", "localPriority", "presentationType", "from", "searchRadius", "view"}
+        junk_keys = {"context", "localPriority", "presentationType", "from", "view"}
         for k in list(query_params.keys()):
             if k in junk_keys or k.startswith("utm_"):
                 query_params.pop(k, None)
@@ -322,7 +322,7 @@ class AvitoParser:
 
         normalized = urlunparse((
             "https",
-            parsed.hostname.lower().rstrip("."),
+            "www.avito.ru",
             parsed.path,
             parsed.params,
             new_query,
@@ -695,12 +695,14 @@ class AvitoParser:
                 except Exception:
                     continue
                 items = data.get("loaderData", {}).get("data", {}).get("catalog", {}).get("items")
-                if items and isinstance(items, list):
+                if items is not None and isinstance(items, list):
                     catalog_items = items
                     break
 
-            if not catalog_items:
+            if catalog_items is None:
                 return None
+            if not catalog_items:
+                return []
 
             results: List[AvitoItem] = []
             for it in catalog_items[:25]:
@@ -831,7 +833,7 @@ class AvitoParser:
                         address = alt.split(",")[-1].strip()
 
                 # Дата в читаемом виде: ПРИОРИТЕТ ТОЧНОМУ TIMESTAMP!
-                date_info = "Только что"
+                date_info = None
                 date_steps = iva.get("DateInfoStep") or []
                 if exact_ts:
                     diff_sec = max(0, int(time.time() - exact_ts))
@@ -842,7 +844,9 @@ class AvitoParser:
                     else:
                         date_info = f"{diff_sec // 3600} ч. назад"
                 elif date_steps:
-                    date_info = (date_steps[0].get("payload") or {}).get("relative") or "Только что"
+                    date_info = (date_steps[0].get("payload") or {}).get("relative") or None
+                if not date_info and not exact_ts:
+                    date_info = "Дата не указана"
 
                 # Резерв и Авито Доставка
                 is_reserved = bool(it.get("isReserved"))
@@ -963,17 +967,27 @@ class AvitoParser:
 
                 # 3. Цена
                 price = "Цена не указана"
+                raw_price = None
                 price_meta = it.find(attrs={"itemprop": "price"})
                 if price_meta and price_meta.get("content"):
                     price_val = price_meta.get("content")
                     try:
-                        price = f"{int(price_val):,} ₽".replace(",", " ")
+                        raw_price = int(price_val)
+                        price = f"{raw_price:,} ₽".replace(",", " ")
                     except Exception:
                         price = f"{price_val} ₽"
                 else:
                     price_elem = it.find(attrs={"data-marker": "item-price"})
                     if price_elem:
                         price = price_elem.text.replace("\xa0", " ").strip()
+                        digits = re.sub(r"\D", "", price)
+                        if digits:
+                            try:
+                                raw_price = int(digits)
+                            except Exception:
+                                pass
+                        elif "бесплатно" in price.lower() or "даром" in price.lower():
+                            raw_price = 0
 
                 # 4. Фотография (100% извлечение через слайдер и lazy-load)
                 image_url = cls._extract_image(it)
@@ -1035,7 +1049,8 @@ class AvitoParser:
                     delivery=delivery,
                     condition=condition,
                     is_reserved=is_reserved,
-                    is_promotion=is_promotion
+                    is_promotion=is_promotion,
+                    raw_price=raw_price
                 ))
 
             except Exception as e:

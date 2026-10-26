@@ -17,14 +17,17 @@ MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "30"))
 STARS_PAYMENTS_ENABLED = os.getenv("STARS_PAYMENTS_ENABLED", "0").strip() == "1"
 STARS_PRICE_STANDART = int(os.getenv("STARS_PRICE_STANDART", "170"))
 STARS_PRICE_PRO = int(os.getenv("STARS_PRICE_PRO", "470"))
+STARS_PRICE_TEST = int(os.getenv("STARS_PRICE_TEST", "10"))
 STARS_SUBSCRIPTION_DAYS = 30
-if STARS_PRICE_STANDART <= 0 or STARS_PRICE_PRO <= 0:
+if STARS_PRICE_STANDART <= 0 or STARS_PRICE_PRO <= 0 or STARS_PRICE_TEST <= 0:
     raise ValueError("Telegram Stars prices must be positive integers")
 if STARS_PRICE_PRO <= STARS_PRICE_STANDART:
     raise ValueError("PRO must cost more Stars than Standart")
 
 
 def stars_price(plan: str) -> int:
+    if plan == "test":
+        return STARS_PRICE_TEST
     if plan == "standart":
         return STARS_PRICE_STANDART
     if plan == "pro":

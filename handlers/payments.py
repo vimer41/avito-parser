@@ -64,12 +64,15 @@ async def buy_stars(call: CallbackQuery, bot: Bot, state: FSMContext):
     await state.clear()
     await call.answer("Открываю счёт Telegram Stars")
     try:
+        plan_title = "AVITO RADAR · ТЕСТ · 1 день" if plan == "test" else f"AVITO RADAR · {plan.upper()} · 30 дней"
+        plan_desc = "Тестовая проверка оплаты Telegram Stars (1 день)." if plan == "test" else f"До {9 if plan == 'pro' else 4} радаров. Разовая подписка, без автосписания. Условия: /terms. Поддержка и возврат: /paysupport."
+        label = "Тестовый доступ (1 день)" if plan == "test" else "Подписка на 30 дней"
         await bot.send_invoice(
             chat_id=call.from_user.id,
-            title=f"AVITO RADAR · {plan.upper()} · 30 дней",
-            description=f"До {9 if plan == 'pro' else 4} радаров. Разовая подписка, без автосписания. Условия: /terms. Поддержка и возврат: /paysupport.",
+            title=plan_title,
+            description=plan_desc,
             payload=order["payload"], provider_token="", currency="XTR",
-            prices=[LabeledPrice(label="Подписка на 30 дней", amount=order["total_amount"])],
+            prices=[LabeledPrice(label=label, amount=order["total_amount"])],
             start_parameter="tariffs", protect_content=True,
         )
     except Exception as exc:

@@ -369,9 +369,11 @@ def is_ad_fresh_enough(
         return age_seconds <= threshold_seconds
 
     if not date_str:
-        return True
+        return False
 
     d = date_str.lower().strip()
+    if d in ("дата не указана", "возраст не указан"):
+        return False
 
     # Секунды и "только что" (всегда свежие, менее минуты)
     if any(k in d for k in ["секунд", "только что"]):
@@ -676,8 +678,9 @@ async def process_url_group(
             # Получаем актуальный черный список продавцов пользователя
             blocked_sellers = await database.get_blocked_sellers(user_id)
 
-            seen_dict = await database.get_seen_items_with_prices(radar_id)
-            pending_ids = await database.get_pending_new_item_ids(radar_id)
+            current_item_ids = [it.item_id for it in items]
+            seen_dict = await database.get_seen_items_with_prices(radar_id, item_ids=current_item_ids)
+            pending_ids = await database.get_pending_new_item_ids(radar_id, item_ids=current_item_ids)
             new_items = [it for it in items if it.item_id not in seen_dict and it.item_id not in pending_ids]
 
             # 📉 Проверка снижения цены (Price Drop Alert) для PRO-тарифа и администраторов
@@ -782,13 +785,12 @@ async def process_url_group(
                 )
                 continue
 
-            # Защита от аномалий: если свежих лотов аномально много (> 15 штук одновременно)
+            # Логируем большую пачку свежих лотов (отправляем все подходящие лоты)
             if len(fresh_items) > 15:
                 fresh_label = plural_form(len(fresh_items), "свежий лот", "свежих лота", "свежих лотов")
                 logger.info(
-                    f"  {w_tag}📦 Радар #{radar_id} [{user_str}] «{search_title}»: аномальная пачка из {fresh_label} (отправляем топ-10 самых свежих)"
+                    f"  {w_tag}📦 Радар #{radar_id} [{user_str}] «{search_title}»: пачка из {fresh_label}"
                 )
-                fresh_items = fresh_items[:10]
 
             fresh_label = plural_form(len(fresh_items), "СВЕЖИЙ ЛОТ", "СВЕЖИХ ЛОТА", "СВЕЖИХ ЛОТОВ")
             logger.info(f"  {w_tag}🔥 Радар #{radar_id} [{user_str}] «{search_title}»: НАЙДЕНО {fresh_label}!")

@@ -45,6 +45,7 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
     async def test_default_prices_and_explicit_disable(self):
         self.assertEqual(config.stars_price("standart"), 170)
         self.assertEqual(config.stars_price("pro"), 470)
+        self.assertEqual(config.stars_price("test"), 10)
         with self.assertRaises(ValueError):
             config.stars_price("fake")
         with patch.object(config, "STARS_PAYMENTS_ENABLED", False):
@@ -52,6 +53,17 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
                 await billing.create_order(self.user_id, "pro")
         async with aiosqlite.connect(database.DB_PATH) as db:
             self.assertEqual((await (await db.execute("SELECT COUNT(*) FROM stars_orders")).fetchone())[0], 0)
+
+    async def test_test_tariff_flow(self):
+        order = await billing.create_order(self.user_id, "test")
+        self.assertEqual(order["total_amount"], 10)
+        self.assertEqual(order["tariff_plan"], "test")
+        await billing.approve_checkout(f"q-{order['id']}", self.user_id, order["payload"], "XTR", 10)
+        grant = await self.pay(order, charge="charge-test")
+        self.assertTrue(grant["applied"])
+        user = await database.get_user(self.user_id)
+        self.assertEqual(user["tariff_plan"], "standart")
+        self.assertTrue(await database.is_user_allowed(self.user_id))
 
     async def test_checkout_validates_owner_amount_currency_and_payload(self):
         order = await billing.create_order(self.user_id, "standart")

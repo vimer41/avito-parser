@@ -38,12 +38,12 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         admin_radars = await database.get_user_max_radars(admin_id)
         self.assertEqual(admin_radars, config.MAX_SEARCHES_PER_USER)
 
-        # 2. Новый пользователь (автоматический 5ч триал)
+        # 2. Новый пользователь (автоматический 6ч триал)
         new_user = await database.get_or_create_user(trial_user_id, "new_buyer", "Ivan")
         self.assertEqual(new_user["trial_used"], 1)
         self.assertIsNotNone(new_user["subscription_until"])
         
-        # Доступ активен в течение 5 часов
+        # Доступ активен в течение 6 часов
         is_allowed = await database.is_user_allowed(trial_user_id)
         self.assertTrue(is_allowed)
 
@@ -252,6 +252,57 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(format_max_age_label(10), "до 10 мин. ⚡️")
         self.assertEqual(format_max_age_label(30), "до 30 мин. ⚡️")
         self.assertEqual(format_max_age_label(60), "до 30 мин. ⚡️")
+
+        # 6. Объявления без даты или с неизвестной датой НЕ считаются свежими
+        self.assertFalse(is_ad_fresh_enough(None, None))
+        self.assertFalse(is_ad_fresh_enough("Дата не указана", None))
+        self.assertFalse(is_ad_fresh_enough("возраст не указан", None))
+
+    def test_normalize_url_radius_and_mobile_domain(self):
+        """Проверка сохранения searchRadius и нормализации m.avito.ru в www.avito.ru."""
+        from parser import AvitoParser
+        url1 = "https://www.avito.ru/sankt-peterburg/odezhda?searchRadius=50&context=xyz&s=1"
+        norm1 = AvitoParser.normalize_url(url1)
+        self.assertIn("searchRadius=50", norm1)
+        self.assertIn("s=104", norm1)
+        self.assertNotIn("context", norm1)
+
+        url2 = "https://m.avito.ru/all/telefony/apple/iphone?s=104"
+        norm2 = AvitoParser.normalize_url(url2)
+        self.assertTrue(norm2.startswith("https://www.avito.ru/all/telefony/apple/iphone"))
+
+    def test_html_parser_extracts_raw_price(self):
+        """Проверка, что HTML фолбэк парсит числовое значение raw_price."""
+        from parser import AvitoParser
+        sample_html = """
+        <div data-marker="catalog-serp">
+            <div data-marker="item" data-item-id="12345">
+                <a data-marker="item-title" href="/item/12345">Тестовый товар</a>
+                <span data-marker="item-price">15 500  ₽</span>
+            </div>
+            <div data-marker="item" data-item-id="67890">
+                <a data-marker="item-title" href="/item/67890">Бесплатный товар</a>
+                <span data-marker="item-price">Бесплатно</span>
+            </div>
+        </div>
+        """
+        items = AvitoParser.parse_items(sample_html)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].raw_price, 15500)
+        self.assertEqual(items[1].raw_price, 0)
+
+    async def test_batch_seen_items_query(self):
+        """Проверка точечной выборки seen_items по списку item_ids."""
+        radar_id = await database.add_search(123456, "Тест", "https://www.avito.ru/test")
+        await database.mark_items_seen_bulk(radar_id, [("item1", 100), ("item2", 200), ("item3", 300)])
+
+        # Запрос только для item1 и item3
+        subset = await database.get_seen_items_with_prices(radar_id, item_ids=["item1", "item3", "item99"])
+        self.assertEqual(subset, {"item1": 100, "item3": 300})
+
+        # Запрос без фильтра возвращает все
+        all_items = await database.get_seen_items_with_prices(radar_id)
+        self.assertEqual(all_items, {"item1": 100, "item2": 200, "item3": 300})
 
 
 if __name__ == "__main__":

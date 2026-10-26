@@ -392,13 +392,13 @@ async def cb_admin_reset_trial_prompt(call: CallbackQuery):
     parts = call.data.split(":")
     target_id, page = int(parts[1]), int(parts[2])
     text = (
-        f"🎁 <b>АКТИВАЦИЯ ТРИАЛА (5 ЧАСОВ)</b>\n\n"
+        f"🎁 <b>АКТИВАЦИЯ ТРИАЛА (6 ЧАСОВ)</b>\n\n"
         f"Пользователь: <code>{target_id}</code>\n\n"
-        "Пользователю будет выдан бесплатный пробный доступ на <b>5 часов</b> (1 радар, Standart). "
+        "Пользователю будет выдан бесплатный пробный доступ на <b>6 часов</b> (1 радар, Standart). "
         "Пользователь получит мгновенное уведомление в чат."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Активировать триал 5 ч", callback_data=f"admin_confirm_trial:{target_id}:{page}")],
+        [InlineKeyboardButton(text="✅ Активировать триал 6 ч", callback_data=f"admin_confirm_trial:{target_id}:{page}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_id}:{page}")]
     ])
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -415,7 +415,7 @@ async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
     user = await database.reset_user_trial(target_id)
     until = database.format_subscription_date(user.get("subscription_until"))
 
-    logger.info("👑 [АДМИН] Администратор ID:%s активировал триал 5ч для пользователя ID:%s", call.from_user.id, target_id)
+    logger.info("👑 [АДМИН] Администратор ID:%s активировал триал 6ч для пользователя ID:%s", call.from_user.id, target_id)
 
     try:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -425,10 +425,10 @@ async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
         await bot.send_message(
             chat_id=target_id,
             text=(
-                f"🎁 <b>Администратор активировал вам бесплатный пробный период на 5 часов!</b>\n"
+                f"🎁 <b>Администратор активировал вам бесплатный пробный период на 6 часов!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 Доступен: <b>1 активный радар</b> (Standart)\n"
-                f"📅 Срок действия: <b>{until}</b> (5 ч.)\n\n"
+                f"📅 Срок действия: <b>{until}</b> (6 ч.)\n\n"
                 f"Отправьте ссылку на поиск с Авито прямо в чат или нажмите кнопку ниже:"
             ),
             reply_markup=kb,
@@ -437,7 +437,7 @@ async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
     except Exception as e:
         logger.warning("Не удалось уведомить пользователя %s об активации триала: %s", target_id, e)
 
-    await call.answer("Триал 5 часов активирован!", show_alert=True)
+    await call.answer("Триал 6 часов активирован!", show_alert=True)
     text, kb = await render_user_card_data(target_id, page)
     if text:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -584,7 +584,7 @@ async def cmd_admin_panel(event, page: int = 0):
         if is_adm:
             text_lines.append(f"{idx}. 👑 <b>{fname}</b> ({uname}) — <i>Администратор</i>")
         elif has_access and not is_allowed and trial_used:
-            text_lines.append(f"{idx}. 🎁 <b>{fname}</b> ({uname}) — <i>[Триал 5ч · 1 радар] {sub_str}</i>")
+            text_lines.append(f"{idx}. 🎁 <b>{fname}</b> ({uname}) — <i>[Триал 6ч · 1 радар] {sub_str}</i>")
             buttons.append([
                 InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke_prompt:{u_id}:{page}"),
                 InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")

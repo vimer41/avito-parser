@@ -102,7 +102,7 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 payload TEXT NOT NULL UNIQUE,
                 user_id INTEGER NOT NULL,
-                tariff_plan TEXT NOT NULL CHECK(tariff_plan IN ('standart', 'pro')),
+                tariff_plan TEXT NOT NULL CHECK(tariff_plan IN ('standart', 'pro', 'test')),
                 total_amount INTEGER NOT NULL CHECK(total_amount > 0),
                 days INTEGER NOT NULL CHECK(days > 0),
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -126,6 +126,41 @@ async def init_db():
                 refund_needs_review INTEGER NOT NULL DEFAULT 0
             )
         """)
+        async with db.execute("SELECT sql FROM sqlite_master WHERE name = 'stars_orders'") as cur:
+            row = await cur.fetchone()
+            if row and row[0] and "'test'" not in row[0]:
+                await db.execute("ALTER TABLE stars_orders RENAME TO stars_orders_old;")
+                await db.execute("""
+                    CREATE TABLE stars_orders (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        payload TEXT NOT NULL UNIQUE,
+                        user_id INTEGER NOT NULL,
+                        tariff_plan TEXT NOT NULL CHECK(tariff_plan IN ('standart', 'pro', 'test')),
+                        total_amount INTEGER NOT NULL CHECK(total_amount > 0),
+                        days INTEGER NOT NULL CHECK(days > 0),
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        pre_checkout_query_id TEXT,
+                        approved_at TIMESTAMP,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TIMESTAMP NOT NULL,
+                        telegram_payment_charge_id TEXT UNIQUE,
+                        provider_payment_charge_id TEXT,
+                        paid_at TIMESTAMP,
+                        subscription_before TIMESTAMP,
+                        tariff_before TEXT,
+                        allowed_before INTEGER,
+                        trial_before INTEGER,
+                        subscription_after TIMESTAMP,
+                        tariff_after TEXT,
+                        revision_after INTEGER,
+                        refund_requested_at TIMESTAMP,
+                        refund_admin_id INTEGER,
+                        refunded_at TIMESTAMP,
+                        refund_needs_review INTEGER NOT NULL DEFAULT 0
+                    )
+                """)
+                await db.execute("INSERT INTO stars_orders SELECT * FROM stars_orders_old;")
+                await db.execute("DROP TABLE stars_orders_old;")
         await db.execute("CREATE INDEX IF NOT EXISTS stars_orders_user ON stars_orders(user_id, id)")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admin_subscription_actions (
@@ -232,7 +267,7 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
                     await db.execute("""
                         UPDATE users 
                         SET trial_used = 1,
-                            subscription_until = datetime('now', '+5 hours'),
+                            subscription_until = datetime('now', '+6 hours'),
                             tariff_plan = 'standart'
                         WHERE user_id = ?
                     """, (user_id,))
@@ -249,10 +284,10 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
                 (user_id, username, first_name, DEFAULT_SELLER_MESSAGE)
             )
         else:
-            # Новым пользователям автоматически активируем 5-часовой бесплатный пробный период (тариф Standart, 1 радар)
+            # Новым пользователям автоматически активируем 6-часовой бесплатный пробный период (тариф Standart, 1 радар)
             await db.execute("""
                 INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan, trial_used, subscription_until)
-                VALUES (?, ?, ?, ?, 0, 'standart', 1, datetime('now', '+5 hours'))
+                VALUES (?, ?, ?, ?, 0, 'standart', 1, datetime('now', '+6 hours'))
             """, (user_id, username, first_name, DEFAULT_SELLER_MESSAGE))
         await db.commit()
 
@@ -384,12 +419,12 @@ async def grant_vip_access(user_id: int, tariff_plan: str = "pro") -> Dict[str, 
 
 
 async def reset_user_trial(user_id: int) -> Dict[str, Any]:
-    """Сбрасывает и активирует 5-часовой пробный период для пользователя."""
+    """Сбрасывает и активирует 6-часовой пробный период для пользователя."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             UPDATE users 
             SET trial_used = 1,
-                subscription_until = datetime('now', '+5 hours'),
+                subscription_until = datetime('now', '+6 hours'),
                 tariff_plan = 'standart',
                 is_allowed = 0,
                 subscription_revision = subscription_revision + 1
@@ -673,13 +708,22 @@ async def remove_blocked_seller_by_id(user_id: int, block_id: int) -> bool:
 
 
 
-async def get_seen_items_with_prices(search_id: int) -> Dict[str, int]:
-    """Возвращает словарь {item_id: last_price} всех просмотренных объявлений в данном радаре."""
+async def get_seen_items_with_prices(search_id: int, item_ids: Optional[Any] = None) -> Dict[str, int]:
+    """Возвращает словарь {item_id: last_price} просмотренных объявлений в данном радаре."""
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT item_id, COALESCE(last_price, 0) FROM seen_items WHERE search_id = ?",
-            (search_id,)
-        ) as cursor:
+        if item_ids is not None:
+            ids = [str(x) for x in item_ids if str(x).strip()]
+            if not ids:
+                return {}
+            ids = ids[:500]
+            placeholders = ",".join("?" for _ in ids)
+            query = f"SELECT item_id, COALESCE(last_price, 0) FROM seen_items WHERE search_id = ? AND item_id IN ({placeholders})"
+            params = [search_id] + ids
+        else:
+            query = "SELECT item_id, COALESCE(last_price, 0) FROM seen_items WHERE search_id = ?"
+            params = [search_id]
+
+        async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
             return {str(r[0]): int(r[1] or 0) for r in rows}
 
@@ -829,7 +873,7 @@ async def get_system_stats() -> Dict[str, int]:
 
 
 async def activate_trial(user_id: int) -> Dict[str, Any]:
-    """Активирует пробный период 5 часов. Строго 1 раз на пользователя."""
+    """Активирует пробный период 6 часов. Строго 1 раз на пользователя."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         db.row_factory = aiosqlite.Row
@@ -843,7 +887,7 @@ async def activate_trial(user_id: int) -> Dict[str, Any]:
         await db.execute("""
             UPDATE users 
             SET trial_used = 1,
-                subscription_until = datetime('now', '+5 hours')
+                subscription_until = datetime('now', '+6 hours')
             WHERE user_id = ?
         """, (user_id,))
         await db.commit()
@@ -852,15 +896,16 @@ async def activate_trial(user_id: int) -> Dict[str, Any]:
             r = await cur.fetchone()
             until = r[0] if r else ""
 
-        return {"success": True, "message": "Пробный период 5 часов успешно активирован!", "until": until}
+        return {"success": True, "message": "Пробный период 6 часов успешно активирован!", "until": until}
 
 
 async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_plan: Optional[str] = None) -> str:
     """Shared atomic update; the caller owns the transaction and commit."""
     if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
         raise ValueError("days must be a positive integer")
-    if tariff_plan is not None and tariff_plan.lower() not in ("standart", "pro"):
+    if tariff_plan is not None and tariff_plan.lower() not in ("standart", "pro", "test"):
         raise ValueError("Unknown tariff plan")
+    effective_plan = "standart" if (tariff_plan and tariff_plan.lower() == "test") else (tariff_plan.lower() if tariff_plan else None)
     cursor = await db.execute("""
         UPDATE users
         SET subscription_until = datetime(
@@ -870,7 +915,7 @@ async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_
             is_allowed = 1, trial_used = 1,
             subscription_revision = subscription_revision + 1
         WHERE user_id = ?
-    """, (days, tariff_plan.lower() if tariff_plan else None, user_id))
+    """, (days, effective_plan, user_id))
     if cursor.rowcount != 1:
         raise ValueError("Пользователь не найден")
     async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (user_id,)) as cursor:
@@ -972,9 +1017,21 @@ async def enqueue_notification(search_id: int, user_id: int, item_id: str, event
         return cursor.rowcount > 0
 
 
-async def get_pending_new_item_ids(search_id: int) -> set[str]:
+async def get_pending_new_item_ids(search_id: int, item_ids: Optional[Any] = None) -> set[str]:
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT item_id FROM notification_outbox WHERE search_id = ? AND event_key = 'new'", (search_id,)) as cursor:
+        if item_ids is not None:
+            ids = [str(x) for x in item_ids if str(x).strip()]
+            if not ids:
+                return set()
+            ids = ids[:500]
+            placeholders = ",".join("?" for _ in ids)
+            query = f"SELECT item_id FROM notification_outbox WHERE search_id = ? AND event_key = 'new' AND item_id IN ({placeholders})"
+            params = [search_id] + ids
+        else:
+            query = "SELECT item_id FROM notification_outbox WHERE search_id = ? AND event_key = 'new'"
+            params = [search_id]
+
+        async with db.execute(query, params) as cursor:
             return {row[0] for row in await cursor.fetchall()}
 
 

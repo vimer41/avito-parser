@@ -80,6 +80,15 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("subscription_period", invoice.model_dump())
         self.assertEqual(await database.get_user(self.user_id), before)
 
+    async def test_test_tariff_ui_and_invoice(self):
+        await self.dispatch_callback("buy_tariff:test")
+        self.assertIn("stars_buy:test:10", self.callback_values())
+        await self.dispatch_callback("stars_buy:test:10")
+        invoice = self.methods("SendInvoice")[-1]
+        self.assertEqual(invoice.currency, "XTR")
+        self.assertEqual([p.amount for p in invoice.prices], [10])
+        self.assertIn("ТЕСТ", invoice.title)
+
     async def test_stale_price_foreign_chat_and_invalid_plan_never_send_invoice(self):
         for value, chat_id in (("stars_buy:pro:1", self.user_id), ("stars_buy:fake:170", self.user_id),
                                ("stars_buy:pro", self.user_id), ("stars_buy:pro:470", 654321)):
