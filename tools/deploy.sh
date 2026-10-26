@@ -37,7 +37,7 @@ git merge-base --is-ancestor "$DEPLOY_SHA" FETCH_HEAD || { echo "Commit is not o
 PREVIOUS_SHA="$(git rev-parse HEAD)"
 PREVIOUS_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
 NEW_ENV=""
-STAGE_DIR="$(mktemp -d)"
+STAGE_DIR="$(mktemp -d "$TARGET_DIR/.stage-$DEPLOY_SHA-XXXXXX")"
 ENV_CHANGED=0
 PREVIOUS_ENV=""
 WAS_ACTIVE=0
@@ -48,8 +48,7 @@ HAD_ENV_FILE=0
 systemctl is-active --quiet avito-bot && WAS_ACTIVE=1
 
 cleanup() {
-    rm -rf "$STAGE_DIR"
-    rm -rf "$TARGET_DIR/.tmp" 2>/dev/null || true
+    rm -rf "$STAGE_DIR" "$TARGET_DIR/.tmp" "$TARGET_DIR"/.stage-* 2>/dev/null || true
     # Failed preflight environments were never used by the service.
     if [[ -n "$NEW_ENV" && "$ENV_CHANGED" == 0 ]]; then
         rm -rf "$NEW_ENV"
@@ -119,7 +118,7 @@ if [[ -z "${MOCK_ROOT:-}" ]]; then
     command -v journalctl >/dev/null 2>&1 && journalctl --vacuum-size=20M --vacuum-time=2d 2>/dev/null || true
 
     # Clean pip caches and system temp directories
-    rm -rf /root/.cache/pip ~/.cache/pip /tmp/pip-* /tmp/tmp.* /tmp/*.whl /var/tmp/tmp.* /var/tmp/pip-* "$TARGET_DIR/.tmp" 2>/dev/null || true
+    rm -rf /root/.cache/pip ~/.cache/pip /tmp/pip-* /tmp/*.whl /var/tmp/pip-* "$TARGET_DIR/.tmp" 2>/dev/null || true
     find "$TARGET_DIR/logs" "$TARGET_DIR" -maxdepth 2 -name "*.log.*" -mtime +2 -delete 2>/dev/null || true
 
     # Prune old releases in .releases to free disk BEFORE building NEW_ENV:
