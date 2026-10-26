@@ -232,7 +232,7 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
                     await db.execute("""
                         UPDATE users 
                         SET trial_used = 1,
-                            subscription_until = datetime('now', '+1 day'),
+                            subscription_until = datetime('now', '+5 hours'),
                             tariff_plan = 'standart'
                         WHERE user_id = ?
                     """, (user_id,))
@@ -249,10 +249,10 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
                 (user_id, username, first_name, DEFAULT_SELLER_MESSAGE)
             )
         else:
-            # Новым пользователям автоматически активируем 24-часовой бесплатный пробный период (тариф Standart, 1 радар)
+            # Новым пользователям автоматически активируем 5-часовой бесплатный пробный период (тариф Standart, 1 радар)
             await db.execute("""
                 INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan, trial_used, subscription_until)
-                VALUES (?, ?, ?, ?, 0, 'standart', 1, datetime('now', '+1 day'))
+                VALUES (?, ?, ?, ?, 0, 'standart', 1, datetime('now', '+5 hours'))
             """, (user_id, username, first_name, DEFAULT_SELLER_MESSAGE))
         await db.commit()
 
@@ -764,7 +764,7 @@ async def get_system_stats() -> Dict[str, int]:
 
 
 async def activate_trial(user_id: int) -> Dict[str, Any]:
-    """Активирует пробный период 24 часа. Строго 1 раз на пользователя."""
+    """Активирует пробный период 5 часов. Строго 1 раз на пользователя."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         db.row_factory = aiosqlite.Row
@@ -778,7 +778,7 @@ async def activate_trial(user_id: int) -> Dict[str, Any]:
         await db.execute("""
             UPDATE users 
             SET trial_used = 1,
-                subscription_until = datetime('now', '+1 day')
+                subscription_until = datetime('now', '+5 hours')
             WHERE user_id = ?
         """, (user_id,))
         await db.commit()
@@ -787,7 +787,7 @@ async def activate_trial(user_id: int) -> Dict[str, Any]:
             r = await cur.fetchone()
             until = r[0] if r else ""
 
-        return {"success": True, "message": "Пробный период 24 часа успешно активирован!", "until": until}
+        return {"success": True, "message": "Пробный период 5 часов успешно активирован!", "until": until}
 
 
 async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_plan: Optional[str] = None) -> str:

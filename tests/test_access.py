@@ -34,7 +34,7 @@ class TestAccessMiddleware(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self.middleware(self.handler, self.message(text), self.data), "handled")
 
     async def test_expired_users_can_open_public_menu_callbacks(self):
-        for value in ("open_subscription_menu", "start_approved", "refresh_profile", "buy_tariff:pro", "demo_tariff:pro", "support_start_ticket"):
+        for value in ("open_subscription_menu", "start_approved", "refresh_profile", "buy_tariff:pro", "demo_tariff:pro", "support_start_ticket", "other_payment_methods"):
             with self.subTest(value=value):
                 self.assertEqual(await self.middleware(self.handler, self.callback(value), self.data), "handled")
 

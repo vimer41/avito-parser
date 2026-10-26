@@ -27,7 +27,7 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     async def test_admin_and_trial_limits(self):
-        """Проверка выдачи 24h триала новым юзерам и лимитов радаров."""
+        """Проверка выдачи 5h триала новым юзерам и лимитов радаров."""
         admin_id = 986832959
         trial_user_id = 11223344
 
@@ -38,12 +38,12 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         admin_radars = await database.get_user_max_radars(admin_id)
         self.assertEqual(admin_radars, config.MAX_SEARCHES_PER_USER)
 
-        # 2. Новый пользователь (автоматический 24ч триал)
+        # 2. Новый пользователь (автоматический 5ч триал)
         new_user = await database.get_or_create_user(trial_user_id, "new_buyer", "Ivan")
         self.assertEqual(new_user["trial_used"], 1)
         self.assertIsNotNone(new_user["subscription_until"])
         
-        # Доступ активен в течение 24 часов
+        # Доступ активен в течение 5 часов
         is_allowed = await database.is_user_allowed(trial_user_id)
         self.assertTrue(is_allowed)
 

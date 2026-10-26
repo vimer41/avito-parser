@@ -106,7 +106,7 @@ class AccessControlMiddleware(BaseMiddleware):
             allowed_exact = {
                 "open_subscription_menu", "activate_trial_btn", "support_start_ticket", "support_cancel",
                 "start_approved", "refresh_profile", "open_help_menu", "cancel_fsm",
-                "payment_terms", "payment_support",
+                "payment_terms", "payment_support", "other_payment_methods",
             }
             if event.data in allowed_exact or any(event.data.startswith(prefix) for prefix in allowed_callbacks):
                 return await handler(event, data)
@@ -164,7 +164,7 @@ class AccessControlMiddleware(BaseMiddleware):
         if trial_used:
             text_for_user = (
                 "🔒 <b>Срок действия пробного периода завершился</b>\n\n"
-                "Ваш бесплатный 24-часовой доступ подошёл к концу. "
+                "Ваш бесплатный 5-часовой доступ подошёл к концу. "
                 "Чтобы продолжить отслеживать новые лоты на Авито без ограничений, выберите подходящий тариф подписки "
                 "или свяжитесь со службой поддержки прямо в этом боте!"
             )

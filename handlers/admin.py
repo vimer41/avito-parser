@@ -348,7 +348,7 @@ async def cmd_admin_panel(event, page: int = 0):
         if is_adm:
             text_lines.append(f"{idx}. 👑 <b>{fname}</b> ({uname}) — <i>Администратор</i>")
         elif has_access and not is_allowed and trial_used:
-            text_lines.append(f"{idx}. 🎁 <b>{fname}</b> ({uname}) — <i>[Триал 24ч · 1 радар] {sub_str}</i>")
+            text_lines.append(f"{idx}. 🎁 <b>{fname}</b> ({uname}) — <i>[Триал 5ч · 1 радар] {sub_str}</i>")
             buttons.append([
                 InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke_prompt:{u_id}:{page}"),
                 InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")

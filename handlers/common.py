@@ -61,7 +61,7 @@ async def cmd_start(event, state: FSMContext):
         badge = "👑 <b>Администратор системы</b>"
     elif sub_until and trial_used and not is_allowed:
         formatted_until = database.format_subscription_date(sub_until)
-        badge = f"🎁 <b>Бесплатный триал (24 ч · до 1 радара)</b>\n<i>└ Доступен: {formatted_until}</i>"
+        badge = f"🎁 <b>Бесплатный триал (5 ч · до 1 радара)</b>\n<i>└ Доступен: {formatted_until}</i>"
     elif sub_until and is_allowed:
         plan_name = (user_record.get("tariff_plan") or "Standart").upper()
         formatted_until = database.format_subscription_date(sub_until)
@@ -150,7 +150,7 @@ async def cmd_help(event):
         "⚡️ <b>6. Быстрый отклик продавцу:</b>\n"
         "Настройте шаблон в меню «⚡️ Быстрый отклик», и бот будет формировать ссылку для связи с продавцом в 1 клик.\n\n"
         "🎁 <b>7. Бесплатный триал и тарифы:</b>\n"
-        "• Всем новым пользователям автоматически доступен <b>24-часовой бесплатный триал на 1 радар</b>.\n"
+        "• Всем новым пользователям автоматически доступен <b>5-часовой бесплатный триал на 1 радар</b>.\n"
         f"• <b>Standart ({config.STARS_PRICE_STANDART} ⭐ / 30 дней):</b> до 4 радаров, фото, стоп-слова и ЧС.\n"
         f"• <b>PRO ({config.STARS_PRICE_PRO} ⭐ / 30 дней):</b> до 9 радаров, приоритетная очередь и алерты на скидки.\n"
         "Оплата только Telegram Stars, без автосписания. Условия: /terms. Поддержка платежей: /paysupport."
@@ -207,7 +207,7 @@ async def cmd_profile(event):
         status_str = "👑 <b>Администратор (Вечный PRO)</b>"
     elif sub_until and trial_used and not is_allowed:
         formatted_until = database.format_subscription_date(sub_until)
-        status_str = f"🎁 <b>Бесплатный триал (24 ч)</b>\n  └ <i>Доступен: {formatted_until}</i>"
+        status_str = f"🎁 <b>Бесплатный триал (5 ч)</b>\n  └ <i>Доступен: {formatted_until}</i>"
     elif sub_until and is_allowed:
         plan_name = (user.get("tariff_plan") or "Standart").upper()
         formatted_until = database.format_subscription_date(sub_until)
@@ -233,9 +233,9 @@ async def cmd_profile(event):
     )
 
     buttons = []
-    # Если нет подписки и триал еще не использован — предлагаем бесплатный триал 24 часа
+    # Если нет подписки и триал еще не использован — предлагаем бесплатный триал 5 часов
     if not is_adm and not sub_until and not trial_used:
-        buttons.append([InlineKeyboardButton(text="🎁 Попробовать 24 часа бесплатно", callback_data="activate_trial_btn")])
+        buttons.append([InlineKeyboardButton(text="🎁 Попробовать 5 часов бесплатно", callback_data="activate_trial_btn")])
 
     # Кнопка подписки/тарифов (видна и пользователям, и администраторам)
     if is_adm:
@@ -279,7 +279,7 @@ async def cb_activate_trial(call: CallbackQuery):
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Активация триала", res["message"], status="OK" if res["success"] else "WARN")
     if res["success"]:
         formatted_until = database.format_subscription_date(res.get("until"))
-        await call.answer(f"🎉 Пробный период 24 часа активирован!\nДействует: {formatted_until}", show_alert=True)
+        await call.answer(f"🎉 Пробный период 5 часов активирован!\nДействует: {formatted_until}", show_alert=True)
         await cmd_profile(call)
     else:
         await call.answer(res["message"], show_alert=True)
@@ -308,7 +308,7 @@ async def cmd_subscription_menu(event):
         status_line = f"👑 <b>Ваш статус:</b> <i>Администратор (PRO, до {config.MAX_SEARCHES_PER_USER} радаров)</i>"
     elif sub_until and trial_used and not is_allowed:
         formatted_until = database.format_subscription_date(sub_until)
-        status_line = f"🎁 <b>Ваш статус:</b> <i>Бесплатный триал (24 ч)\n  └ Доступен: {formatted_until}</i>"
+        status_line = f"🎁 <b>Ваш статус:</b> <i>Бесплатный триал (5 ч)\n  └ Доступен: {formatted_until}</i>"
     elif sub_until and is_allowed:
         plan_name = (user.get("tariff_plan") or "Standart").upper()
         formatted_until = database.format_subscription_date(sub_until)
@@ -325,7 +325,9 @@ async def cmd_subscription_menu(event):
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"⚡️ <b>STANDART ({config.STARS_PRICE_STANDART} ⭐ / 30 дней)</b> — до 4 радаров, фото, стоп-слова, ЧС\n"
         f"🔥 <b>PRO ({config.STARS_PRICE_PRO} ⭐ / 30 дней)</b> — до 9 радаров + <b>Price Drop 💎</b>\n\n"
-        "Только Telegram Stars. Разовая оплата, без автосписания.\n"
+        "⭐ <b>Доступна моментальная оплата Telegram Stars.</b>\n"
+        "Разовая оплата, без автосписания.\n\n"
+        "⏳ <i>Другие способы оплаты находятся в состоянии настройки и скоро будут доступны.</i>\n\n"
         f"{'Приём платежей включён.' if config.STARS_PAYMENTS_ENABLED else 'Приём платежей временно выключен.'}\n\n"
         "<i>💡 Выберите тариф ниже для просмотра подробностей:</i>"
     )
@@ -334,7 +336,7 @@ async def cmd_subscription_menu(event):
     # Если триал ещё не использован (для старых аккаунтов)
     if not is_adm and not sub_until and not trial_used:
         buttons.append([
-            InlineKeyboardButton(text="🎁 Активировать 24 часа БЕСПЛАТНО", callback_data="activate_trial_btn")
+            InlineKeyboardButton(text="🎁 Активировать 5 часов БЕСПЛАТНО", callback_data="activate_trial_btn")
         ])
 
     buttons.append([
@@ -342,6 +344,9 @@ async def cmd_subscription_menu(event):
     ])
     buttons.append([
         InlineKeyboardButton(text=f"🔥 PRO — {config.STARS_PRICE_PRO} ⭐ / 30 дней", callback_data="buy_tariff:pro")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="⏳ Другие способы оплаты (в настройке)", callback_data="other_payment_methods")
     ])
     buttons.append([
         InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile"),
@@ -408,9 +413,11 @@ async def cb_select_tariff(call: CallbackQuery):
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🚀 <b>Возможности тарифа:</b>\n"
         f"{selected['perks']}\n\n"
+        "⭐ <b>Оплата через Telegram Stars активна.</b>\n"
         "Разовая подписка, без автосписания. 30 дней добавляются к оставшемуся сроку; "
         "выбранный тариф применяется сразу, включая при смене PRO на Standart. "
-        "Доступность и скорость зависят от Авито. Условия и возврат: /terms, поддержка: /paysupport."
+        "Доступность и скорость зависят от Авито. Условия и возврат: /terms, поддержка: /paysupport.\n\n"
+        "⏳ <i>Другие способы оплаты находятся в состоянии настройки и скоро будут подключены.</i>"
     )
 
     nav_buttons = [
@@ -423,11 +430,39 @@ async def cb_select_tariff(call: CallbackQuery):
                                              callback_data=f"stars_buy:{tariff_key}:{config.stars_price(tariff_key)}")])
     else:
         text += "\n\n⚠️ Приём платежей временно выключен."
+    buttons.append([
+        InlineKeyboardButton(text="⏳ Другие способы оплаты (в настройке)", callback_data="other_payment_methods")
+    ])
     buttons.append([InlineKeyboardButton(text="📃 Условия оплаты", callback_data="payment_terms"),
                     InlineKeyboardButton(text="💬 Платёжная поддержка", callback_data="payment_support")])
     buttons.append(nav_buttons)
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data == "other_payment_methods")
+async def cb_other_payment_methods(call: CallbackQuery):
+    text = (
+        "⏳ <b>ДРУГИЕ СПОСОБЫ ОПЛАТЫ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⭐ В данный момент моментальная оплата доступна через <b>Telegram Stars</b>.\n\n"
+        "⚙️ <b>В процессе настройки и подключения:</b>\n"
+        "• Банковские карты (МИР, Visa, Mastercard)\n"
+        "• СБП (Система быстрых платежей)\n"
+        "• Альтернативные электронные способы\n\n"
+        "Ведутся технические работы по интеграции платёжного шлюза. Скоро эти способы будут полностью доступны для оплаты прямо в боте!\n\n"
+        "💬 <i>Если у вас есть вопросы по оплате или нужна помощь с доступом — свяжитесь с поддержкой:</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Оплатить через Telegram Stars", callback_data="open_subscription_menu")],
+        [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="support_start_ticket")],
+        [InlineKeyboardButton(text="« Назад к тарифам", callback_data="open_subscription_menu")]
+    ])
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:

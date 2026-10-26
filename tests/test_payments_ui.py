@@ -97,6 +97,18 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.methods("SendInvoice"), [])
         self.assertEqual(self.methods("SendMessage"), [])
 
+    async def test_other_payment_methods_button_and_screen(self):
+        await self.dispatch_callback("open_subscription_menu")
+        self.assertIn("other_payment_methods", self.callback_values())
+        await self.dispatch_callback("buy_tariff:standart")
+        self.assertIn("other_payment_methods", self.callback_values())
+        await self.dispatch_callback("other_payment_methods")
+        text = self.methods("EditMessageText")[-1].text
+        self.assertIn("ДРУГИЕ СПОСОБЫ ОПЛАТЫ", text)
+        self.assertIn("Telegram Stars", text)
+        self.assertIn("настройки", text)
+        self.assertIn("open_subscription_menu", self.callback_values())
+
     async def test_precheckout_can_reject_invalid_amount_then_approve_without_access(self):
         order = await billing.create_order(self.user_id, "standart")
         await self.checkout(order, total_amount=1)
