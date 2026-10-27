@@ -10,8 +10,11 @@ if not TESTING:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "25"))
 MAX_SEARCHES_PER_USER = int(os.getenv("MAX_SEARCHES_PER_USER", "20"))
-# Количество параллельных воркеров мониторинга (по умолчанию 30)
-MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "30"))
+# Количество параллельных воркеров мониторинга (по умолчанию 4 для безопасной работы без 403)
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))
+# Защита от 403: на одном прямом IP или 1 прокси безопасно работают не более 4 воркеров
+if MAX_CONCURRENT_WORKERS > 4 and not os.getenv("PROXY_POOL_FILE"):
+    MAX_CONCURRENT_WORKERS = 4
 
 # Stars — единственный способ оплаты цифровой подписки. Включается явно.
 STARS_PAYMENTS_ENABLED = os.getenv("STARS_PAYMENTS_ENABLED", "0").strip() == "1"
