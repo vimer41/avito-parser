@@ -1,25 +1,25 @@
 import asyncio
 import datetime
-import gc
 import html
 import json
 import logging
-import random
 import re
 import time
-from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import urlparse, parse_qs
 import aiohttp
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 import config
 import database
-from config import CHECK_INTERVAL
+from freshness import freshness_status
+from request_budget import get_network_block_state, RequestDeferred, RequestBudgetExceeded
 from parser import AvitoParser, AvitoItem
+from collector import collect_source
+from source_cache import SOURCE_SNAPSHOTS, SourceSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +36,18 @@ class NotificationTask:
     is_price_drop: bool = False
     old_price: Optional[int] = None
     drop_percent: Optional[int] = None
+    discovered_at: float = 0.0
+    freshness_verified: bool = False
 
 
 async def enqueue_notification_task(task: NotificationTask) -> bool:
+    task.discovered_at = task.discovered_at or time.time()
+    if not task.is_price_drop:
+        radar = await database.get_search(task.radar_id)
+        task.freshness_verified = task.freshness_verified or freshness_status(
+            task.item.date, task.item.timestamp, radar.get("max_age_minutes") if radar else 5,
+            now=task.discovered_at,
+        ) is True
     event_key = f"drop:{task.old_price}:{task.item.raw_price}" if task.is_price_drop else "new"
     return await database.enqueue_notification(task.radar_id, task.user_id, task.item.item_id, event_key, asdict(task))
 
@@ -146,6 +155,7 @@ async def close_image_session():
     if _IMAGE_SESSION and not _IMAGE_SESSION.closed:
         await _IMAGE_SESSION.close()
         _IMAGE_SESSION = None
+    await SOURCE_SNAPSHOTS.close()
 
 async def download_image_bytes(raw_url: str) -> Optional[bytes]:
     """
@@ -168,12 +178,20 @@ async def download_image_bytes(raw_url: str) -> Optional[bytes]:
 
     for u in urls_to_try:
         try:
-            async with IMAGE_DOWNLOAD_SEMAPHORE:
-                async with session.get(u) as resp:
+            parsed = urlparse(u)
+            if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".img.avito.st") or parsed.username or parsed.password:
+                continue
+            budget = get_network_block_state(config.PROXY_URL)
+            async with IMAGE_DOWNLOAD_SEMAPHORE, budget.request_slot_async():
+                async with session.get(u, proxy=config.PROXY_URL, allow_redirects=False) as resp:
+                    budget.record_response(resp.status)
+                    budget.register_throttle_response(resp.status, resp.headers)
                     if resp.status == 200:
                         content = await resp.read()
                         if len(content) > 500:
                             return content
+        except (RequestDeferred, RequestBudgetExceeded):
+            return None
         except Exception as dl_err:
             logger.debug(f"Сбой загрузки фото по {u[:45]}: {dl_err}")
 
@@ -340,72 +358,13 @@ def format_item_age(date_str: Optional[str], timestamp: Optional[int] = None) ->
             return f"{age_seconds // 3600} ч. назад"
         else:
             return f"{age_seconds // 86400} дн. назад"
-    if date_str:
-        return date_str.strip()
-    return "возраст не указан"
+    return date_str or "возраст не указан"
 
 
-def is_ad_fresh_enough(
-    date_str: Optional[str],
-    timestamp: Optional[int] = None,
-    max_age_minutes: Optional[int] = 5
-) -> bool:
-    """
-    Проверяет, действительно ли объявление актуальное/свежее согласно настройке радара (max_age_minutes),
-    отсекая старый спам из глубины каталога. Лимит строго от 1 до 30 минут (по дефолту 5 мин).
-
-    1. Если есть точный timestamp из SSR JSON — вычисляет возраст лота с точностью до секунды.
-    2. Если timestamp нет — парсит относительные фразы и время 'сегодня в HH:MM'.
-    """
-    if not max_age_minutes or max_age_minutes <= 0:
-        eff_max_age = 5
-    else:
-        eff_max_age = min(30, int(max_age_minutes))
-
-    threshold_seconds = eff_max_age * 60
-
-    if timestamp:
-        age_seconds = max(0, int(time.time() - timestamp))
-        return age_seconds <= threshold_seconds
-
-    if not date_str:
-        return False
-
-    d = date_str.lower().strip()
-    if d in ("дата не указана", "возраст не указан"):
-        return False
-
-    # Секунды и "только что" (всегда свежие, менее минуты)
-    if any(k in d for k in ["секунд", "только что"]):
-        return True
-
-    # Минуты
-    if "минут" in d:
-        m = re.search(r"(\d+)\s+минут", d)
-        if m:
-            mins = int(m.group(1))
-            return mins <= eff_max_age
-        return True
-
-    # При лимите до 30 минут "час назад", "2 часа назад", "вчера" и т.д. ГАРАНТИРОВАННО отсекаются!
-    if any(k in d for k in ["час назад", "часа назад", "часов назад"]):
-        return False
-
-    # "сегодня в 18:06" / "сегодня, 18:06"
-    if "сегодня" in d:
-        m = re.search(r"(\d{1,2}):(\d{2})", d)
-        if m:
-            ad_h, ad_m = int(m.group(1)), int(m.group(2))
-            now = datetime.datetime.now()
-            diff_min = (now.hour * 60 + now.minute) - (ad_h * 60 + ad_m)
-            # Учитываем возможный рассинхрон часов / смену суток
-            if diff_min < -60:
-                return True
-            return diff_min <= eff_max_age
-        return True
-
-    # Все остальное: "вчера", "24 октября", "3 дня назад" и т.д. считаем старыми
-    return False
+def is_ad_fresh_enough(date_str: Optional[str], timestamp: Optional[int] = None,
+                      max_age_minutes: Optional[int] = 5) -> bool:
+    """Compatibility boolean; collection distinguishes unknown publication ages."""
+    return freshness_status(date_str, timestamp, max_age_minutes) is True
 
 
 def is_stop_word_matched(item: AvitoItem, stop_words: list) -> Optional[str]:
@@ -439,7 +398,7 @@ def get_user_display_name(radar: Dict) -> str:
 
 
 async def get_next_pipeline_task(urgent_queue: asyncio.Queue, pipeline_queue: asyncio.Queue):
-    """Priority dequeue without leaving orphaned queue.get tasks on cancellation."""
+    """Legacy helper only; active monitoring uses DeadlineScheduler, not this queue."""
     try:
         return urgent_queue.get_nowait(), True
     except asyncio.QueueEmpty:
@@ -473,14 +432,7 @@ async def send_ad_to_user(
     old_price: Optional[int] = None,
     drop_percent: Optional[int] = None
 ) -> bool:
-    """
-    Отправляет уведомление пользователю (фото или текст).
-    1. Синхронизируется через per-item lock (защита от Cache Stampede при параллельной отправке).
-    2. Сначала проверяет кэш telegram file_id для мгновенной отправки без скачивания.
-    3. Скачивает фото через high-performance aiohttp session (Anycast CDN c80.img.avito.st).
-    4. Сохраняет полученный telegram file_id для остальных пользователей и будущих отправок.
-    5. Автоматически выдерживает паузу и повторяет отправку при TelegramRetryAfter.
-    """
+    """Cached Telegram photo or immediate text; no image HTTP on the critical path."""
     caption = build_notification_text(
         it, search_title,
         is_price_drop=is_price_drop,
@@ -493,7 +445,7 @@ async def send_ad_to_user(
 
     async def prepare_send() -> bool:
         await limit_notification_send_rate()
-        # Downloading an image or waiting for its lock may outlive the radar/access.
+        # A Telegram rate-limit wait may outlive the radar or access permission.
         return await database.can_deliver_to_search(search_id, user_id)
 
     # 1. Быстрая попытка через кэш telegram file_id (без блокировки)
@@ -517,65 +469,8 @@ async def send_ad_to_user(
             except TelegramRetryAfter as retry_err:
                 raise
             except Exception as cache_err:
-                logger.debug(f"file_id кэш сбой ({cache_err}), пробуем скачать фото...")
+                logger.debug(f"file_id кэш сбой ({cache_err}), отправляем текст...")
                 break
-
-    # 2. Если в кэше нет — берем атомарный item_lock (исключает повторное скачивание одной картинки параллельными воркерами)
-    item_lock = await get_item_lock(it.item_id)
-    async with item_lock:
-        # Проверяем кэш повторно внутри лока (если другой воркер скачал и залил в Telegram мгновением ранее)
-        cached_fid = get_cached_photo_file_id(it.item_id)
-        if cached_fid:
-            for attempt in range(2):
-                try:
-                    if not await prepare_send():
-                        return False
-                    await bot.send_photo(
-                        chat_id=user_id,
-                        photo=cached_fid,
-                        caption=caption,
-                        reply_markup=keyboard,
-                        parse_mode="HTML"
-                    )
-                    logger.info(f"     ⚡️ [Радар #{search_id}{owner_str}] {delivery_tag} (file_id кэш/lock): {it.price} · «{it.title[:35]}»")
-                    return True
-                except TelegramForbiddenError:
-                    raise
-                except TelegramRetryAfter as retry_err:
-                    raise
-                except Exception:
-                    break
-
-        # Скачиваем изображение через aiohttp
-        photo_bytes: Optional[bytes] = None
-        if it.image_url:
-            photo_bytes = await download_image_bytes(it.image_url)
-
-        # Отправляем фото и сохраняем telegram file_id в кэш
-        if photo_bytes:
-            for attempt in range(2):
-                try:
-                    photo_file = BufferedInputFile(photo_bytes, filename=f"{it.item_id}.jpg")
-                    if not await prepare_send():
-                        return False
-                    sent_msg = await bot.send_photo(
-                        chat_id=user_id,
-                        photo=photo_file,
-                        caption=caption,
-                        reply_markup=keyboard,
-                        parse_mode="HTML"
-                    )
-                    if sent_msg.photo:
-                        set_cached_photo_file_id(it.item_id, sent_msg.photo[-1].file_id)
-                    logger.info(f"     🚀 [Радар #{search_id}{owner_str}] {delivery_tag} (с фото): {it.price} · «{it.title[:35]}»")
-                    return True
-                except TelegramForbiddenError:
-                    raise
-                except TelegramRetryAfter as retry_err:
-                    raise
-                except Exception as photo_send_err:
-                    logger.warning(f"⚠️ [РАДАР #{search_id}] Сбой send_photo: {photo_send_err}, отправляем текстом...")
-                    break
 
     # 3. Фолбэк: отправляем текстом (если фото недоступно или Telegram отклонил фото)
     for attempt in range(2):
@@ -620,29 +515,32 @@ async def process_url_group(
     radars_for_url: List[dict],
     worker_id: int = 1
 ):
-    """
-    Обрабатывает один уникальный URL выдачи Авито:
-    - Делает ровно 1 HTTP-запрос к Авито
-    - Парсит органическую выдачу (топ-25)
-    - Сортирует пользователей по приоритету тарифов (PRO и админы получают первыми)
-    - Раздает результаты с фильтрацией по стоп-словам и ЧС продавцов
-    - Сразу запоминает новые ID в базе для каждого радара
+    """Collect an exact source once, then apply each subscriber's filters.
+
+    All pages share a finite deadline; accepted items enter the persistent outbox
+    before they can become seen. Unknown publication ages remain unseen.
     """
     try:
-        # Выполняем 1 сетевой запрос к Авито на всю группу радаров с этим URL
         fetch_t0 = time.monotonic()
-        html_content = await parser.fetch_page_async(clean_url)
-        fetch_ms = int((time.monotonic() - fetch_t0) * 1000)
-
-        if not html_content:
-            logger.info("Scan result: ok=0 elapsed_ms=%d items=0 blocked=%d", fetch_ms, int(bool(parser.is_blocked())))
+        parser.last_coverage_gap = False
+        max_age = max((min(30, max(1, int(radar.get("max_age_minutes") or 5))) for radar in radars_for_url), default=5)
+        collection = await collect_source(parser, clean_url, max_age)
+        if collection is None:
+            logger.info("Scan result: ok=0 elapsed_ms=%d items=0 blocked=%d failure=%s",
+                        int((time.monotonic() - fetch_t0) * 1000), int(bool(parser.is_blocked())), getattr(parser, "last_failure", None))
             return False
-
-        items = parser.parse_items(html_content)
-        logger.info("Scan result: ok=1 elapsed_ms=%d items=%d blocked=0", fetch_ms, len(items))
+        items = list(collection.items)
+        fetch_ms = collection.elapsed_ms
+        SOURCE_SNAPSHOTS.put(clean_url, SourceSnapshot(collection.title, collection.items, collection.captured_at))
+        logger.info("Scan result: ok=1 elapsed_ms=%d items=%d blocked=0 pages=%d coverage_gap=%d", fetch_ms, len(items), collection.pages, int(collection.coverage_gap))
         w_tag = f"[W{worker_id}] " if config.MAX_CONCURRENT_WORKERS > 1 else ""
 
         if not items:
+            for radar in radars_for_url:
+                if radar.get("initialized_at") is None:
+                    await database.initialize_search_snapshot(radar["id"], [])
+            global LAST_SCAN_TIMESTAMP
+            LAST_SCAN_TIMESTAMP = time.time()
             logger.info(f"📡 {w_tag}[ПАРСЕР] По URL «{clean_url[:60]}...»: страница получена за {fetch_ms} мс, лотов в каталоге не найдено")
             return True
 
@@ -669,6 +567,11 @@ async def process_url_group(
 
             # 🛡 Защита от фантомного спама: проверяем, что радар не был удален во время скачивания
             if not await database.is_search_active(radar_id) or not await database.is_user_allowed(user_id):
+                continue
+
+            if radar.get("initialized_at") is None and await database.initialize_search_snapshot(
+                radar_id, [(item.item_id, item.raw_price) for item in items],
+            ):
                 continue
 
             stop_words = radar.get("stop_words", [])
@@ -757,19 +660,22 @@ async def process_url_group(
             else:
                 max_age_min = min(30, int(max_age_raw))
 
-            fresh_items = [
-                it for it in new_items 
-                if is_ad_fresh_enough(it.date, getattr(it, "timestamp", None), max_age_minutes=max_age_min)
-            ]
+            ages = {item.item_id: freshness_status(item.date, item.timestamp, max_age_min,
+                                                 now=collection.discovery_times.get(item.item_id, collection.captured_at)) for item in new_items}
+            unknown_ids = {item_id for item_id, status in ages.items() if status is None}
+            fresh_items = [item for item in new_items if ages[item.item_id] is True]
             deliverable_items = [
                 it for it in fresh_items
                 if not is_stop_word_matched(it, stop_words)
                 and not (it.seller_name and it.seller_name.lower().strip() in blocked_sellers)
             ]
             deliverable_ids = {it.item_id for it in deliverable_items}
-            rejected = [(item_id, price) for item_id, price in candidates.items() if item_id not in deliverable_ids]
+            rejected = [(item_id, price) for item_id, price in candidates.items()
+                        if item_id not in deliverable_ids and item_id not in unknown_ids]
             if rejected:
                 await database.mark_items_seen_bulk(radar_id, rejected)
+            if unknown_ids:
+                logger.info("Радар #%s: %s объявлений без достоверного возраста оставлены для повторной проверки", radar_id, len(unknown_ids))
             fresh_items = deliverable_items
 
             if not fresh_items:
@@ -814,10 +720,11 @@ async def process_url_group(
                     radar_id=radar_id,
                     search_title=search_title,
                     item=it,
-                    user_label=user_str
+                    user_label=user_str,
+                    discovered_at=collection.discovery_times.get(it.item_id, collection.captured_at),
+                    freshness_verified=True,
                 ))
 
-        global LAST_SCAN_TIMESTAMP
         LAST_SCAN_TIMESTAMP = time.time()
         return True
 
@@ -827,269 +734,8 @@ async def process_url_group(
 
 
 async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
-    """
-    Непрерывный асинхронный конвейер мониторинга поисков (Continuous Pipeline Queue)
-    с приоритетным перехватом сбоев (Immediate Priority Failover).
-    
-    1. Непрерывная очередь (next_check_at):
-       Каждая ссылка опрашивается по своему индивидуальному таймлайну без жестких пауз между кругами.
-       Новые радары подхватываются мгновенно (в течение 1 секунды).
-       PRO-радары и администраторы опрашиваются с повышенным приоритетом и сокращенным интервалом.
-       
-    2. Приоритетный перехват сбоев (Immediate Priority Failover):
-       При ошибке парсинга (403, 429, таймаут сети) задача не отбрасывается в конец очереди,
-       а мгновенно помещается в стек urgent_failover_queue.
-       Первый освободившийся воркер немедленно забирает её со своим чистым сетевым контекстом (до 3 попыток).
-    """
-    pool_size = max(1, config.MAX_CONCURRENT_WORKERS)
-    parser_pool = ParserPool(pool_size, proxy_url=config.PROXY_URL)
-    if parser is not None and parser_pool.parsers:
-        parser_pool.parsers[0].close()
-        parser_pool.parsers[0] = parser
-
-    logger.info(f"🚀 Запуск непрерывного конвейера мониторинга Авито (Worker Pool: {pool_size} воркеров, Continuous Queue)...")
-
-    # Очереди задач
-    urgent_failover_queue: asyncio.LifoQueue = asyncio.LifoQueue()
-    pipeline_queue: asyncio.Queue = asyncio.Queue()
-
-    # Состояние планировщика
-    url_next_check: Dict[str, float] = {}
-    url_intervals: Dict[str, float] = {}
-    url_radars_map: Dict[str, List[dict]] = {}
-    in_flight_urls: set = set()
-
-    # Статистика и здоровье
-    stats = {
-        "processed": 0,
-        "success": 0,
-        "failover_retries": 0,
-        "exhausted_fails": 0,
-        "consecutive_failures": 0,
-    }
-    alert_sent = False
-    FAILURE_THRESHOLD = 5
-
-    async def get_next_task() -> Tuple[Tuple[str, List[dict], int], bool]:
-        """
-        Забирает задачу с абсолютным приоритетом для urgent_failover_queue.
-        Если задач нет, ждет появления либо срочной, либо конвейерной задачи.
-        Возвращает: ((clean_url, radars, retry_attempt), is_urgent)
-        """
-        return await get_next_pipeline_task(urgent_failover_queue, pipeline_queue)
-
-    async def worker_loop(worker_id: int):
-        """Индивидуальный параллельный воркер-обработчик конвейера."""
-        w_parser = parser_pool.get_parser(worker_id - 1)
-        # Небольшой начальный сдвиг старта воркеров
-        if worker_id > 1:
-            await asyncio.sleep((worker_id - 1) * 1.2)
-
-        while True:
-            try:
-                task, is_urgent = await get_next_task()
-            except asyncio.CancelledError:
-                break
-            except Exception as task_err:
-                logger.error(f"[W{worker_id}] Ошибка извлечения задачи: {task_err}")
-                await asyncio.sleep(1)
-                continue
-
-            clean_url, radars_for_url, retry_attempt = task
-            human_name = AvitoParser._human_url(clean_url)
-
-            if is_urgent:
-                logger.info(
-                    f"  [W{worker_id}] 🎯 [FAILOVER ПЕРЕХВАТ #{retry_attempt}/3] Забрал задачу «{human_name}» из приоритетного стека!"
-                )
-
-            stats["processed"] += 1
-            ok = await process_url_group(bot, w_parser, clean_url, radars_for_url, worker_id=worker_id)
-
-            if ok:
-                stats["success"] += 1
-                stats["consecutive_failures"] = 0
-                nonlocal alert_sent
-                if alert_sent:
-                    alert_sent = False
-                    recovery_msg = (
-                        f"✅ <b>Связь с Авито восстановлена!</b>\n\n"
-                        f"Конвейер мониторинга успешно получает данные. Бот работает в штатном режиме."
-                    )
-                    for aid in config.ADMIN_IDS:
-                        try:
-                            await bot.send_message(chat_id=aid, text=recovery_msg, parse_mode="HTML")
-                        except Exception:
-                            pass
-
-                # Вычисляем время следующей проверки
-                base_interval = url_intervals.get(clean_url, config.CHECK_INTERVAL)
-                jitter = random.uniform(-1.5, 1.5)
-                url_next_check[clean_url] = time.time() + max(10.0, base_interval + jitter)
-                in_flight_urls.discard(clean_url)
-
-                # Безопасная пауза между плановыми запросами конкретного воркера
-                if urgent_failover_queue.empty():
-                    await asyncio.sleep(random.uniform(1.8, 3.0))
-                else:
-                    await asyncio.sleep(0.3)
-            else:
-                # ОШИБКА: Мгновенная передача задачи другому воркеру без ожидания и кулдаунов!
-                if retry_attempt < 3:
-                    next_attempt = retry_attempt + 1
-                    stats["failover_retries"] += 1
-                    logger.warning(
-                        f"  [W{worker_id}] ⚡️ [PRIORITY FAILOVER #{next_attempt}/3] Ошибка на «{human_name}» -> мгновенно передано в приоритетный стек другому воркеру!"
-                    )
-                    # Задача остается в in_flight_urls, отдается в LIFO стек первому свободному воркеру
-                    await urgent_failover_queue.put((clean_url, radars_for_url, next_attempt))
-                    await asyncio.sleep(0.2)
-                else:
-                    # 3 попытки исчерпаны
-                    stats["exhausted_fails"] += 1
-                    stats["consecutive_failures"] += 1
-                    logger.error(
-                        f"  [W{worker_id}] ❌ [FAILOVER EXHAUSTED] «{human_name}» не ответил после 3 попыток. Отложено на следующий плановый интервал."
-                    )
-                    base_interval = url_intervals.get(clean_url, config.CHECK_INTERVAL)
-                    url_next_check[clean_url] = time.time() + base_interval
-                    in_flight_urls.discard(clean_url)
-
-                    if stats["consecutive_failures"] >= FAILURE_THRESHOLD and not alert_sent:
-                        alert_sent = True
-                        current_p = "Настроенный прокси (реквизиты скрыты)" if config.PROXY_URL else "Прямое соединение (без прокси)"
-                        alert_msg = (
-                            f"🚨 <b>ВНИМАНИЕ: Сбой мониторинга Авито!</b>\n\n"
-                            f"Конвейер зафиксировал <b>{stats['consecutive_failures']} отказов подряд</b>.\n"
-                            f"❌ Запросы к Авито завершаются ошибкой (403, 429 или таймаут).\n\n"
-                            f"🌐 <i>Текущий прокси:</i> <code>{html.escape(current_p)}</code>\n"
-                            f"🛠 <i>Рекомендация:</i> Проверьте соединение или перезапустите бота."
-                        )
-                        for aid in config.ADMIN_IDS:
-                            try:
-                                await bot.send_message(chat_id=aid, text=alert_msg, parse_mode="HTML")
-                            except Exception:
-                                pass
-
-                    await asyncio.sleep(2.0)
-
-    async def dispatcher_loop():
-        """
-        Диспетчер конвейера:
-        - Периодически обновляет список радаров из базы данных;
-        - Назначает индивидуальный интервал опроса (PRO/Standart);
-        - Добавляет подошедшие по времени ссылки (next_check_at <= now) в рабочий конвейер;
-        - Выводит регулярную статистику работы конвейера.
-        """
-        last_db_refresh = 0.0
-        last_stats_log = time.time()
-        last_maintenance = time.time()
-
-        while True:
-            now = time.time()
-
-            # 1. Периодическое обновление активных радаров из БД (раз в 5 секунд)
-            if now - last_db_refresh >= 5.0:
-                last_db_refresh = now
-                try:
-                    active_searches = await database.get_all_active_searches()
-                    new_groups: Dict[str, List[dict]] = defaultdict(list)
-                    for search in active_searches:
-                        clean_url = AvitoParser.normalize_url(search["url"])
-                        new_groups[clean_url].append(search)
-
-                    # Вычисляем интервалы для каждого URL
-                    for clean_url, radars in new_groups.items():
-                        # Если хотя бы один радар принадлежит PRO или Admin -> ускоренный интервал
-                        has_pro = any(
-                            r.get("user_id") in config.ADMIN_IDS or (r.get("tariff_plan") or "").lower() == "pro"
-                            for r in radars
-                        )
-                        if has_pro:
-                            # PRO-интервал: на 40% быстрее стандартного, но не менее 12 сек
-                            url_intervals[clean_url] = max(12.0, config.CHECK_INTERVAL * 0.6)
-                        else:
-                            url_intervals[clean_url] = float(config.CHECK_INTERVAL)
-
-                        # Если URL новый — ставим время проверки "прямо сейчас", чтобы проверить мгновенно!
-                        if clean_url not in url_next_check:
-                            url_next_check[clean_url] = now
-                            logger.info(
-                                f"✨ [КОНВЕЙЕР] Обнаружен новый радар «{AvitoParser._human_url(clean_url)}» "
-                                f"(интервал: {url_intervals[clean_url]:.0f}с) -> мгновенная постановка в очередь!"
-                            )
-
-                    # Удаляем удаленные пользователями радары из отслеживания
-                    existing_keys = set(new_groups.keys())
-                    for old_url in list(url_next_check.keys()):
-                        if old_url not in existing_keys:
-                            url_next_check.pop(old_url, None)
-                            url_intervals.pop(old_url, None)
-                            # Примечание: in_flight_urls.discard(old_url) НЕ вызывается здесь,
-                            # чтобы избежать race condition при повторном добавлении того же URL,
-                            # пока воркер еще выполняет сетевой запрос. Флаг снимает только сам воркер!
-
-                    url_radars_map.clear()
-                    url_radars_map.update(new_groups)
-
-                except Exception as db_err:
-                    logger.error(f"[ДИСПЕТЧЕР] Ошибка синхронизации с БД: {db_err}")
-
-            # 2. Постановка созревших задач в рабочий конвейер pipeline_queue
-            for clean_url, radars in list(url_radars_map.items()):
-                if clean_url not in in_flight_urls:
-                    due_time = url_next_check.get(clean_url, 0.0)
-                    if due_time <= now:
-                        in_flight_urls.add(clean_url)
-                        await pipeline_queue.put((clean_url, radars, 0))
-
-            # 3. Периодический лог состояния конвейера (раз в 60 сек)
-            if now - last_stats_log >= 60.0:
-                last_stats_log = now
-                total_radars = sum(len(r) for r in url_radars_map.values())
-                if total_radars > 0:
-                    logger.info(
-                        f"🔄 [КОНВЕЙЕР СТАТУС] Активно: {total_radars} радаров ({len(url_radars_map)} URL) | "
-                        f"В конвейере: {pipeline_queue.qsize()} | В приоритетном стеке: {urgent_failover_queue.qsize()} | "
-                        f"За минуту: обработано {stats['processed']} (успешно {stats['success']}, failover {stats['failover_retries']})"
-                    )
-                else:
-                    logger.info("ℹ️ [КОНВЕЙЕР] Нет активных радаров для сканирования.")
-                stats["processed"] = 0
-                stats["success"] = 0
-                stats["failover_retries"] = 0
-
-            # 4. Техническое обслуживание раз в 45 минут (очистка БД, старых логов и RAM)
-            if now - last_maintenance >= 2700.0:
-                last_maintenance = now
-                try:
-                    await database.cleanup_old_seen_items(days=5)
-                    from logger_setup import cleanup_logs
-                    cleaned_logs = cleanup_logs(max_total_mb=40, keep_days=3)
-                    if cleaned_logs > 0:
-                        logger.info(f"🧹 [КОНВЕЙЕР] Удалено {cleaned_logs} старых архивных файлов логов")
-                    gc.collect()
-                    logger.info("🧹 [КОНВЕЙЕР] Очистка старых объявлений и сборка мусора (gc.collect) выполнены")
-                except Exception as maint_err:
-                    logger.error(f"Ошибка техобслуживания: {maint_err}")
-
-            # Шаг квантования диспетчера — 0.5 секунды
-            await asyncio.sleep(0.5)
-
-    # Запускаем диспетчер и пул воркеров
-    worker_tasks = [asyncio.create_task(worker_loop(w_id)) for w_id in range(1, pool_size + 1)]
-    dispatcher_task = asyncio.create_task(dispatcher_loop())
-
-    try:
-        await asyncio.gather(dispatcher_task, *worker_tasks)
-    finally:
-        dispatcher_task.cancel()
-        for wt in worker_tasks:
-            wt.cancel()
-        await asyncio.gather(dispatcher_task, *worker_tasks, return_exceptions=True)
-        for owned_parser in parser_pool.parsers:
-            if owned_parser is not parser:
-                owned_parser.close()
+    from monitoring import run_monitoring
+    await run_monitoring(bot, parser)
 
 
 async def deliver_notification(bot: Bot, parser: AvitoParser, row: dict) -> bool:
@@ -1121,10 +767,20 @@ async def deliver_notification(bot: Bot, parser: AvitoParser, row: dict) -> bool
             if threshold <= 0 or (task.drop_percent or 0) < threshold:
                 await database.discard_notification(notification_id, token)
                 return False
-        if not task.is_price_drop and not is_ad_fresh_enough(task.item.date, task.item.timestamp, search.get("max_age_minutes")):
-            await database.discard_notification(notification_id, token)
-            await database.mark_item_seen(task.radar_id, task.item.item_id, task.item.raw_price or 0)
-            return False
+        if not task.is_price_drop and not task.freshness_verified:
+            queued_at = task.discovered_at or row.get("created_at") or time.time()
+            if isinstance(queued_at, str):
+                queued_at = datetime.datetime.fromisoformat(queued_at).replace(tzinfo=datetime.timezone.utc).timestamp()
+            status = freshness_status(task.item.date, task.item.timestamp, search.get("max_age_minutes"), now=queued_at)
+            if status is False:
+                await database.discard_notification(notification_id, token)
+                await database.mark_item_seen(task.radar_id, task.item.item_id, task.item.raw_price or 0)
+                return False
+            if status is None:
+                # Legacy unknown-age tasks were never verified. Return them to
+                # discovery without seen state so later metadata can qualify.
+                await database.discard_notification(notification_id, token)
+                return False
         blocked = await database.get_blocked_sellers(task.user_id)
         if is_stop_word_matched(task.item, search.get("stop_words", [])) or (task.item.seller_name and task.item.seller_name.lower().strip() in blocked):
             await database.discard_notification(notification_id, token)
@@ -1135,7 +791,11 @@ async def deliver_notification(bot: Bot, parser: AvitoParser, row: dict) -> bool
             old_price=task.old_price, drop_percent=task.drop_percent,
         )
         if delivered:
-            return await database.acknowledge_notification(notification_id, token, task.item.raw_price or 0)
+            acknowledged = await database.acknowledge_notification(notification_id, token, task.item.raw_price or 0)
+            if acknowledged:
+                logger.info("Delivery result: notification=%s discovery_to_send_ms=%d attempts=%s", notification_id,
+                            int((time.time() - (task.discovered_at or time.time())) * 1000), row["attempts"])
+            return acknowledged
         await database.release_notification(notification_id, token, min(300, 2 ** min(row["attempts"], 8)))
         return False
     except asyncio.CancelledError:

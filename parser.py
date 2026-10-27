@@ -10,7 +10,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass
-from email.utils import parsedate_to_datetime
+from contextlib import contextmanager
 from http.cookiejar import Cookie
 from threading import Event, Lock, RLock
 from typing import List, Optional, Tuple
@@ -18,7 +18,14 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
+import config
 from config import DATA_DIR
+from freshness import normalize_timestamp
+from request_budget import (
+    BLOCK_BASE_COOLDOWN, BLOCK_MAX_COOLDOWN,
+    NetworkBlockState, get_network_block_state, parse_retry_after,
+    RequestDeferred, RequestBudgetExceeded,
+)
 from anti_bot import (
     get_browser_user_agent,
     handle_anti_bot_challenge,
@@ -33,56 +40,15 @@ from anti_bot.pow_budget import PowSearchCancelled, PowSearchError, check_cancel
 logger = logging.getLogger(__name__)
 
 COOKIE_FILE = DATA_DIR / "avito_cookies.json"
-
-# Пауза при ошибке воркера: без общих задержек, мгновенный переход к другим воркерам
-BLOCK_BASE_COOLDOWN = 1
-BLOCK_MAX_COOLDOWN = 2
 COOKIE_IO_LOCK = Lock()
 
 
-class NetworkBlockState:
-    """A shared cooldown for sessions with the same external connection."""
-    def __init__(self):
-        self.blocked_until = 0.0
-        self.block_streak = 0
-        self.lock = Lock()
-
-    def register_block(self, retry_after: float = 0) -> tuple[float, int]:
-        with self.lock:
-            self.block_streak += 1
-            cooldown = max(min(BLOCK_BASE_COOLDOWN * 2 ** min(self.block_streak - 1, 5), BLOCK_MAX_COOLDOWN), retry_after)
-            self.blocked_until = max(self.blocked_until, time.time() + cooldown)
-            return cooldown, self.block_streak
-
-    def register_success(self):
-        with self.lock:
-            # An in-flight success must not lift another worker's active rate limit.
-            if self.blocked_until <= time.time():
-                self.block_streak = 0
-
-
-NETWORK_BLOCK_STATES: dict[str, NetworkBlockState] = {}
-NETWORK_STATES_LOCK = Lock()
-
-
-def get_network_block_state(proxy: Optional[str]) -> NetworkBlockState:
-    key = hashlib.sha256((proxy or "direct").encode()).hexdigest()
-    with NETWORK_STATES_LOCK:
-        return NETWORK_BLOCK_STATES.setdefault(key, NetworkBlockState())
-
-
-def parse_retry_after(headers) -> float:
-    value = next((str(v).strip() for k, v in (headers or {}).items() if k.lower() == "retry-after"), "")
-    if not value:
-        return 0
-    try:
-        delay = float(value)
-    except ValueError:
-        try:
-            delay = parsedate_to_datetime(value).timestamp() - time.time()
-        except (ValueError, TypeError, OverflowError):
-            return 0
-    return min(86400, max(0, delay)) if math.isfinite(delay) else 0
+@dataclass
+class FetchFailure:
+    kind: str
+    retryable: bool = True
+    retry_after: float = 0.0
+    status: Optional[int] = None
 
 @dataclass
 class AvitoItem:
@@ -113,18 +79,23 @@ class AvitoItem:
 class AvitoParser:
     def __init__(self, proxy: Optional[str] = None, *, block_state: Optional[NetworkBlockState] = None):
         self.current_proxy: Optional[str] = proxy
-        self.network_block = block_state if block_state is not None else NetworkBlockState()
+        self.network_block = block_state if block_state is not None else get_network_block_state(proxy)
         self._session_lock = RLock()
         self._async_fetch_lock = asyncio.Lock()
+        self._cancel_event: Event | None = None
+        self._operation_deadline: float | None = None
+        self._operation_requests = 0
+        self._last_block_response = None
+        self.last_failure: Optional[FetchFailure] = None
+        self.last_coverage_gap = False
+        self.blocked_until = 0.0
+        self.block_streak = 0
         self._proxy_key = hashlib.sha256((proxy or "direct").encode()).hexdigest()
         self.cookie_file = COOKIE_FILE if not proxy else DATA_DIR / f"avito_cookies_{self._proxy_key[:16]}.json"
         self.session = self._create_session()
+        self._install_request_budget()
         self._last_saved_cookies: list = []
         self._load_cookies()
-
-        # Защита от бана: пока активна пауза, к Авито не отправляется ни одного запроса
-        self.blocked_until: float = 0.0
-        self.block_streak: int = 0
 
         # Кэш SSR-редиректов Авито: исходный URL -> канонический URL (экономит 1 запрос на радар)
         self._canonical_cache: dict = {}
@@ -136,12 +107,70 @@ class AvitoParser:
     def block_remaining(self) -> int:
         return max(0, math.ceil(max(self.blocked_until, self.network_block.blocked_until) - time.time()))
 
-    def _register_block(self, status: int, headers=None):
+    def _register_block(self, status: int, headers=None, *, response=None, kind=None):
+        if response is not None and response is self._last_block_response:
+            return
         cooldown, self.block_streak = self.network_block.register_block(parse_retry_after(headers))
         self.blocked_until = time.time() + cooldown
+        self._last_block_response = response
+        self.last_failure = FetchFailure(kind or ("rate_limit" if status == 429 else "forbidden" if status == 403 else "challenge"), retry_after=cooldown, status=status)
         logger.warning(
-            f"⚠️ Авито вернул статус {status}. Задача передаётся следующему воркеру конвейера (попытка #{self.block_streak})"
+            "⚠️ HTTP %s (%s): общая пауза %.1f с, серия %s. Это не подтверждение IP-бана.",
+            status, self.last_failure.kind, cooldown, self.block_streak,
         )
+
+    @staticmethod
+    def _is_recognized_challenge(response, session) -> bool:
+        return bool(
+            is_qrator_challenge_response(response) or is_geetest_challenge(response)
+            or extract_pow_challenge(response, session)
+            or "firewall-container" in (getattr(response, "text", "") or "")
+        )
+
+    @contextmanager
+    def _operation(self, cancel_event: Event | None = None, deadline: float | None = None):
+        previous = self._cancel_event, self._operation_deadline, self._operation_requests
+        self._cancel_event = cancel_event
+        self._operation_deadline = min(deadline or float("inf"), time.monotonic() + config.AVITO_FETCH_TIMEOUT)
+        self._operation_requests = 0
+        try:
+            yield
+        finally:
+            self._cancel_event, self._operation_deadline, self._operation_requests = previous
+
+    def _install_request_budget(self):
+        # Keep the actual curl session identity/cookies for the existing handlers.
+        # curl_cffi 0.16.3 get/post dispatch through this assignable method.
+        raw_request = getattr(self.session, "request", None)
+        if not callable(raw_request):
+            return  # Injected test doubles can implement get/post directly.
+
+        def budgeted_request(*args, **kwargs):
+            with self._session_lock:
+                event, deadline = self._cancel_event, self._operation_deadline
+                if self._operation_requests >= config.AVITO_MAX_REQUESTS_PER_FETCH:
+                    raise RequestBudgetExceeded("HTTP request limit per fetch exceeded")
+                with self.network_block.request_slot(event, deadline):
+                    self._operation_requests += 1
+                    remaining = max(0.001, deadline - time.monotonic()) if deadline else 20.0
+                    timeout = kwargs.get("timeout", 20)
+                    if isinstance(timeout, tuple):
+                        kwargs["timeout"] = tuple(min(float(part), remaining) for part in timeout)
+                    else:
+                        kwargs["timeout"] = min(float(timeout or 20), remaining)
+                    # Redirects must be explicit, validated and budgeted separately.
+                    kwargs["allow_redirects"] = False
+                    response = raw_request(*args, **kwargs)
+                    self.network_block.record_response(response.status_code)
+                    recognized = self._is_recognized_challenge(response, self.session)
+                    retry_after = parse_retry_after(response.headers)
+                    if (response.status_code in (403, 429) and (retry_after or not recognized)) or (response.status_code == 503 and retry_after):
+                        self._register_block(response.status_code, response.headers, response=response,
+                                             kind="server_retry_after" if response.status_code == 503 else None)
+                    check_cancelled(event)
+                    return response
+
+        self.session.request = budgeted_request
 
     @staticmethod
     def _is_firewall(r) -> bool:
@@ -304,7 +333,7 @@ class AvitoParser:
         query_params = parse_qs(parsed.query)
 
         # Удаляем мусорные / сессионные параметры, меняющиеся между запросами
-        junk_keys = {"context", "localPriority", "presentationType", "from", "view"}
+        junk_keys = {"context", "localPriority", "presentationType", "from", "view", "p"}
         for k in list(query_params.keys()):
             if k in junk_keys or k.startswith("utm_"):
                 query_params.pop(k, None)
@@ -332,14 +361,17 @@ class AvitoParser:
 
     def _solve_pow_challenge(self, pow_challenge: str) -> bool:
         """Решает PoW challenge через модуль anti_bot."""
-        with self._session_lock:
+        with self._session_lock, self._operation():
             return solve_pow_challenge(self.session, pow_challenge)
 
-    async def fetch_page_async(self, url: str) -> Optional[str]:
+    async def fetch_page_async(self, url: str, *, deadline: float | None = None) -> Optional[str]:
         """Signal cancellation to the worker and wait for it before reusing its session."""
         async with self._async_fetch_lock:
             cancel_event = Event()
-            task = asyncio.create_task(asyncio.to_thread(self.fetch_page, url, cancel_event=cancel_event))
+            kwargs = {"cancel_event": cancel_event}
+            if deadline is not None:
+                kwargs["deadline"] = deadline
+            task = asyncio.create_task(asyncio.to_thread(self.fetch_page, url, **kwargs))
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
@@ -376,45 +408,56 @@ class AvitoParser:
             url = urljoin(url, location)
         raise ValueError("Avito redirect limit exceeded")
 
-    def fetch_page(self, url: str, *, cancel_event: Event | None = None) -> Optional[str]:
+    def fetch_page(self, url: str, *, cancel_event: Event | None = None, deadline: float | None = None) -> Optional[str]:
         """Only an unchallenged target-page response is success, never a solver token."""
-        with self._session_lock:
+        with self._session_lock, self._operation(cancel_event, deadline):
+            self.last_failure = None
             check_cancelled(cancel_event)
             if self.is_blocked():
+                self.last_failure = FetchFailure("cooldown", retry_after=self.block_remaining())
                 return None
             target = self._canonical_cache.get(url, url)
             human = self._human_url(url)
             challenge_attempts = 0
             ssr_redirects = 0
-            network_failures = 0
             while True:
                 check_cancelled(cancel_event)
                 if self.is_blocked():
+                    self.last_failure = self.last_failure or FetchFailure("cooldown", retry_after=self.block_remaining())
                     return None
                 try:
                     response, actual_url = self._get_page_response(target, cancel_event)
-                    challenged = self._is_firewall(response) or extract_pow_challenge(response, self.session)
+                    challenged = self._is_recognized_challenge(response, self.session)
+                    if response.status_code in (403, 429) and (parse_retry_after(response.headers) or not challenged):
+                        self._register_block(response.status_code, response.headers, response=response)
+                        return None
+                    if response.status_code == 503 and parse_retry_after(response.headers):
+                        self._register_block(503, response.headers, response=response, kind="server_retry_after")
+                        return None
                     if challenged:
                         if challenge_attempts >= 2:
-                            self._register_block(response.status_code, response.headers)
+                            self._register_block(response.status_code, response.headers, response=response, kind="challenge")
                             return None
                         challenge_attempts += 1
                         logger.info("🛡 %s: проверка HTTP %s (попытка %d/2)", human, response.status_code, challenge_attempts)
                         accepted = handle_anti_bot_challenge(self.session, response, actual_url, cancel_event=cancel_event)
                         check_cancelled(cancel_event)
                         if not accepted:
-                            self._register_block(response.status_code, response.headers)
+                            if not self.is_blocked():
+                                self._register_block(response.status_code, response.headers, response=response, kind="challenge")
                             return None
                         # Preserve the same session/IP. Do not save clearance cookies yet.
                         continue
 
                     if response.status_code != 200:
+                        self.last_failure = FetchFailure("server" if response.status_code >= 500 else "http_client", response.status_code >= 500, status=response.status_code)
                         logger.warning("⚠️ %s: Авито ответил HTTP %s", human, response.status_code)
                         return None
                     page_html = response.text
                     if '"isSuspenseRedirect":true' in page_html:
                         match = re.search(r'"redirect"\s*:\s*"([^"]+)"', page_html)
                         if not match or ssr_redirects >= 2:
+                            self.last_failure = FetchFailure("invalid_redirect", False)
                             return None
                         redirect_path = match.group(1).replace(r"\u0026", "&")
                         target = urljoin(actual_url, redirect_path)
@@ -423,6 +466,7 @@ class AvitoParser:
                         continue
 
                     if not page_html or not re.search(r"<(?:!doctype\s+html|html|head|body|script)\b", page_html, re.I):
+                        self.last_failure = FetchFailure("invalid_html")
                         logger.warning("⚠️ %s: HTTP 200 без HTML страницы", human)
                         return None
                     if self.block_streak:
@@ -438,24 +482,26 @@ class AvitoParser:
                     return page_html
                 except PowSearchCancelled:
                     raise
+                except RequestDeferred as exc:
+                    self.last_failure = self.last_failure or FetchFailure("cooldown", retry_after=exc.retry_after)
+                    return None
+                except RequestBudgetExceeded as exc:
+                    self.last_failure = FetchFailure("request_budget")
+                    logger.warning("🌐 %s: %s", human, exc)
+                    return None
                 except PowSearchError as exc:
                     logger.warning("PoW stopped: %s", exc)
                     self._register_block(439)
                     return None
                 except ValueError as exc:
+                    self.last_failure = FetchFailure("invalid_response", False)
                     logger.warning("Некорректный ответ/URL Авито: %s", exc)
                     return None
                 except Exception as exc:
                     check_cancelled(cancel_event)
-                    network_failures += 1
-                    if network_failures >= 2:
-                        logger.warning("🌐 %s: сетевой сбой (%s)", human, type(exc).__name__)
-                        return None
-                    if cancel_event is not None:
-                        if cancel_event.wait(1.0):
-                            check_cancelled(cancel_event)
-                    else:
-                        time.sleep(1.0)
+                    self.last_failure = self.last_failure or FetchFailure("timeout" if "timeout" in type(exc).__name__.lower() else "network")
+                    logger.warning("🌐 %s: сетевой сбой (%s), повтор отложен планировщиком", human, type(exc).__name__)
+                    return None
 
     def fetch_item_details(self, item_id: str | int) -> Optional[dict]:
         """
@@ -465,7 +511,7 @@ class AvitoParser:
         """
         if self.is_blocked() or not str(item_id).isdigit():
             return None
-        with self._session_lock:
+        with self._session_lock, self._operation():
             if self.is_blocked():
                 return None
             return self._fetch_item_details(item_id)
@@ -480,7 +526,7 @@ class AvitoParser:
             }
             r = self.session.get(url, headers=headers, timeout=10, allow_redirects=False)
             if self._is_firewall(r) or extract_pow_challenge(r, self.session):
-                self._register_block(r.status_code, r.headers)
+                self._register_block(r.status_code, r.headers, response=r)
                 return None
             if r.status_code == 200:
                 payload = r.json()
@@ -680,7 +726,7 @@ class AvitoParser:
             if not candidates:
                 candidates = [
                     s for s in re.findall(r'<script[^>]*>([\s\S]*?)</script>', html)
-                    if '"catalog"' in s and '"items"' in s and len(s) > 10000
+                    if '"catalog"' in s and '"items"' in s
                 ]
 
             for raw in candidates:
@@ -705,7 +751,9 @@ class AvitoParser:
                 return []
 
             results: List[AvitoItem] = []
-            for it in catalog_items[:25]:
+            for it in catalog_items:
+                if not isinstance(it, dict):
+                    continue
                 raw_id = it.get("id")
                 if not raw_id:
                     continue
@@ -758,7 +806,7 @@ class AvitoParser:
 
                 # Точный timestamp публикации (в секундах)
                 sort_ts = it.get("sortTimeStamp") or it.get("allowTimeStamp")
-                exact_ts = int(sort_ts / 1000) if sort_ts else None
+                exact_ts = normalize_timestamp(sort_ts)
 
                 # Компоненты IVA (описание, продавец, доставка)
                 iva = it.get("iva") or {}
@@ -917,6 +965,37 @@ class AvitoParser:
             return None
 
     @classmethod
+    def has_catalog(cls, html: str) -> bool:
+        """A login/error HTML page is not a successful empty search."""
+        if cls._parse_items_from_ssr_json(html) is not None:
+            return True
+        return bool(re.search(r'data-marker=["\'](?:item|catalog-serp|search-results|search-results/empty)["\']', html))
+
+    @classmethod
+    def next_page_url(cls, html: str, current_url: str) -> Optional[str]:
+        """Follow only an explicit next-page link for the exact same search."""
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            marker = anchor.get("data-marker", "")
+            if marker != "pagination-button/nextPage" and "next" not in anchor.get("rel", []):
+                continue
+            candidate = urljoin(current_url, anchor["href"])
+            try:
+                parsed = cls._validate_avito_url(candidate)
+                params = parse_qs(parsed.query)
+                old_page = int(parse_qs(urlparse(current_url).query).get("p", ["1"])[0])
+                new_page = int(params.get("p", ["1"])[0])
+                if new_page != old_page + 1 or cls.normalize_url(candidate) != cls.normalize_url(current_url):
+                    continue
+            except (ValueError, TypeError):
+                continue
+            canonical = urlparse(cls.normalize_url(candidate))
+            params = parse_qs(canonical.query)
+            params["p"] = [str(new_page)]
+            return urlunparse(canonical._replace(query=urlencode(sorted(params.items()), doseq=True)))
+        return None
+
+    @classmethod
     def parse_items(cls, html: str) -> List[AvitoItem]:
         """
         Парсит органические объявления на странице выдачи:
@@ -925,7 +1004,7 @@ class AvitoParser:
         """
         # ⚡️ 1. Мгновенное извлечение через чистый встроенный SSR JSON
         json_items = cls._parse_items_from_ssr_json(html)
-        if json_items:
+        if json_items is not None:
             return json_items
 
         # 2. Фолбэк на HTML-разметку (BeautifulSoup)
@@ -936,7 +1015,7 @@ class AvitoParser:
         
         if not main_catalog:
             # Фолбэк, если Авито отдало нестандартную разметку
-            items_raw = soup.find_all(attrs={"data-marker": "item"}, limit=25)
+            items_raw = soup.find_all(attrs={"data-marker": "item"})
         else:
             # 2. Удаляем из каталога карусели VIP/рекламы и врезки других регионов
             for junk in main_catalog.find_all(attrs={"data-marker": ["witcher/block", "items-vip"]}):
@@ -944,8 +1023,8 @@ class AvitoParser:
             for junk in main_catalog.find_all(class_=lambda c: c and any(x in c for x in ["items-vip", "witcher"])):
                 junk.decompose()
 
-            # 3. Берем карточки только из очищенного контейнера (топ-25)
-            items_raw = main_catalog.find_all(attrs={"data-marker": "item"}, limit=25)
+            # 3. Все карточки из очищенного контейнера, без скрытого лимита 25.
+            items_raw = main_catalog.find_all(attrs={"data-marker": "item"})
 
         results: List[AvitoItem] = []
 

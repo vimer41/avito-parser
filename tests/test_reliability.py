@@ -100,6 +100,16 @@ class TestReliability(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.outbox_count(), 1)
         self.assertIsNotNone(await database.claim_notification())
 
+    async def test_outbox_metrics_include_leased_and_queue_age(self):
+        self.assertEqual(await database.get_outbox_metrics(), {"pending": 0, "leased": 0, "oldest_seconds": 0})
+        await self.enqueue()
+        await self.execute("UPDATE notification_outbox SET created_at = datetime('now', '-10 minutes')")
+        await database.claim_notification()
+        metrics = await database.get_outbox_metrics()
+        self.assertEqual(metrics["pending"], 1)
+        self.assertEqual(metrics["leased"], 1)
+        self.assertGreaterEqual(metrics["oldest_seconds"], 600)
+
     async def test_claim_is_atomic_and_stale_lease_cannot_acknowledge(self):
         await self.enqueue()
         results = await asyncio.gather(database.claim_notification(), database.claim_notification())
@@ -228,17 +238,105 @@ class TestReliability(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await scheduler.process_url_group(self.bot, parser, radar["url"], [radar]))
         self.assertEqual(await self.outbox_count(), 1)
 
-    async def test_deleted_radar_cannot_send_after_photo_download(self):
+    async def test_deleted_radar_cannot_send_after_rate_wait(self):
         self.item.image_url = "https://c80.img.avito.st/offline-fixture"
         self.bot.send_photo = AsyncMock()
         self.bot.send_message = AsyncMock()
-        async def download(url):
+        async def rate_wait():
             await database.delete_search(self.radar_id, self.user_id)
-            return b"offline-image"
-        with patch.object(scheduler, "download_image_bytes", new=AsyncMock(side_effect=download)), patch.object(scheduler, "get_cached_photo_file_id", return_value=None), patch.object(scheduler, "limit_notification_send_rate", new=AsyncMock()):
+        with patch.object(scheduler, "get_cached_photo_file_id", return_value=None), patch.object(scheduler, "limit_notification_send_rate", new=rate_wait):
             self.assertFalse(await scheduler.send_ad_to_user(self.bot, None, self.user_id, self.radar_id, "Test", self.item))
-        self.bot.send_photo.assert_not_called()
-        self.bot.send_message.assert_not_called()
+        self.bot.send_photo.assert_not_awaited()
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_uncached_photo_never_delays_text_notification(self):
+        self.item.image_url = "https://c80.img.avito.st/test.jpg"
+        self.bot.send_photo = AsyncMock()
+        self.bot.send_message = AsyncMock()
+        with patch.object(scheduler, "get_cached_photo_file_id", return_value=None), patch.object(scheduler, "download_image_bytes", new=AsyncMock()) as download, patch.object(scheduler, "limit_notification_send_rate", new=AsyncMock()):
+            self.assertTrue(await scheduler.send_ad_to_user(self.bot, None, self.user_id, self.radar_id, "Test", self.item))
+        download.assert_not_awaited()
+        self.bot.send_photo.assert_not_awaited()
+        self.bot.send_message.assert_awaited_once()
+
+    async def test_verified_notification_survives_queue_age_and_changed_age_limit(self):
+        await self.enqueue()
+        await database.update_search_max_age(self.radar_id, self.user_id, 1)
+        row = await database.claim_notification()
+        with patch.object(scheduler.time, "time", return_value=time.time() + 600), patch.object(scheduler, "send_ad_to_user", new=AsyncMock(return_value=True)) as send:
+            self.assertTrue(await scheduler.deliver_notification(self.bot, None, row))
+        send.assert_awaited_once()
+        self.assertTrue(await database.is_item_seen(self.radar_id, self.item.item_id))
+
+    async def test_legacy_notification_is_validated_at_enqueue_time(self):
+        await self.enqueue()
+        row = await database.claim_notification()
+        payload = json.loads(row["payload"])
+        payload.pop("freshness_verified")
+        payload.pop("discovered_at")
+        row["payload"] = json.dumps(payload)
+        with patch.object(scheduler.time, "time", return_value=time.time() + 600), patch.object(scheduler, "send_ad_to_user", new=AsyncMock(return_value=True)):
+            self.assertTrue(await scheduler.deliver_notification(self.bot, None, row))
+
+    async def test_unknown_age_is_not_marked_seen_and_can_be_delivered_later(self):
+        radar = await database.get_search(self.radar_id)
+        self.item.date, self.item.timestamp = "Дата не указана", None
+        parser = Mock()
+        parser.fetch_page_async = AsyncMock(return_value="<html></html>")
+        parser.parse_items.return_value = [self.item]
+        self.assertTrue(await scheduler.process_url_group(self.bot, parser, radar["url"], [radar]))
+        self.assertEqual(await self.outbox_count(), 0)
+        self.assertFalse(await database.is_item_seen(self.radar_id, self.item.item_id))
+        self.item.date = "2 мин. назад"
+        self.assertTrue(await scheduler.process_url_group(self.bot, parser, radar["url"], [radar]))
+        self.assertEqual(await self.outbox_count(), 1)
+
+    async def test_atomic_initial_snapshot_preserves_unknown_price(self):
+        await database.delete_search(self.radar_id, self.user_id)
+        radar_id = await database.add_search(self.user_id, "Atomic", "https://www.avito.ru/search", initial_items=[("old", None), ("free", 0)])
+        radar = await database.get_search(radar_id)
+        self.assertIsNotNone(radar["initialized_at"])
+        async with aiosqlite.connect(database.DB_PATH) as db:
+            async with db.execute("SELECT item_id, last_price FROM seen_items WHERE search_id = ?", (radar_id,)) as cursor:
+                self.assertEqual(dict(await cursor.fetchall()), {"old": None, "free": 0})
+
+    async def test_empty_deferred_baseline_initializes_only_once(self):
+        await self.execute("UPDATE searches SET initialized_at = NULL WHERE id = ?", (self.radar_id,))
+        radar = await database.get_search(self.radar_id)
+        parser = Mock()
+        parser.fetch_page_async = AsyncMock(return_value="<html></html>")
+        parser.parse_items.return_value = []
+        parser.has_catalog.return_value = True
+        parser.next_page_url.return_value = None
+        self.assertTrue(await scheduler.process_url_group(self.bot, parser, radar["url"], [radar]))
+        radar = await database.get_search(self.radar_id)
+        self.assertIsNotNone(radar["initialized_at"])
+        parser.parse_items.return_value = [self.item]
+        self.assertTrue(await scheduler.process_url_group(self.bot, parser, radar["url"], [radar]))
+        self.assertEqual(await self.outbox_count(), 1)
+
+    async def test_pending_baseline_survives_repeated_migration(self):
+        await self.execute("UPDATE searches SET initialized_at = NULL WHERE id = ?", (self.radar_id,))
+        await database.init_db()
+        self.assertIsNone((await database.get_search(self.radar_id))["initialized_at"])
+
+    async def test_legacy_unknown_age_returns_to_discovery_without_seen_state(self):
+        self.item.timestamp = None
+        self.item.date = "Дата не указана"
+        await self.enqueue()
+        row = await database.claim_notification()
+        with patch.object(scheduler, "send_ad_to_user", new=AsyncMock()) as send:
+            self.assertFalse(await scheduler.deliver_notification(self.bot, None, row))
+        send.assert_not_called()
+        self.assertEqual(await self.outbox_count(), 0)
+        self.assertFalse(await database.is_item_seen(self.radar_id, self.item.item_id))
+        self.item.date = "только что"
+        radar = await database.get_search(self.radar_id)
+        parser = Mock()
+        parser.fetch_page_async = AsyncMock(return_value="<html></html>")
+        parser.parse_items.return_value = [self.item]
+        self.assertTrue(await scheduler.process_url_group(self.bot, parser, radar["url"], [radar]))
+        self.assertEqual(await self.outbox_count(), 1)
 
     async def test_send_message_floodwait_reaches_persistent_outbox(self):
         self.bot.send_message = AsyncMock(side_effect=TelegramRetryAfter(method=SendMessage(chat_id=self.user_id, text="test"), message="rate limited", retry_after=10))

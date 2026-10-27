@@ -1,4 +1,5 @@
 import os
+import math
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -10,11 +11,39 @@ if not TESTING:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "25"))
 MAX_SEARCHES_PER_USER = int(os.getenv("MAX_SEARCHES_PER_USER", "20"))
-# Количество параллельных воркеров мониторинга (по умолчанию 4 для безопасной работы без 403)
-MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))
-# Защита от 403: на одном прямом IP или 1 прокси безопасно работают не более 4 воркеров
-if MAX_CONCURRENT_WORKERS > 4 and not os.getenv("PROXY_POOL_FILE"):
-    MAX_CONCURRENT_WORKERS = 4
+# Это воркеры обработки, а не разрешённая Авито частота запросов.
+# PROXY_POOL_FILE не создаёт пул: активный HTTP-путь использует только PROXY_URL.
+MAX_CONCURRENT_WORKERS = min(4, max(1, int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))))
+
+
+def positive_float_setting(name: str, default: str) -> float:
+    value = float(os.getenv(name, default))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return value
+
+
+if CHECK_INTERVAL <= 0:
+    raise ValueError("CHECK_INTERVAL must be positive")
+
+# Осторожный стартовый бюджет, НЕ подтверждённый безопасный лимит Авито.
+# Увеличивать только после разрешённых измерений. Бюджет общий для всех сессий.
+AVITO_REQUESTS_PER_SECOND = positive_float_setting("AVITO_REQUESTS_PER_SECOND", "0.5")
+AVITO_MAX_IN_FLIGHT = min(4, max(1, int(os.getenv("AVITO_MAX_IN_FLIGHT", "2"))))
+AVITO_BLOCK_BASE_COOLDOWN = positive_float_setting("AVITO_BLOCK_BASE_COOLDOWN", "30")
+AVITO_BLOCK_MAX_COOLDOWN = max(AVITO_BLOCK_BASE_COOLDOWN, positive_float_setting("AVITO_BLOCK_MAX_COOLDOWN", "900"))
+AVITO_FETCH_TIMEOUT = positive_float_setting("AVITO_FETCH_TIMEOUT", "45")
+AVITO_MAX_REQUESTS_PER_FETCH = max(1, int(os.getenv("AVITO_MAX_REQUESTS_PER_FETCH", "8")))
+AVITO_MAX_PAGES_PER_SCAN = min(5, max(1, int(os.getenv("AVITO_MAX_PAGES_PER_SCAN", "2"))))
+SCAN_MAX_INTERVAL = max(float(CHECK_INTERVAL), positive_float_setting("SCAN_MAX_INTERVAL", "120"))
+SCAN_BUDGET_UTILIZATION = positive_float_setting("SCAN_BUDGET_UTILIZATION", "0.8")
+if SCAN_BUDGET_UTILIZATION > 1:
+    raise ValueError("SCAN_BUDGET_UTILIZATION must not exceed 1")
+SCAN_MAX_RETRIES = min(3, max(0, int(os.getenv("SCAN_MAX_RETRIES", "2"))))
+SCAN_RETRY_BASE_DELAY = positive_float_setting("SCAN_RETRY_BASE_DELAY", "5")
+SCAN_RETRY_MAX_DELAY = max(SCAN_RETRY_BASE_DELAY, positive_float_setting("SCAN_RETRY_MAX_DELAY", "60"))
+SCAN_STARTUP_SPREAD = positive_float_setting("SCAN_STARTUP_SPREAD", "15")
+INITIAL_SNAPSHOT_TTL = positive_float_setting("INITIAL_SNAPSHOT_TTL", "25")
 
 # Stars — единственный способ оплаты цифровой подписки. Включается явно.
 STARS_PAYMENTS_ENABLED = os.getenv("STARS_PAYMENTS_ENABLED", "0").strip() == "1"

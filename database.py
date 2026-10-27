@@ -196,7 +196,11 @@ async def init_db():
         await ensure_columns(db, "searches", {
             "min_discount_percent": "INTEGER DEFAULT 0", "search_in_title_only": "INTEGER DEFAULT 0",
             "max_age_minutes": "INTEGER DEFAULT 5",
+            "initialized_at": "TEXT DEFAULT ''",
         })
+        # Existing radars already had a baseline. NULL is reserved for new,
+        # explicitly deferred calibrations and must survive later restarts.
+        await db.execute("UPDATE searches SET initialized_at = created_at WHERE initialized_at = ''")
 
         # Отключаем отслеживание скидок по дефолту на всех радарах (0% = выключено),
         # скидки работают только если пользователь сам явно включает их в меню радара.
@@ -444,7 +448,8 @@ async def update_user_default_template(user_id: int, template: str):
         await db.commit()
 
 
-async def add_search(user_id: int, title: str, url: str, search_in_title_only: int = 0, max_age_minutes: int = 5) -> int:
+async def add_search(user_id: int, title: str, url: str, search_in_title_only: int = 0, max_age_minutes: int = 5,
+                     *, initial_items=()) -> int:
     max_radars = await get_user_max_radars(user_id)
     max_age_minutes = min(30, max(1, int(max_age_minutes)))
     async with aiosqlite.connect(DB_PATH) as db:
@@ -468,8 +473,33 @@ async def add_search(user_id: int, title: str, url: str, search_in_title_only: i
             (user_id, title, url, json.dumps([], ensure_ascii=False), search_in_title_only, max_age_minutes)
         )
         search_id = cursor.lastrowid
+        if initial_items is not None:
+            await db.executemany(
+                "INSERT OR IGNORE INTO seen_items (search_id, item_id, last_price) VALUES (?, ?, ?)",
+                [(search_id, str(item_id), price) for item_id, price in initial_items],
+            )
+            await db.execute("UPDATE searches SET initialized_at = datetime('now') WHERE id = ?", (search_id,))
+        else:
+            await db.execute("UPDATE searches SET initialized_at = NULL WHERE id = ?", (search_id,))
         await db.commit()
         return search_id
+
+
+async def initialize_search_snapshot(search_id: int, items) -> bool:
+    """An empty baseline is valid; capture it atomically and never overwrite it."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT initialized_at FROM searches WHERE id = ?", (search_id,)) as cursor:
+            row = await cursor.fetchone()
+        if row is None or row[0] is not None:
+            return False
+        await db.executemany(
+            "INSERT OR IGNORE INTO seen_items (search_id, item_id, last_price) VALUES (?, ?, ?)",
+            [(search_id, str(item_id), price) for item_id, price in items],
+        )
+        await db.execute("UPDATE searches SET initialized_at = datetime('now') WHERE id = ?", (search_id,))
+        await db.commit()
+        return True
 
 
 async def update_search_max_age(search_id: int, user_id: int, max_age_minutes: int) -> bool:
@@ -1015,6 +1045,18 @@ async def enqueue_notification(search_id: int, user_id: int, item_id: str, event
         """, (search_id, user_id, str(item_id), event_key, json.dumps(payload, ensure_ascii=False)))
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def get_outbox_metrics() -> dict:
+    """Low-frequency backlog measurements, without loading notification payloads."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT COUNT(*), COALESCE(SUM(lease_token IS NOT NULL), 0),
+                   COALESCE(MAX(CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER)), 0)
+            FROM notification_outbox
+        """) as cursor:
+            pending, leased, oldest = await cursor.fetchone()
+    return {"pending": pending, "leased": leased, "oldest_seconds": max(0, oldest)}
 
 
 async def get_pending_new_item_ids(search_id: int, item_ids: Optional[Any] = None) -> set[str]:

@@ -44,7 +44,8 @@ def main() -> int:
         stack.enter_context(patch("urllib.request.urlopen", side_effect=deny_network))
         stack.enter_context(patch.object(socket.socket, "connect", local_connect))
         stack.enter_context(patch.object(socket.socket, "connect_ex", local_connect_ex))
-        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_*.py")
+        suite = (unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:]) if len(sys.argv) > 1
+                 else unittest.defaultTestLoader.discover(str(ROOT / "tests")))
         result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 

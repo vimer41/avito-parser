@@ -241,7 +241,7 @@ class TestChallengeManager(unittest.TestCase):
 class TestParserProtection(unittest.IsolatedAsyncioTestCase):
     def make_parser(self, session, block_state=None, save=False):
         with patch.object(AvitoParser, "_create_session", return_value=session), patch.object(AvitoParser, "_load_cookies"):
-            result = AvitoParser(block_state=block_state or NetworkBlockState())
+            result = AvitoParser(block_state=block_state or NetworkBlockState(requests_per_second=1000))
         if not save:
             result._save_cookies = Mock()
         self.addCleanup(result.close)

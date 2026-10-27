@@ -13,6 +13,7 @@ import config
 import database
 from config import MAX_SEARCHES_PER_USER, ADMIN_IDS
 from parser import AvitoParser
+from source_cache import SOURCE_SNAPSHOTS
 from logger_setup import log_user_event
 
 logger = logging.getLogger(__name__)
@@ -173,21 +174,13 @@ async def process_avito_url(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-    html_content = None
-    for attempt in range(1, 4):
-        parser = AvitoParser(proxy=config.PROXY_URL)
-        try:
-            html_content = await parser.fetch_page_async(normalized_url)
-            if html_content:
-                break
-        except Exception as e:
-            logger.warning("Ошибка калибровки (попытка %d/3): %s", attempt, e)
-        finally:
-            parser.close()
-        if attempt < 3:
-            await asyncio.sleep(1.2)
+    try:
+        snapshot = await SOURCE_SNAPSHOTS.load(normalized_url)
+    except Exception as e:
+        logger.warning("Ошибка калибровки: %s", e)
+        snapshot = None
 
-    if not html_content:
+    if snapshot is None:
         log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Калибровка радара", f"Ошибка: Авито не вернул HTML («{normalized_url[:80]}»)", status="ERROR")
         await status_msg.edit_text(
             "❌ <b>Не удалось подключиться к странице Авито.</b>\n\n"
@@ -196,24 +189,23 @@ async def process_avito_url(message: Message, state: FSMContext):
         )
         return
 
-    search_title = AvitoParser.extract_search_title(html_content, normalized_url)
-    items = AvitoParser.parse_items(html_content)
+    search_title = snapshot.title
+    items = list(snapshot.items)
 
     # Определяем область выборки: если в ссылке есть bt=1 — поиск строго по названиям
     is_title_only = 1 if "bt=1" in normalized_url else 0
 
     # Сохраняем в БД
     try:
-        search_id = await database.add_search(user_id, search_title, normalized_url, search_in_title_only=is_title_only)
+        search_id = await database.add_search(
+            user_id, search_title, normalized_url, search_in_title_only=is_title_only,
+            initial_items=[(item.item_id, item.raw_price) for item in items],
+        )
     except (database.RadarLimitError, PermissionError) as exc:
         await status_msg.edit_text(f"⚠️ {html.escape(str(exc))}", parse_mode="HTML")
         await state.clear()
         return
-
-    # Запоминаем текущие объявления, чтобы не спамить старыми
-    item_ids = [(it.item_id, it.raw_price or 0) for it in items]
-    if item_ids:
-        await database.mark_items_seen_bulk(search_id, item_ids)
+    # Baseline and radar creation are one transaction: monitoring cannot race it.
 
     log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Радар создан", f"Радар #{search_id} «{search_title}» (лотов: {len(items)})", status="OK")
     logger.info(f"🎯 [РАДАР] Пользователь ID:{user_id} создал радар #{search_id}: «{search_title}» ({len(items)} базовых лотов проиндексировано)")
@@ -231,8 +223,8 @@ async def process_avito_url(message: Message, state: FSMContext):
         f"├ 🔍 <b>Область выборки:</b> <b>{scope_icon}</b>\n"
         f"├ 📦 <b>Существующих объявлений:</b> <b>{len(items)}</b> (пропущены)\n"
         f"├ 📡 <b>Статус:</b> 🟢 Мониторинг 24/7 активен\n"
-        f"└ ⚡️ <b>Базовый интервал:</b> {config.CHECK_INTERVAL} сек. (с учётом тарифа и блокировок Авито)\n\n"
-        "<i>Как только появится свежий лот — бот пришлёт фото в HD, цену, контакты и готовый отклик продавцу!</i>"
+        f"└ ⚡️ <b>Целевой базовый интервал:</b> {config.CHECK_INTERVAL} сек. (зависит от тарифа, нагрузки и доступности Авито)\n\n"
+        "<i>При обнаружении свежего лота бот отправит цену, ссылку и готовый отклик. Фото добавляется, если уже доступно в Telegram-кэше, без задержки на скачивание.</i>"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
