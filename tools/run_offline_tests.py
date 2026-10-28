@@ -39,6 +39,8 @@ def main() -> int:
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(curl_requests.Session, "request", side_effect=deny_network))
+        if hasattr(curl_requests, "AsyncSession"):
+            stack.enter_context(patch.object(curl_requests.AsyncSession, "request", side_effect=deny_network))
         stack.enter_context(patch.object(requests.Session, "request", side_effect=deny_network))
         stack.enter_context(patch.object(aiohttp.ClientSession, "_request", side_effect=deny_network))
         stack.enter_context(patch("urllib.request.urlopen", side_effect=deny_network))

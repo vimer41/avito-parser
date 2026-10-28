@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +9,8 @@ from tests._dispatcher import DispatcherFixture
 
 import config
 import database
+import scheduler
+from parser import AvitoItem
 
 
 class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
@@ -27,63 +30,154 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.db_patch.stop()
         self.directory.cleanup()
 
-    async def test_single_radar_shortcut_preserves_immutable_callback(self):
-        call = await self.dispatch_callback("all_discounts_menu")
-        self.assertEqual(call.data, "all_discounts_menu")
-        self.assertIn(f"save_discount:{self.radar_id}:10", self.callback_values())
-        self.assertIn("ОТСЛЕЖИВАНИЕ СНИЖЕНИЯ ЦЕНЫ", self.methods("EditMessageText")[-1].text)
-        await self.dispatch_callback(f"save_discount:{self.radar_id}:10")
-        self.assertEqual((await database.get_search(self.radar_id))["min_discount_percent"], 10)
+    async def test_price_drop_controls_removed_from_tariffs_and_radar_cards(self):
+        await self.dispatch_message(text="/tariffs", user_id=self.user_id)
+        tariff_text = self.methods("SendMessage")[-1].text
+        self.assertNotIn("Price Drop", tariff_text)
+        self.assertIn("0.0", tariff_text)
 
-    async def test_multi_radar_selection_and_individual_card(self):
-        second = await database.add_search(self.user_id, "Second", "https://www.avito.ru/second")
-        await self.dispatch_callback("all_discounts_menu")
-        self.assertIn(f"set_discount:{self.radar_id}", self.callback_values())
-        self.assertIn(f"set_discount:{second}", self.callback_values())
-        await self.dispatch_callback(f"set_discount:{second}")
-        self.assertIn(f"custom_discount:{second}", self.callback_values())
+        await self.dispatch_callback(f"view_search:{self.radar_id}", self.user_id)
+        callbacks = self.callback_values()
+        self.assertFalse(any(cb.startswith(("set_discount:", "save_discount:", "custom_discount:")) for cb in callbacks))
+        self.assertNotIn("all_discounts_menu", callbacks)
 
-    async def test_foreign_radar_cannot_be_viewed_saved_or_used_in_fsm(self):
+    async def test_event_stop_word_single_and_multi_radar_selection(self):
+        second = await database.add_search(self.user_id, "Second radar", "https://www.avito.ru/search")
+        item = AvitoItem(
+            "777",
+            "MacBook Pro",
+            "100 000 ₽",
+            "https://www.avito.ru/mac_777",
+            seller_name="AppleStore",
+            raw_price=100000,
+            timestamp=int(time.time()),
+            t_pub_reliable=True,
+        )
+        # Single radar event
+        await database.enqueue_group_events(
+            [
+                {
+                    "user_id": self.user_id,
+                    "radar_id": self.radar_id,
+                    "radar_title": "Fixture radar",
+                    "item_id": "777",
+                    "raw_price": 100000,
+                    "tariff": "pro",
+                    "priority": 10,
+                    "delay_seconds": 0.0,
+                    "t_seen": time.time(),
+                    "t_pub": item.timestamp,
+                    "t_pub_reliable": True,
+                    "is_catchup": False,
+                    "payload_dict": {
+                        "user_id": self.user_id,
+                        "radar_id": self.radar_id,
+                        "search_title": "Fixture radar",
+                        "item": item.__dict__,
+                    },
+                }
+            ],
+            [],
+        )
+        row = await database.claim_notification_event()
+        event_id = row["id"]
+
+        # Single active radar -> opens FSM directly
+        await self.dispatch_callback(f"event_stop:{event_id}", self.user_id)
+        state = self.dp.fsm.get_context(bot=self.bot, chat_id=self.user_id, user_id=self.user_id)
+        self.assertIsNotNone(await state.get_state())
+        await state.clear()
+
+        # Aggregate second radar onto another item event -> shows inline selection
+        await database.enqueue_group_events(
+            [
+                {
+                    "user_id": self.user_id,
+                    "radar_id": self.radar_id,
+                    "radar_title": "Fixture radar",
+                    "item_id": "888",
+                    "raw_price": 100000,
+                    "tariff": "pro",
+                    "priority": 10,
+                    "delay_seconds": 0.0,
+                    "t_seen": time.time(),
+                    "t_pub": item.timestamp,
+                    "t_pub_reliable": True,
+                    "is_catchup": False,
+                    "payload_dict": {
+                        "user_id": self.user_id,
+                        "radar_id": self.radar_id,
+                        "search_title": "Fixture radar",
+                        "item": {**item.__dict__, "item_id": "888"},
+                    },
+                },
+                {
+                    "user_id": self.user_id,
+                    "radar_id": second,
+                    "radar_title": "Second radar",
+                    "item_id": "888",
+                    "raw_price": 100000,
+                    "tariff": "pro",
+                    "priority": 10,
+                    "delay_seconds": 0.0,
+                    "t_seen": time.time(),
+                    "t_pub": item.timestamp,
+                    "t_pub_reliable": True,
+                    "is_catchup": False,
+                    "payload_dict": {
+                        "user_id": self.user_id,
+                        "radar_id": second,
+                        "search_title": "Second radar",
+                        "item": {**item.__dict__, "item_id": "888"},
+                    },
+                },
+            ],
+            [],
+        )
+        row2 = await database.claim_notification_event()
+        event2_id = row2["id"]
+        await self.dispatch_callback(f"event_stop:{event2_id}", self.user_id)
+        self.assertIn(f"add_stop:{self.radar_id}", self.callback_values())
+        self.assertIn(f"add_stop:{second}", self.callback_values())
+
+        # Ban seller by event_id
+        await self.dispatch_callback(f"ban_seller:{event2_id}", self.user_id)
+        blocked = await database.get_blocked_sellers(self.user_id)
+        self.assertIn("applestore", blocked)
+
+        # Missing/cleaned event_id returns friendly alert
+        await self.dispatch_callback("event_stop:999999", self.user_id)
+        self.assertIn("Уведомление устарело", self.methods("AnswerCallbackQuery")[-1].text)
+
+    async def test_foreign_user_cannot_use_event_stop_or_ban_seller(self):
         foreign_user = 654321
         await database.get_or_create_user(foreign_user)
         await database.grant_subscription(foreign_user, 30, "pro")
-        for value in (f"set_discount:{self.radar_id}", f"save_discount:{self.radar_id}:30", f"custom_discount:{self.radar_id}"):
-            self.session.calls.clear()
-            await self.dispatch_callback(value, foreign_user)
-            self.assertEqual(self.methods("EditMessageText"), [])
-            self.assertTrue(self.methods("AnswerCallbackQuery")[-1].show_alert)
-        state = self.dp.fsm.get_context(bot=self.bot, chat_id=foreign_user, user_id=foreign_user)
-        self.assertIsNone(await state.get_state())
-        self.assertEqual((await database.get_search(self.radar_id))["min_discount_percent"], 0)
+        item = AvitoItem("999", "Phone", "10 000 ₽", "https://www.avito.ru/p_999", seller_name="Shop")
+        await scheduler.enqueue_notification_task(
+            scheduler.NotificationTask(self.user_id, self.radar_id, "Fixture radar", item, freshness_verified=True)
+        )
+        row = await database.claim_notification_event()
+        event_id = row["id"]
 
-    async def test_standart_cannot_use_discount_shortcut_or_forged_save(self):
-        await database.grant_subscription(self.user_id, 1, "standart")
-        for value in ("all_discounts_menu", f"set_discount:{self.radar_id}", f"save_discount:{self.radar_id}:20", f"custom_discount:{self.radar_id}"):
-            await self.dispatch_callback(value)
-            self.assertIn("PRO", self.methods("AnswerCallbackQuery")[-1].text)
-        self.assertEqual(self.methods("EditMessageText"), [])
-        self.assertEqual((await database.get_search(self.radar_id))["min_discount_percent"], 0)
+        await self.dispatch_callback(f"event_stop:{event_id}", foreign_user)
+        self.assertTrue(self.methods("AnswerCallbackQuery")[-1].show_alert)
+        await self.dispatch_callback(f"ban_seller:{event_id}", foreign_user)
+        self.assertEqual(await database.get_blocked_sellers(self.user_id), set())
 
-    async def test_revoked_pro_access_cannot_change_discounts(self):
-        await database.set_user_allowed(self.user_id, 0)
-        for value in ("all_discounts_menu", f"set_discount:{self.radar_id}", f"save_discount:{self.radar_id}:20"):
-            await self.dispatch_callback(value)
-            self.assertTrue(self.methods("AnswerCallbackQuery")[-1].show_alert)
-        self.assertEqual(self.methods("EditMessageText"), [])
-        self.assertEqual((await database.get_search(self.radar_id))["min_discount_percent"], 0)
+    async def test_admin_stats_and_reload_proxies_commands(self):
+        # Non-admin denied
+        await self.dispatch_message(text="/stats", user_id=self.user_id)
+        self.assertIn("прав", self.methods("SendMessage")[-1].text)
 
-    async def test_custom_discount_rechecks_tariff_after_prompt(self):
-        await self.dispatch_callback(f"custom_discount:{self.radar_id}")
-        await database.grant_subscription(self.user_id, 1, "standart")
-        await self.dispatch_message(text="17")
-        self.assertEqual((await database.get_search(self.radar_id))["min_discount_percent"], 0)
-        self.assertIn("PRO", self.methods("SendMessage")[-1].text)
+        # Admin gets stats report
+        await self.dispatch_message(text="/stats", user_id=config.ADMIN_ID)
+        stats_text = self.methods("SendMessage")[-1].text
+        self.assertIn("СТАТИСТИКА МОНИТОРИНГА", stats_text)
 
-    async def test_invalid_discount_buttons_do_not_crash_or_write(self):
-        for value in ("set_discount:fake", "save_discount:1", f"save_discount:{self.radar_id}:100", "custom_discount:fake"):
-            await self.dispatch_callback(value)
-            self.assertTrue(self.methods("AnswerCallbackQuery")[-1].show_alert)
-        self.assertEqual((await database.get_search(self.radar_id))["min_discount_percent"], 0)
+        await self.dispatch_message(text="/reload_proxies", user_id=config.ADMIN_ID)
+        reload_text = self.methods("SendMessage")[-1].text
+        self.assertIn("Пул прокси", reload_text)
 
     async def test_admin_list_exposes_tariff_duration_confirmation_and_replay_safety(self):
         await self.dispatch_message(text="/admin", user_id=config.ADMIN_ID)
@@ -120,9 +214,14 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_non_admin_cannot_use_any_subscription_or_refund_controls(self):
         before = await database.get_user(self.user_id)
-        for value in (f"admin_user:{self.user_id}:0", f"admin_sub_menu:{self.user_id}:0",
-                      f"admin_grant_sub:{self.user_id}:pro:30:0", f"admin_revoke:{self.user_id}:0",
-                      f"admin_payments:{self.user_id}", "admin_refund:1"):
+        for value in (
+            f"admin_user:{self.user_id}:0",
+            f"admin_sub_menu:{self.user_id}:0",
+            f"admin_grant_sub:{self.user_id}:pro:30:0",
+            f"admin_revoke:{self.user_id}:0",
+            f"admin_payments:{self.user_id}",
+            "admin_refund:1",
+        ):
             await self.dispatch_callback(value)
             self.assertIn("прав", self.methods("AnswerCallbackQuery")[-1].text)
         self.assertEqual(await database.get_user(self.user_id), before)
@@ -149,23 +248,19 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn("реального запроса Telegram", self.methods("SendMessage")[-1].text)
 
     async def test_admin_search_user_by_id_and_username(self):
-        # 1. Поиск по ID через команду /find
         await self.dispatch_message(text=f"/find {self.user_id}", user_id=config.ADMIN_ID)
         self.assertIn("КАРТОЧКА ПОЛЬЗОВАТЕЛЯ", self.methods("SendMessage")[-1].text)
         self.assertIn(str(self.user_id), self.methods("SendMessage")[-1].text)
 
-        # 2. Поиск по @username через интерактивную кнопку
         await self.dispatch_callback("admin_search_user_prompt", config.ADMIN_ID)
         self.assertIn("ПОИСК ПОЛЬЗОВАТЕЛЯ", self.methods("EditMessageText")[-1].text)
         await self.dispatch_message(text="@fixture_user", user_id=config.ADMIN_ID)
         self.assertIn("КАРТОЧКА ПОЛЬЗОВАТЕЛЯ", self.methods("SendMessage")[-1].text)
 
-        # 3. Поиск несуществующего пользователя
         await self.dispatch_message(text="/find non_existent_user_99999", user_id=config.ADMIN_ID)
         self.assertIn("не найден", self.methods("SendMessage")[-1].text)
 
     async def test_admin_grant_vip_and_reset_trial_notifications(self):
-        # 1. Выдача бессрочного VIP
         await self.dispatch_callback(f"admin_grant_vip_prompt:{self.user_id}:pro:0", config.ADMIN_ID)
         self.assertIn(f"admin_confirm_vip:{self.user_id}:pro:0", self.callback_values())
         await self.dispatch_callback(f"admin_confirm_vip:{self.user_id}:pro:0", config.ADMIN_ID)
@@ -176,7 +271,6 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         notices = [m for m in self.methods("SendMessage") if m.chat_id == self.user_id]
         self.assertTrue(any("VIP-доступ" in m.text for m in notices))
 
-        # 2. Активация 6-часового триала
         await self.dispatch_callback(f"admin_reset_trial_prompt:{self.user_id}:0", config.ADMIN_ID)
         self.assertIn(f"admin_confirm_trial:{self.user_id}:0", self.callback_values())
         await self.dispatch_callback(f"admin_confirm_trial:{self.user_id}:0", config.ADMIN_ID)
@@ -190,3 +284,7 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         text = self.methods("EditMessageText")[-1].text
         self.assertIn("РАДАРЫ ПОЛЬЗОВАТЕЛЯ", text)
         self.assertIn("Fixture radar", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

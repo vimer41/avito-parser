@@ -42,7 +42,7 @@ AGREEMENT_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     "<b>1. Общие положения</b>\n"
     "1.1. Настоящее Соглашение регулирует порядок использования сервиса Avito Radar (Telegram-бот).\n"
-    "1.2. Сервис оказывает нематериальную цифровую услугу — автоматизированный программный мониторинг и оповещение о появлении публично доступных объявлений на платформе avito.ru по критериям пользователя.\n"
+    "1.2. Сервис оказывает нематериальную цифровая услугу — автоматизированный программный мониторинг и оповещение о появлении публично доступных объявлений на платформе avito.ru по критериям пользователя.\n"
     "1.3. Сервис не является представителем или аффилированным лицом Avito, не выступает стороной сделок купли-продажи и не несёт ответственности за действия продавцов.\n\n"
     "<b>2. Тарифные планы и расчёты</b>\n"
     "2.1. Доступ к функционалу сервиса предоставляется на условиях цифровой подписки на 30 дней без автоматического продления (без автосписаний).\n"
@@ -209,24 +209,24 @@ async def cmd_help(event):
         "• Задайте поисковый запрос и выставьте нужные фильтры (город, цену, состояние лота).\n"
         "• Скопируйте ссылку из адресной строки и отправьте её боту в чат.\n"
         "• Сортировку по дате бот применяет автоматически.\n\n"
-        "<b>2. Отслеживание снижения цен (Price Drop)</b>\n"
-        "• Доступно на тарифе PRO.\n"
-        "• Бот фиксирует первоначальную цену каждого лота. Если продавец снизит цену на указанный процент, бот пришлёт повторное оповещение с расчётом разницы.\n\n"
+        "<b>2. Мгновенная доставка и догон после паузы (PRO)</b>\n"
+        "• Все радары опрашиваются с единым целевым интервалом 15–20 секунд.\n"
+        "• На тарифе PRO уведомления отправляются мгновенно (0.0 с задержки) с наивысшим приоритетом.\n"
+        "• После технических пауз пользователи PRO получают до 10 самых свежих объявлений моложе 30 минут с пометкой «🕒 найдено после паузы».\n\n"
         "<b>3. Фильтрация и защита от спама</b>\n"
         "• <b>Стоп-слова:</b> отсекают объявления с указанными словами (например, «запчасти», «реплика»).\n"
         "• <b>Чёрный список:</b> блокировка продавцов и спам-магазинов в 1 клик под карточкой лота.\n"
         "• <b>Область поиска:</b> переключение поиска строго в заголовках или в заголовке и описании.\n\n"
         "<b>4. Тарифные планы</b>\n"
-        "• Всем новым пользователям доступен ознакомительный период (5 часов, 1 радар).\n"
-        f"• <b>Standart ({config.STARS_PRICE_STANDART} ⭐ / 30 дней):</b> до 4 радаров, фото, фильтрация стоп-слов, чёрный список.\n"
-        f"• <b>PRO ({config.STARS_PRICE_PRO} ⭐ / 30 дней):</b> до 9 радаров, приоритетная очередь, алерты на скидки.\n\n"
+        "• Всем новым пользователям доступен ознакомительный период (6 часов, 1 радар).\n"
+        f"• <b>Standart ({config.STARS_PRICE_STANDART} ⭐ / 30 дней):</b> до 4 радаров, фото лотов, фильтрация стоп-слов, чёрный список.\n"
+        f"• <b>PRO ({config.STARS_PRICE_PRO} ⭐ / 30 дней):</b> до 9 радаров, мгновенная доставка (0.0 с), догон свежих лотов после паузы.\n\n"
         "Официальные регламенты и правила: /docs, /agreement, /privacy. Поддержка: /paysupport."
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="💳 Тарифы и подписка", callback_data="open_subscription_menu"),
-            InlineKeyboardButton(text="Настройка скидок (PRO)", callback_data="all_discounts_menu")
+            InlineKeyboardButton(text="💳 Тарифы и подписка", callback_data="open_subscription_menu")
         ],
         [
             InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
@@ -263,7 +263,6 @@ async def cmd_profile(event):
     searches_count = len(searches)
     active_count = sum(1 for s in searches if s.get("is_active"))
 
-    current_tmpl = user.get("default_template") or database.DEFAULT_SELLER_MESSAGE
     is_adm = config.is_admin(user_id)
     sub_until = user.get("subscription_until")
     trial_used = bool(user.get("trial_used"))
@@ -311,10 +310,6 @@ async def cmd_profile(event):
     else:
         sub_btn_text = "💳 Выбрать тариф"
     buttons.append([InlineKeyboardButton(text=sub_btn_text, callback_data="open_subscription_menu")])
-
-    buttons.append([
-        InlineKeyboardButton(text="Настройка скидок (PRO)", callback_data="all_discounts_menu")
-    ])
 
     buttons.append([
         InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
@@ -393,7 +388,7 @@ async def cmd_subscription_menu(event):
         f"• <b>Standart:</b> {config.STARS_PRICE_STANDART} ⭐ / 30 дней\n"
         "  До 4 радаров, фото лотов, фильтрация стоп-слов, чёрный список продавцов.\n\n"
         f"• <b>PRO:</b> {config.STARS_PRICE_PRO} ⭐ / 30 дней\n"
-        "  До 9 радаров, мониторинг снижения цен (Price Drop), приоритетная очередь, поиск в заголовках.\n\n"
+        "  До 9 радаров, мгновенная доставка (0.0 с), догон свежих лотов после паузы (до 30 мин), приоритетная очередь, поиск в заголовках.\n\n"
         "Оплата производится через Telegram Stars. Разовая подписка на 30 дней без автоматических списаний.\n\n"
         f"{'Приём платежей включён.' if config.STARS_PAYMENTS_ENABLED else 'Приём платежей временно выключен.'}\n\n"
         "<i>Выберите интересующий тариф для просмотра параметров:</i>"
@@ -448,7 +443,7 @@ async def cb_select_tariff(call: CallbackQuery):
             "perks": (
                 "• Тестовый доступ на 1 день для проверки сервиса\n"
                 "• До 4 активных радаров одновременно\n"
-                "• Быстрые оповещения с ценой и ссылкой"
+                "• Опрос каждые 15–20 сек., оповещения с ценой и ссылкой"
             )
         },
         "standart": {
@@ -458,8 +453,8 @@ async def cb_select_tariff(call: CallbackQuery):
             "price_num": f"{config.STARS_PRICE_STANDART} ⭐",
             "perks": (
                 "• До 4 активных радаров одновременно\n"
-                f"• Целевой базовый интервал: {config.CHECK_INTERVAL} сек.\n"
-                "• Быстрые оповещения с ценой и ссылкой\n"
+                f"• Целевой интервал опроса: {int(config.SCAN_INTERVAL_MIN)}–{int(config.SCAN_INTERVAL_MAX)} сек.\n"
+                "• Оповещения с фото, ценой и ссылкой\n"
                 "• Фильтрация по стоп-словам\n"
                 "• Чёрный список продавцов"
             )
@@ -471,10 +466,10 @@ async def cb_select_tariff(call: CallbackQuery):
             "price_num": f"{config.STARS_PRICE_PRO} ⭐",
             "perks": (
                 "• До 9 активных радаров одновременно\n"
-                "• Отслеживание снижения цен (Price Drop)\n"
+                "• Мгновенная доставка уведомлений без задержки (0.0 с)\n"
+                "• Авто-догон до 10 свежих лотов (моложе 30 мин) после паузы\n"
                 "• Точный поиск строго в названиях\n"
-                "• Быстрые оповещения с ценой и ссылкой\n"
-                "• Фильтрация по стоп-словам и чёрный список"
+                "• Оповещения с фото, фильтрация стоп-слов и чёрный список"
             )
         }
     }
@@ -685,7 +680,6 @@ async def cb_manage_blacklist(call: CallbackQuery):
     await call.answer()
 
 
-
 @router.callback_query(F.data.startswith("unban_seller:"))
 async def cb_unban_seller(call: CallbackQuery):
     block_id = int(call.data.split(":")[1])
@@ -696,21 +690,37 @@ async def cb_unban_seller(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("ban_seller:"))
 async def cb_ban_seller(call: CallbackQuery):
-    msg_text = call.message.caption or call.message.text or ""
+    user_id = call.from_user.id
+    parts = call.data.split(":", 1)
+    raw_id = parts[1].strip() if len(parts) > 1 else ""
+
     seller_name = None
+    if raw_id.isdigit() and int(raw_id) > 0:
+        event_id = int(raw_id)
+        event = await database.get_event_for_callback(event_id)
+        if event is None or not event.get("active_radars"):
+            await call.answer("Уведомление устарело, откройте радар в меню", show_alert=True)
+            return
+        if int(event["user_id"]) != int(user_id):
+            await call.answer("Уведомление устарело, откройте радар в меню", show_alert=True)
+            return
+        item_obj = event.get("item") or {}
+        if isinstance(item_obj.get("item"), dict):
+            item_obj = item_obj["item"]
+        seller_name = (item_obj.get("seller_name") or "").strip()
 
-    m = re.search(r"👤\s*<b>Продавец:</b>\s*([^·\n<]+)", msg_text)
-    if not m:
-        m = re.search(r"👤\s*Продавец:\s*([^·\n]+)", msg_text)
-
-    if m:
-        seller_name = m.group(1).strip()
+    if not seller_name and call.message:
+        msg_text = call.message.caption or call.message.text or ""
+        m = re.search(r"👤\s*<b>Продавец:</b>\s*([^·\n<]+)", msg_text)
+        if not m:
+            m = re.search(r"👤\s*Продавец:\s*([^·\n]+)", msg_text)
+        if m:
+            seller_name = m.group(1).strip()
 
     if not seller_name or seller_name.lower() in {"продавец", "компания", "частное лицо"}:
         await call.answer("Не удалось определить имя продавца для блокировки", show_alert=True)
         return
 
-    user_id = call.from_user.id
     await database.add_blocked_seller(user_id, seller_name)
     log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Блокировка продавца", f"Продавец «{seller_name}» добавлен в ЧС", status="OK")
     logger.info(f"🚷 [ЧЕРНЫЙ СПИСОК] Пользователь ID:{user_id} заблокировал продавца «{seller_name}»")

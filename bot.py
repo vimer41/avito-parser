@@ -12,10 +12,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
 import database
-from logging.handlers import RotatingFileHandler
 from handlers import main_router
 from middlewares import AccessControlMiddleware, ActionLoggingMiddleware
-from scheduler import monitoring_worker, start_background_services, close_image_session
+from proxy_pool import close_proxy_pool, get_proxy_pool
+from scheduler import start_background_services, close_image_session
 
 # Принудительная поддержка UTF-8 в консоли Windows (для эмодзи)
 if sys.platform == "win32":
@@ -29,9 +29,6 @@ if sys.platform == "win32":
 from logger_setup import setup_logging
 setup_logging()
 logger = logging.getLogger("bot")
-
-
-
 
 
 async def start_health_server():
@@ -68,16 +65,16 @@ async def setup_bot_profile(bot: Bot):
     bot_description = (
         "🔥 AVITO RADAR — перехватывай лучшие предложения с выгодой!\n\n"
         "📌 Мониторинг Авито 24/7!\n"
-        "Оповещения о новых лотах после проверки Авито.\n\n"
+        "Оповещения о новых лотах сразу после публикации на Авито.\n\n"
         "🎯 Что умеет бот?\n"
         "✔️ Доставка новинок с реальными живыми HD фото\n"
-        "✔️ 📉 Price Drop 💎: авто-алерт при снижении цен продавцом\n"
+        "✔️ ⚡️ Мгновенная доставка PRO без задержки (0.0 с) и авто-догон после паузы\n"
         "✔️ Умный фильтр стоп-слов и чёрный список спамеров\n"
         "✔️ Точный поиск только в названиях или по всему тексту\n\n"
         "🎁 Бонус! Нажмите «Старт» и получите 6 часов бесплатного тест-драйва прямо сейчас!"
     )
 
-    bot_short_description = "⚡️ Мониторинг новых объявлений и скидок на Авито 24/7. Фото, стоп-слова и алерты на снижение цен."
+    bot_short_description = "⚡️ Мониторинг новых объявлений на Авито 24/7. Живые фото, стоп-слова и мгновенные PRO-уведомления."
 
     try:
         await bot.set_my_description(description=bot_description, language_code="ru")
@@ -105,6 +102,10 @@ async def main():
         )
         return
 
+    config.check_deprecated_env_vars()
+    config.validate_runtime_config()
+    get_proxy_pool()
+
     # Запуск легковесного сервера для Render Web Service (если передан PORT)
     web_runner = await start_health_server()
     bot = None
@@ -127,9 +128,16 @@ async def main():
         # A deploy must not discard unread Telegram updates.
         await bot.delete_webhook(drop_pending_updates=False)
         await setup_bot_profile(bot)
-        logger.info("Stars checkout: enabled=%s standart=%s pro=%s days=%s",
-                    config.STARS_PAYMENTS_ENABLED, config.STARS_PRICE_STANDART,
-                    config.STARS_PRICE_PRO, config.STARS_SUBSCRIPTION_DAYS)
+        recovery = await database.recover_outbox_on_startup()
+        if any(recovery.values()):
+            logger.info("Восстановление очереди уведомлений при старте: %s", recovery)
+        logger.info(
+            "Stars checkout: enabled=%s standart=%s pro=%s days=%s",
+            config.STARS_PAYMENTS_ENABLED,
+            config.STARS_PRICE_STANDART,
+            config.STARS_PRICE_PRO,
+            config.STARS_SUBSCRIPTION_DAYS,
+        )
         background_tasks = start_background_services(bot)
         logger.info("Бот успешно запущен и готов к работе!")
         await dp.start_polling(bot)
@@ -139,6 +147,8 @@ async def main():
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
         await close_image_session()
+        await close_proxy_pool()
+        await database.close_db()
         if bot is not None:
             await bot.session.close()
         if web_runner:

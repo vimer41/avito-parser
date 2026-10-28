@@ -2,6 +2,7 @@
 
 import atexit
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -14,11 +15,27 @@ NATIVE_THREAD_LIMITS = {
 }
 os.environ.update(NATIVE_THREAD_LIMITS)
 
+_ORIG_TEMPDIR_CLEANUP = tempfile.TemporaryDirectory.cleanup
+
+
+def _safe_tempdir_cleanup(self) -> None:
+    db_mod = sys.modules.get("database")
+    if db_mod is not None and hasattr(db_mod, "close_db_sync"):
+        try:
+            db_mod.close_db_sync(self.name)
+        except Exception:
+            pass
+    _ORIG_TEMPDIR_CLEANUP(self)
+
+
+tempfile.TemporaryDirectory.cleanup = _safe_tempdir_cleanup
+
 TEST_ROOT = tempfile.TemporaryDirectory(prefix="avito-radar-tests-")
 atexit.register(TEST_ROOT.cleanup)
 root = Path(TEST_ROOT.name)
 os.environ.update({
     "AVITO_RADAR_TESTING": "1",
+    "ALLOW_DIRECT_AVITO": "1",
     "BOT_TOKEN": "1234567890:TEST_TOKEN_FOR_CI_CD_MOCK",
     "ADMIN_ID": "986832959",
     "ADMIN_IDS": "986832959,455386428",

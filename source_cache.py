@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import config
 from collector import collect_source
 from parser import AvitoParser, AvitoItem
+from proxy_pool import get_proxy_pool
 
 
 @dataclass
@@ -18,7 +19,11 @@ class SourceSnapshot:
 
 
 class SourceSnapshotCache:
-    def __init__(self, maxsize: int = 500, ttl: float = config.INITIAL_SNAPSHOT_TTL):
+    def __init__(
+        self,
+        maxsize: int = config.SOURCE_SNAPSHOT_CACHE_SIZE,
+        ttl: float = config.SOURCE_SNAPSHOT_TTL,
+    ):
         self.maxsize, self.ttl = maxsize, ttl
         self._data = OrderedDict()
         self._pending: dict[str, asyncio.Task] = {}
@@ -59,6 +64,25 @@ class SourceSnapshotCache:
             task.exception()  # Retrieve exceptions even when all UI callers cancelled.
 
     async def _fetch(self, key: str):
+        pool = get_proxy_pool()
+        excluded: set[str] = set()
+        for _ in range(max(1, int(config.SCAN_PROXY_ATTEMPTS))):
+            client = await pool.acquire_client(exclude_ids=excluded, timeout=2.0)
+            if client is None:
+                break
+            excluded.add(client.proxy_id)
+            parser = AvitoParser(proxy_client=client)
+            try:
+                result = await collect_source(parser, key, max_age_minutes=30)
+                if result is not None:
+                    snapshot = SourceSnapshot(result.title, result.items, result.captured_at)
+                    self.put(key, snapshot)
+                    return snapshot
+            finally:
+                parser.close()
+                await pool.release_client(client)
+
+        # Fallback for direct/legacy mode when pool has no clients
         parser = None
         try:
             parser = AvitoParser(proxy=config.PROXY_URL)

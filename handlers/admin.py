@@ -1081,3 +1081,65 @@ async def do_admin_user_search(message: Message, query: str, state: FSMContext):
 
 
 
+
+
+@router.message(Command("stats"))
+@router.callback_query(F.data == "admin_runtime_stats")
+async def cmd_admin_stats(event):
+    if isinstance(event, CallbackQuery):
+        message = event.message
+        user_id = event.from_user.id
+        if not config.is_admin(user_id):
+            await event.answer("У вас нет прав администратора", show_alert=True)
+            return
+        await event.answer()
+    else:
+        message = event
+        user_id = message.from_user.id
+        if not config.is_admin(user_id):
+            await message.answer("⛔ У вас нет прав администратора.")
+            return
+
+    from runtime_metrics import METRICS
+    try:
+        ob = await database.get_outbox_metrics()
+        METRICS.update_outbox_state(
+            pending_depth=ob.get("pending", 0),
+            leased_depth=ob.get("leased", 0),
+            oldest_pending_age_seconds=ob.get("oldest_seconds", 0),
+        )
+    except Exception:
+        pass
+
+    chunks = METRICS.format_stats_messages()
+    for chunk in chunks:
+        await message.answer(chunk, parse_mode="HTML")
+
+
+@router.message(Command("reload_proxies"))
+async def cmd_admin_reload_proxies(message: Message):
+    if not config.is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+
+    from proxy_pool import get_proxy_pool
+    from runtime_metrics import sanitize_proxy_credentials
+
+    try:
+        pool = get_proxy_pool()
+        res = await pool.reload_async()
+        await message.answer(
+            "✅ <b>Пул прокси успешно перезагружен:</b>\n"
+            f"• Активных прокси: <code>{res['total']}</code>\n"
+            f"• Добавлено: <code>{res['added']}</code>\n"
+            f"• Сохранено: <code>{res['kept']}</code>\n"
+            f"• Выведено в дренаж: <code>{res['removed']}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        safe_err = sanitize_proxy_credentials(str(exc))
+        await message.answer(
+            f"❌ <b>Ошибка перезагрузки пула прокси:</b> {html.escape(safe_err)}\n"
+            "Текущий активный пул оставлен без изменений.",
+            parse_mode="HTML",
+        )

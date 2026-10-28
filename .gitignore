@@ -11,6 +11,7 @@ __pycache__/
 *.db
 *.sqlite
 *.sqlite3
+*.bak
 data/
 
 # Logs
@@ -23,8 +24,10 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Cookies & Local Sessions
+# Cookies, Proxies & Local Sessions
 avito_cookies.json
+proxies.txt
+*.proxies
 *.session
 .releases/
 backups/

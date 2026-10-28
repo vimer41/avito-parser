@@ -19,11 +19,19 @@ from logger_setup import log_user_event
 logger = logging.getLogger(__name__)
 router = Router()
 
+# Множество нормализованных URL, где радар был только что снят с паузы (для однократного обхода fast-skip)
+RESUMED_SOURCE_URLS: set[str] = set()
+
+
+def pop_resumed_source_urls() -> set[str]:
+    res = set(RESUMED_SOURCE_URLS)
+    RESUMED_SOURCE_URLS.clear()
+    return res
+
 
 class SearchStates(StatesGroup):
     waiting_for_url = State()
     waiting_for_stop_word = State()
-    waiting_for_custom_discount = State()
     waiting_for_custom_age = State()
 
 
@@ -77,9 +85,12 @@ async def cb_cancel_fsm(call: CallbackQuery, state: FSMContext):
             InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
         ]
     ])
-    await call.message.edit_text("❌ <b>Действие отменено.</b>", reply_markup=kb, parse_mode="HTML")
+    if call.message:
+        try:
+            await call.message.edit_text("❌ <b>Действие отменено.</b>", reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await call.message.answer("❌ <b>Действие отменено.</b>", reply_markup=kb, parse_mode="HTML")
     await call.answer()
-
 
 
 @router.message(F.text.regexp(r"(?i)avito\.ru"))
@@ -117,7 +128,6 @@ async def process_avito_url(message: Message, state: FSMContext):
             return await cmd_docs_hub(message)
         return
 
-    # Проверяем, что ссылка действительно с avito.ru
     if "avito.ru" not in raw_url.lower():
         log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка: ссылка не с avito.ru («{raw_url[:80]}»)", status="WARN")
         await message.answer(
@@ -133,7 +143,6 @@ async def process_avito_url(message: Message, state: FSMContext):
         )
         return
 
-    # Проверяем, не на одно ли объявление ссылка
     if "/item/" in raw_url or re.search(r"_\d{8,}", raw_url):
         log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", "Ошибка: ссылка на объявление (/item/), а не на поиск", status="WARN")
         await message.answer(
@@ -143,7 +152,6 @@ async def process_avito_url(message: Message, state: FSMContext):
         )
         return
 
-    # Проверяем лимит поисков по тарифу
     current_count = await database.count_user_searches(user_id)
     max_radars = await database.get_user_max_radars(user_id)
     if current_count >= max_radars:
@@ -160,14 +168,12 @@ async def process_avito_url(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    # Нормализуем ссылку
     try:
         normalized_url = AvitoParser.normalize_url(raw_url)
     except Exception as e:
         log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка синтаксиса ссылки: {e}", status="WARN")
         await message.answer(f"❌ Ошибка в ссылке: {e}\nУбедитесь, что ссылка ведёт на avito.ru.")
         return
-
 
     status_msg = await message.answer(
         "⏳ <b>Подключаюсь к Авито и калибрую радар...</b>",
@@ -191,11 +197,8 @@ async def process_avito_url(message: Message, state: FSMContext):
 
     search_title = snapshot.title
     items = list(snapshot.items)
-
-    # Определяем область выборки: если в ссылке есть bt=1 — поиск строго по названиям
     is_title_only = 1 if "bt=1" in normalized_url else 0
 
-    # Сохраняем в БД
     try:
         search_id = await database.add_search(
             user_id, search_title, normalized_url, search_in_title_only=is_title_only,
@@ -205,13 +208,11 @@ async def process_avito_url(message: Message, state: FSMContext):
         await status_msg.edit_text(f"⚠️ {html.escape(str(exc))}", parse_mode="HTML")
         await state.clear()
         return
-    # Baseline and radar creation are one transaction: monitoring cannot race it.
 
     log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Радар создан", f"Радар #{search_id} «{search_title}» (лотов: {len(items)})", status="OK")
     logger.info(f"🎯 [РАДАР] Пользователь ID:{user_id} создал радар #{search_id}: «{search_title}» ({len(items)} базовых лотов проиндексировано)")
 
     await state.clear()
-
 
     clean_title = html.escape(search_title)
     scope_icon = "🏷 Только в названиях" if is_title_only else "📄 Название + описание"
@@ -223,8 +224,8 @@ async def process_avito_url(message: Message, state: FSMContext):
         f"├ 🔍 <b>Область выборки:</b> <b>{scope_icon}</b>\n"
         f"├ 📦 <b>Существующих объявлений:</b> <b>{len(items)}</b> (пропущены)\n"
         f"├ 📡 <b>Статус:</b> 🟢 Мониторинг 24/7 активен\n"
-        f"└ ⚡️ <b>Целевой базовый интервал:</b> {config.CHECK_INTERVAL} сек. (зависит от тарифа, нагрузки и доступности Авито)\n\n"
-        "<i>При обнаружении свежего лота бот отправит цену, ссылку и готовый отклик. Фото добавляется, если уже доступно в Telegram-кэше, без задержки на скачивание.</i>"
+        f"└ ⚡️ <b>Целевой интервал опроса:</b> {int(config.SCAN_INTERVAL_MIN)}–{int(config.SCAN_INTERVAL_MAX)} сек.\n\n"
+        "<i>При обнаружении свежего лота бот отправит уведомление с ценой, ссылкой и фото (для тарифов Standart и PRO).</i>"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -233,7 +234,6 @@ async def process_avito_url(message: Message, state: FSMContext):
             InlineKeyboardButton(text=scope_btn, callback_data=f"toggle_title_scope:{search_id}")
         ],
         [
-            InlineKeyboardButton(text="📉 Алерт на скидки 💎", callback_data=f"set_discount:{search_id}"),
             InlineKeyboardButton(text="🚫 Стоп-слова", callback_data=f"manage_stops:{search_id}")
         ],
         [
@@ -248,7 +248,6 @@ async def process_avito_url(message: Message, state: FSMContext):
 # ── Список радаров и компактное меню ────────────────────────────────────
 
 def format_max_age_label(max_age_minutes: Optional[int]) -> str:
-    """Форматирует человекочитаемое представление фильтра свежести (от 1 до 30 минут)."""
     if not max_age_minutes or max_age_minutes <= 0:
         max_age_minutes = 5
     elif max_age_minutes > 30:
@@ -257,19 +256,11 @@ def format_max_age_label(max_age_minutes: Optional[int]) -> str:
 
 
 def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
-    """Формирует детальную карточку конкретного радара и клавиатуру управления."""
     search_id = s["id"]
     title = html.escape(s["title"])
     is_active = bool(s["is_active"])
     status_icon = "🟢 <b>Активен (24/7)</b>" if is_active else "⏸ <b>На паузе</b>"
     stops_count = len(s["stop_words"])
-    disc_val = s.get("min_discount_percent") or 0
-    if disc_val > 0:
-        disc_info = f"<b>от -{disc_val}%</b> 🟢"
-        disc_btn_label = f"📉 Алерт на скидки: от -{disc_val}% 💎 ⚙️"
-    else:
-        disc_info = "<code>Выключено</code> ⚪️"
-        disc_btn_label = "📉 Отслеживать скидки продавцов 💎"
 
     title_only = bool(s.get("search_in_title_only", 0))
     if title_only:
@@ -292,7 +283,6 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         f"📡 <b>Статус:</b> {status_icon}\n"
         f"⏱ <b>Свежесть лотов:</b> <b>{age_label}</b>\n"
         f"🔍 <b>Область выборки:</b> {scope_info}\n"
-        f"📉 <b>Скидки продавцов:</b> {disc_info}\n"
         f"🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>\n"
         f"🔗 <b>Ссылка:</b> <a href=\"{s['url']}\">Открыть выдачу на Авито</a>\n"
         f"━━━━━━━━━━━━━━━━━━━━"
@@ -305,9 +295,6 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         ],
         [
             InlineKeyboardButton(text=scope_btn_label, callback_data=f"toggle_title_scope:{search_id}")
-        ],
-        [
-            InlineKeyboardButton(text=disc_btn_label, callback_data=f"set_discount:{search_id}")
         ],
         [
             InlineKeyboardButton(text=toggle_btn_text, callback_data=f"toggle_search:{search_id}"),
@@ -344,7 +331,7 @@ async def show_searches(event, state: Optional[FSMContext] = None):
         text = (
             "📁 <b>У вас пока нет активных радаров</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "Вы можете отслеживать до <b>10 разных категорий</b> одновременно.\n\n"
+            "Вы можете отслеживать несколько категорий одновременно.\n\n"
             "Нажмите кнопку ниже или просто отправьте ссылку на поиск с Авито в этот чат!"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -356,7 +343,6 @@ async def show_searches(event, state: Optional[FSMContext] = None):
         else:
             await message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
-
 
     from scheduler import get_last_scan_info
     scan_info = get_last_scan_info()
@@ -372,12 +358,10 @@ async def show_searches(event, state: Optional[FSMContext] = None):
         title = html.escape(s["title"])
         is_active = bool(s["is_active"])
         status_dot = "🟢" if is_active else "⏸"
-        disc_val = s.get("min_discount_percent") or 0
-        disc_str = f" 🏷 <i>(-{disc_val}%)</i>" if disc_val > 0 else ""
         stops_cnt = len(s["stop_words"])
         stops_str = f" · 🛡 {stops_cnt}" if stops_cnt > 0 else ""
         pause_str = " <i>(пауза)</i>" if not is_active else ""
-        lines.append(f"<b>{i}.</b> {status_dot} <b>{title}</b>{pause_str}{disc_str}{stops_str}")
+        lines.append(f"<b>{i}.</b> {status_dot} <b>{title}</b>{pause_str}{stops_str}")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("<i>Выберите радар для перехода к настройкам:</i>")
@@ -398,9 +382,6 @@ async def show_searches(event, state: Optional[FSMContext] = None):
         buttons.append(row)
 
     buttons.append([
-        InlineKeyboardButton(text="📉 Настройка скидок (PRO) 💎", callback_data="all_discounts_menu")
-    ])
-    buttons.append([
         InlineKeyboardButton(text="➕ Добавить радар", callback_data="add_search_prompt"),
         InlineKeyboardButton(text="🔄 Обновить", callback_data="list_searches")
     ])
@@ -420,8 +401,11 @@ async def show_searches(event, state: Optional[FSMContext] = None):
 
 @router.callback_query(F.data.startswith("open_search:"))
 async def cb_open_search(call: CallbackQuery):
-    """Открывает детальную карточку конкретного радара."""
-    search_id = int(call.data.split(":")[1])
+    try:
+        search_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная кнопка радара", show_alert=True)
+        return
     s = await database.get_search(search_id)
     if not s or s.get("user_id") != call.from_user.id:
         await call.answer("Радар не найден", show_alert=True)
@@ -454,6 +438,12 @@ async def cb_toggle_search(call: CallbackQuery):
     s = await database.get_search(search_id)
     if not s:
         return
+
+    if new_status:
+        try:
+            RESUMED_SOURCE_URLS.add(AvitoParser.normalize_url(s["url"]))
+        except Exception:
+            pass
 
     card_text, kb = build_radar_card(s)
     try:
@@ -505,251 +495,6 @@ async def cb_toggle_title_scope(call: CallbackQuery):
         await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     except Exception:
         pass
-
-
-# ── Быстрый выбор радара для скидки (PRO) ──────────────────────────────
-
-@router.callback_query(F.data == "all_discounts_menu")
-async def cb_all_discounts_menu(call: CallbackQuery):
-    user_id = call.from_user.id
-    if not await database.is_user_allowed(user_id):
-        await call.answer("Доступ истёк. Продлите подписку в меню «Тарифы».", show_alert=True)
-        return
-    user = await database.get_or_create_user(user_id)
-    if not config.is_admin(user_id) and (user.get("tariff_plan") or "").lower() != "pro":
-        await call.answer(
-            "🔒 Отслеживание снижения цен доступно только на тарифе PRO!\n\n"
-            "Оформите подписку PRO в меню «Мой профиль», чтобы бот моментально ловил скидки перекупов.",
-            show_alert=True
-        )
-        return
-
-    searches = await database.get_user_searches(user_id)
-    if not searches:
-        await call.answer("У вас пока нет активных радаров!", show_alert=True)
-        return
-
-    if len(searches) == 1:
-        return await show_discount_menu(call, searches[0]["id"])
-
-    text = (
-        "📉 <b>НАСТРОЙКА АЛЕРТОВ НА СКИДКИ (PRO)</b> 💎\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Выберите радар, для которого хотите настроить порог скидки:\n\n"
-        "<i>(Как только продавец скинет цену на этот процент или более — "
-        "бот сразу пришлёт пуш с расчётом вашей выгоды!)</i>"
-    )
-
-    buttons = []
-    for i, s in enumerate(searches, 1):
-        s_id = s["id"]
-        raw_title = s["title"].strip()
-        short_title = (raw_title[:16] + "…") if len(raw_title) > 17 else raw_title
-        disc_val = s.get("min_discount_percent") or 0
-        disc_label = f"-{disc_val}% 🟢" if disc_val > 0 else "Выкл ⚪️"
-        btn_text = f"#{i}. {short_title} [{disc_label}]"
-        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"set_discount:{s_id}")])
-
-    buttons.append([
-        InlineKeyboardButton(text="« Назад ко всем радарам", callback_data="list_searches"),
-        InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
-    ])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
-
-
-# ── Настройка скидки для PRO (Price Drop Alert) ─────────────────────────
-
-@router.callback_query(F.data.startswith("set_discount:"))
-async def cb_set_discount_menu(call: CallbackQuery):
-    try:
-        search_id = int(call.data.split(":")[1])
-    except (ValueError, IndexError):
-        await call.answer("Некорректная кнопка радара", show_alert=True)
-        return
-    await show_discount_menu(call, search_id)
-
-
-async def get_discount_search(user_id: int, search_id: int):
-    if not await database.is_user_allowed(user_id):
-        return None, "Доступ истёк. Продлите подписку в меню «Тарифы»."
-    user = await database.get_or_create_user(user_id)
-    if not config.is_admin(user_id) and (user.get("tariff_plan") or "").lower() != "pro":
-        return None, "🔒 Отслеживание снижения цен доступно только на тарифе PRO!"
-    search = await database.get_search(search_id)
-    if not search or search.get("user_id") != user_id:
-        return None, "Радар не найден"
-    return search, None
-
-
-async def show_discount_menu(call: CallbackQuery, search_id: int):
-    """Shared view: CallbackQuery is immutable; the radar ID is an explicit argument."""
-    s, error = await get_discount_search(call.from_user.id, search_id)
-    if error:
-        await call.answer(error, show_alert=True)
-        return
-    if not call.message:
-        await call.answer("Радар не найден", show_alert=True)
-        return
-
-    cur_disc = s.get("min_discount_percent") or 0
-    cur_label = f"-{cur_disc}%" if cur_disc > 0 else "Выключено"
-
-    text = (
-        f"📉 <b>ОТСЛЕЖИВАНИЕ СНИЖЕНИЯ ЦЕНЫ</b> 💎\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Радар: <b>{html.escape(s['title'])}</b>\n"
-        f"Текущий порог: <b>{cur_label}</b>\n\n"
-        f"Выберите процент скидки для мгновенного уведомления или введите свой собственный:\n"
-        f"<i>(Как только продавец скинет цену на этот процент или более — бот сразу пришлёт пуш)</i>"
-    )
-
-    options = [
-        ("5%", 5), ("10%", 10), ("15%", 15),
-        ("20%", 20), ("30%", 30), ("50%", 50)
-    ]
-    buttons = []
-    row = []
-    for label, val in options:
-        btn_mark = " ✓" if cur_disc == val else ""
-        row.append(InlineKeyboardButton(text=f"{label}{btn_mark}", callback_data=f"save_discount:{search_id}:{val}"))
-        if len(row) == 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append([InlineKeyboardButton(text="✏️ Ввести свой процент...", callback_data=f"custom_discount:{search_id}")])
-    buttons.append([InlineKeyboardButton(text="❌ Отключить отслеживание", callback_data=f"save_discount:{search_id}:0")])
-    buttons.append([
-        InlineKeyboardButton(text="« Назад к радару", callback_data=f"open_search:{search_id}"),
-        InlineKeyboardButton(text="📁 Ко всем радарам", callback_data="list_searches")
-    ])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("save_discount:"))
-async def cb_save_discount(call: CallbackQuery):
-    try:
-        parts = call.data.split(":")
-        search_id, val = int(parts[1]), int(parts[2])
-    except (ValueError, IndexError):
-        await call.answer("Некорректные настройки скидки", show_alert=True)
-        return
-    user_id = call.from_user.id
-    s, error = await get_discount_search(user_id, search_id)
-    if error or not 0 <= val <= 99:
-        await call.answer(error or "Процент должен быть от 0 до 99", show_alert=True)
-        return
-
-    if not await database.update_search_discount_percent(search_id, user_id, val):
-        await call.answer("Радар не найден", show_alert=True)
-        return
-    status_text = f"скидки от -{val}%" if val > 0 else "отслеживание скидок отключено"
-    log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Настройка скидки", f"Радар #{search_id} -> {status_text}", status="OK")
-    await call.answer(f"✅ Сохранено: {status_text}!")
-    s = await database.get_search(search_id)
-    if s:
-        card_text, kb = build_radar_card(s)
-        try:
-            await call.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
-            return
-        except Exception:
-            pass
-    await show_searches(call)
-
-
-@router.callback_query(F.data.startswith("custom_discount:"))
-async def cb_prompt_custom_discount(call: CallbackQuery, state: FSMContext):
-    try:
-        search_id = int(call.data.split(":")[1])
-    except (ValueError, IndexError):
-        await call.answer("Некорректная кнопка радара", show_alert=True)
-        return
-    _, error = await get_discount_search(call.from_user.id, search_id)
-    if error:
-        await call.answer(error, show_alert=True)
-        return
-    await state.set_state(SearchStates.waiting_for_custom_discount)
-    await state.update_data(discount_search_id=search_id)
-
-    text = (
-        "✍️ <b>ВВЕДИТЕ ЖЕЛАЕМЫЙ ПРОЦЕНТ СКИДКИ</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Отправьте в чат число от <b>1</b> до <b>99</b> "
-        "(например: <code>7</code>, <code>12</code>, <code>25</code> или <code>40</code>).\n\n"
-        "<i>Бот пришлёт уведомление, как только продавец скинет цену на указанный процент!</i>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"open_search:{search_id}")]
-    ])
-    try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
-
-
-@router.message(SearchStates.waiting_for_custom_discount, F.text)
-async def process_custom_discount_input(message: Message, state: FSMContext):
-    raw_val = message.text.strip().replace("%", "")
-    menu_buttons = {
-        "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
-        "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
-        "⚡️ Быстрый отклик", "💬 Быстрый отклик", "⚙️ Шаблон по умолчанию",
-        "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
-        "📖 Инструкция", "❓ Помощь", "Инструкция",
-        "👑 Админ-панель", "👑 Админка",
-        "❌ Отмена", "Отмена"
-    }
-    if message.text.strip() in menu_buttons or message.text.strip().startswith("/"):
-        await state.clear()
-        if message.text.strip() in {"📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары"}:
-            return await show_searches(message, state)
-        return
-
-    if not raw_val.isdigit():
-        await message.answer(
-            "⚠️ <b>Пожалуйста, введите целое число от 1 до 99</b> (например: <code>7</code> или <code>15</code>):",
-            parse_mode="HTML"
-        )
-        return
-
-    percent = int(raw_val)
-    if percent < 1 or percent > 99:
-        await message.answer(
-            "⚠️ <b>Процент должен быть в диапазоне от 1% до 99%!</b> Попробуйте ещё раз:",
-            parse_mode="HTML"
-        )
-        return
-
-    data = await state.get_data()
-    search_id = data.get("discount_search_id")
-    await state.clear()
-
-    if search_id:
-        _, error = await get_discount_search(message.from_user.id, search_id)
-        if error:
-            await message.answer(error)
-            return
-        if not await database.update_search_discount_percent(search_id, message.from_user.id, percent):
-            await message.answer("Радар не найден")
-            return
-        log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Настройка скидки", f"Радар #{search_id} -> свой порог: {percent}%", status="OK")
-        await message.answer(f"✅ <b>Отлично! Алерт установлен на снижение цены от -{percent}%!</b>", parse_mode="HTML")
-
-    await show_searches(message, state)
 
 
 # ── Настройка свежести лотов (max_age_minutes) ──────────────────────────
@@ -899,7 +644,7 @@ async def process_custom_age_input(message: Message, state: FSMContext):
         return
 
     val = int(text)
-    if val < 1 or val > 30:  # максимум 30 минут
+    if val < 1 or val > 30:
         await message.answer(
             "⚠️ <b>Число минут должно быть от 1 до 30 (максимум 30 минут)!</b> Попробуйте ещё раз:",
             parse_mode="HTML"
@@ -931,7 +676,10 @@ async def process_custom_age_input(message: Message, state: FSMContext):
 async def cb_delete_search(call: CallbackQuery):
     search_id = int(call.data.split(":")[1])
     s = await database.get_search(search_id)
-    title = html.escape(s["title"]) if s else "радар"
+    if not s or s.get("user_id") != call.from_user.id:
+        await call.answer("Радар не найден", show_alert=True)
+        return
+    title = html.escape(s["title"])
 
     text = (
         f"⚠️ <b>Удаление радара «{title}»</b>\n\n"
@@ -961,7 +709,7 @@ async def cb_confirm_delete(call: CallbackQuery):
 async def cb_cancel_delete(call: CallbackQuery):
     search_id = int(call.data.split(":")[1])
     s = await database.get_search(search_id)
-    if not s:
+    if not s or s.get("user_id") != call.from_user.id:
         await show_searches(call)
         return
 
@@ -979,7 +727,7 @@ async def cb_cancel_delete(call: CallbackQuery):
 async def cb_manage_stops(call: CallbackQuery):
     search_id = int(call.data.split(":")[1])
     s = await database.get_search(search_id)
-    if not s:
+    if not s or s.get("user_id") != call.from_user.id:
         await call.answer("Радар не найден", show_alert=True)
         return
 
@@ -999,7 +747,6 @@ async def cb_manage_stops(call: CallbackQuery):
         lines.append("<i>Стоп-слова пока не заданы. Примеры: «на запчасти», «реплика», «дефект», «копия»</i>")
 
     buttons = []
-    # Кнопки быстрого удаления по 2 в ряд
     current_row = []
     for w in stop_words:
         btn = InlineKeyboardButton(text=f"❌ {w}", callback_data=f"rm_stop:{search_id}:{w}")
@@ -1020,34 +767,98 @@ async def cb_manage_stops(call: CallbackQuery):
     await call.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await call.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
-    await call.answer()
 
-
-@router.callback_query(F.data.startswith("add_stop:"))
-@router.callback_query(F.data.startswith("add_stop_from_item:"))
-async def cb_add_stop_word_prompt(call: CallbackQuery, state: FSMContext):
-    search_id = int(call.data.split(":")[1])
-    search = await database.get_search(search_id)
-    if not search or search["user_id"] != call.from_user.id:
-        await call.answer("Радар не найден", show_alert=True)
-        return
+async def _start_stop_word_fsm(call: CallbackQuery, state: FSMContext, search_id: int) -> None:
     await state.set_state(SearchStates.waiting_for_stop_word)
     await state.update_data(search_id=search_id)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")]
     ])
-    await call.message.answer(
-        "✍️ <b>Введите стоп-слово или фразу:</b>\n\n"
-        "<i>Например:\n"
-        "<code>на запчасти, копия, без комплекта</code>\n"
-        "(Можно прислать несколько слов через запятую)</i>",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
+    if call.message:
+        await call.message.answer(
+            "✍️ <b>Введите стоп-слово или фразу:</b>\n\n"
+            "<i>Например:\n"
+            "<code>на запчасти, копия, без комплекта</code>\n"
+            "(Можно прислать несколько слов через запятую)</i>",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("event_stop:"))
+async def cb_event_stop_word(call: CallbackQuery, state: FSMContext):
+    """
+    Обработчик кнопки «Стоп-слово» под агрегированным уведомлением (по event_id):
+    - 1 активный радар -> сразу открывает ввод стоп-слова
+    - >1 активных радаров -> показывает выбор радара (до 5 кнопок в ряд и Отмена)
+    - удалено / очищено -> отвечает 'Уведомление устарело, откройте радар в меню'
+    """
+    parts = call.data.split(":", 1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await call.answer("Уведомление устарело, откройте радар в меню", show_alert=True)
+        return
+    event_id = int(parts[1].strip())
+    event = await database.get_event_for_callback(event_id)
+    if event is None or int(event.get("user_id") or 0) != int(call.from_user.id):
+        await call.answer("Уведомление устарело, откройте радар в меню", show_alert=True)
+        return
+
+    active_radars = event.get("active_radars") or []
+    if not active_radars:
+        await call.answer("Уведомление устарело, откройте радар в меню", show_alert=True)
+        return
+
+    if len(active_radars) == 1:
+        await _start_stop_word_fsm(call, state, int(active_radars[0]["search_id"]))
+        return
+
+    # Несколько активных радаров — показываем inline-выбор (до 5 кнопок в ряд + Отмена)
+    lines = [
+        "🛡 <b>Выберите радар для добавления стоп-слова:</b>\n"
+    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for idx, r in enumerate(active_radars, start=1):
+        sid = int(r["search_id"])
+        rtitle = html.escape(str(r.get("radar_title") or f"Радар #{sid}"))
+        lines.append(f"<b>{idx}.</b> {rtitle}")
+        short_label = str(r.get("radar_title") or f"#{sid}").strip()
+        if len(short_label) > 16:
+            short_label = short_label[:15] + "…"
+        current_row.append(
+            InlineKeyboardButton(text=f"{idx}. {short_label}", callback_data=f"add_stop:{sid}")
+        )
+        if len(current_row) == 5:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")])
+
+    if call.message:
+        await call.message.answer(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("add_stop:"))
+@router.callback_query(F.data.startswith("add_stop_from_item:"))
+async def cb_add_stop_word_prompt(call: CallbackQuery, state: FSMContext):
+    try:
+        search_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Уведомление устарело, откройте радар в меню", show_alert=True)
+        return
+    search = await database.get_search(search_id)
+    if not search or search["user_id"] != call.from_user.id:
+        await call.answer("Радар не найден", show_alert=True)
+        return
+    await _start_stop_word_fsm(call, state, search_id)
 
 
 @router.message(SearchStates.waiting_for_stop_word, F.text)
@@ -1106,6 +917,3 @@ async def cb_remove_stop_word(call: CallbackQuery):
     logger.info(f"🛡 [СТОП-СЛОВА] Пользователь ID:{call.from_user.id} удалил «{word}» из радара #{search_id}")
     await call.answer(f"Слово «{word}» удалено")
     await cb_manage_stops(call)
-
-
-

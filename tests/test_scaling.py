@@ -410,3 +410,195 @@ class TestSharedCalibration(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestRuntimeMetricsAndCapacity(unittest.TestCase):
+    def test_percentiles_capacity_reserve_and_credential_sanitization(self):
+        import runtime_metrics
+
+        m = runtime_metrics.RuntimeMetricsRegistry()
+        # Cold-start capacity uses 1.3 req/scan and 0.8 reserve
+        cap = runtime_metrics.calculate_capacity_report(
+            unique_sources=300,
+            proxy_endpoints=[{"proxy_id": f"p{i}", "state": "healthy", "current_rps": 1.0} for i in range(2)],
+            rolling_mean_cost=None,
+            p95_cost=None,
+            completed_scans_count=0,
+        )
+        self.assertEqual(cap["capacity_mode"], "deficit")
+        self.assertEqual(cap["healthy_proxies"], 2)
+        self.assertTrue(cap["needs_more_proxies"])
+
+        # Record deliveries for pro, standart, base and check separate deliver_at -> t_sent vs t_queued -> t_sent
+        now = time.time()
+        m.record_delivery(
+            tariff="pro",
+            t_pub=now - 5.0,
+            t_pub_reliable=True,
+            t_seen=now - 1.2,
+            t_queued=now - 1.0,
+            deliver_at=now - 1.0,
+            t_sent=now,
+        )
+        m.record_delivery(
+            tariff="standart",
+            t_pub=None,
+            t_pub_reliable=False,
+            t_seen=now - 2.2,
+            t_queued=now - 2.0,
+            deliver_at=now - 1.0,
+            t_sent=now,
+        )
+        m.record_delivery(
+            tariff="base",
+            t_pub=None,
+            t_pub_reliable=False,
+            t_seen=now - 2.7,
+            t_queued=now - 2.5,
+            deliver_at=now - 1.0,
+            t_sent=now,
+        )
+        m.record_http_request("p0", "http://secret_user:top_secret_pass@10.20.30.40:8080", 200, 0.35)
+        snap = m.snapshot(
+            active_unique_urls=20,
+            proxy_snapshots=[
+                {
+                    "proxy_id": "p0",
+                    "masked_url": runtime_metrics.mask_proxy_url("http://secret_user:top_secret_pass@10.20.30.40:8080"),
+                    "state": "healthy",
+                    "current_rps": 1.0,
+                }
+            ],
+        )
+        by_t = snap["by_tariff"]
+        self.assertLessEqual(by_t["pro"]["deliver_at_to_sent_seconds"]["p95"], 2.0)
+        self.assertAlmostEqual(by_t["standart"]["queued_to_sent_seconds"]["p95"], 2.0, delta=0.5)
+        self.assertAlmostEqual(by_t["base"]["queued_to_sent_seconds"]["p95"], 2.5, delta=0.5)
+
+        report = m.format_stats_report()
+        self.assertIn("СТАТИСТИКА МОНИТОРИНГА AVITO RADAR", report)
+        self.assertNotIn("top_secret_pass", report)
+        self.assertNotIn("secret_user", report)
+
+
+class TestProxyPoolLifecycle(unittest.IsolatedAsyncioTestCase):
+    async def test_proxy_validation_quarantine_half_open_and_hot_reload(self):
+        import tempfile
+        from pathlib import Path
+        import runtime_metrics
+        from proxy_pool import ProxyPool, parse_and_validate_proxy_line
+
+        # Percent-encoded special chars in user/pass are valid; unencoded '@' or invalid schemes never leak credentials
+        parsed_url = parse_and_validate_proxy_line("http://user%40name:p%3Aa%40ss@192.0.2.10:8080", 1)
+        self.assertIn("192.0.2.10:8080", parsed_url)
+        self.assertEqual(runtime_metrics.mask_proxy_url(parsed_url), "http://***@192.0.2.10:8080")
+
+        with self.assertRaises(ValueError) as ctx1:
+            parse_and_validate_proxy_line("http://user@name:secret_pass@192.0.2.10:8080", 1)
+        self.assertNotIn("secret_pass", str(ctx1.exception))
+
+        with self.assertRaises(ValueError) as ctx2:
+            parse_and_validate_proxy_line("ftp://secret_login:secret_pass@192.0.2.10:8080", 2)
+        self.assertNotIn("secret_pass", str(ctx2.exception))
+
+        with tempfile.TemporaryDirectory(prefix="avito-proxies-") as tmp:
+            pfile = Path(tmp) / "proxies.txt"
+            pfile.write_text(
+                "# Primary proxies\nhttp://u1:p1@192.0.2.1:8001\nhttp://u2:p2@192.0.2.2:8002\n",
+                encoding="utf-8",
+            )
+            pool = ProxyPool(proxy_pool_file=pfile, fallback_proxy_url="", allow_direct=False)
+            self.assertEqual(len(pool.clients), 2)
+            self.assertEqual(pool.healthy_count(), 2)
+
+            # Quarantine first proxy via 3 transport errors, and also test block rate reduction
+            c1 = pool.clients[0]
+            for _ in range(3):
+                c1.record_transport_error()
+            self.assertEqual(c1.state, "quarantined")
+            self.assertEqual(pool.healthy_count(), 1)
+            c1.record_final_block("test_403")
+
+            # Half-open recovery after quarantine expires
+            c1.quarantined_until = time.monotonic() - 0.01
+            lease = pool.acquire_client(exclude_ids={pool.clients[1].proxy_id})
+            self.assertIsNotNone(lease)
+            self.assertIs(lease.client, c1)
+            self.assertEqual(c1.state, "half_open")
+            # Second concurrent acquire while half-open probe is in flight is rejected
+            self.assertIsNone(pool.acquire_client(exclude_ids={pool.clients[1].proxy_id}))
+            c1.record_success()
+            lease.release()
+            self.assertEqual(c1.state, "healthy")
+
+            # 50 consecutive successes restore effective_rate by *1.25 up to configured_rate
+            start_rps = c1.effective_rate
+            for _ in range(50):
+                c1.record_raw_http_response(200, 0.2)
+            self.assertGreater(c1.effective_rate, start_rps)
+
+            # Hot reload adds a 3rd proxy and removes the 2nd without dropping c1
+            pfile.write_text(
+                "http://u1:p1@192.0.2.1:8001\nhttp://u3:p3@192.0.2.3:8003\n",
+                encoding="utf-8",
+            )
+            reload_info = await pool.reload_async(proxy_pool_file=pfile, fallback_proxy_url="", allow_direct=False)
+            self.assertEqual(reload_info["total"], 2)
+            self.assertEqual(reload_info["added"], 1)
+            self.assertEqual(reload_info["removed"], 1)
+            await pool.close()
+
+
+class TestFastSkipCatchupAndHysteresis(unittest.IsolatedAsyncioTestCase):
+    async def test_fast_skip_skips_page_2_when_top_3_match(self):
+        cards1 = [
+            {"id": "10", "title": "Item 10", "sortTimeStamp": int(time.time() * 1000)},
+            {"id": "20", "title": "Item 20", "sortTimeStamp": int(time.time() * 1000)},
+            {"id": "30", "title": "Item 30", "sortTimeStamp": int(time.time() * 1000)},
+        ]
+        page1 = (
+            '<html><script>'
+            + json.dumps({"loaderData": {"data": {"catalog": {"items": cards1}}}})
+            + '</script><a rel="next" href="?s=104&amp;p=2">Next</a></html>'
+        )
+        parser = Mock(spec=AvitoParser)
+        parser.fetch_page_async = AsyncMock(side_effect=[page1, "<html>should not fetch</html>"])
+        parser.parse_items = AvitoParser.parse_items
+        parser.has_catalog = AvitoParser.has_catalog
+        parser.next_page_url = AvitoParser.next_page_url
+
+        collection = await collect_source(
+            parser,
+            "https://www.avito.ru/search?s=104",
+            can_fast_skip=True,
+            last_top_ids=("10", "20", "30"),
+        )
+        self.assertIsNotNone(collection)
+        self.assertTrue(collection.fast_skipped)
+        self.assertEqual(collection.pages, 1)
+        self.assertEqual(parser.fetch_page_async.await_count, 1)
+
+    def test_two_proxy_attempts_and_three_success_hysteresis(self):
+        planner = DeadlineScheduler(use_source_backoff=True)
+        planner.sync({"u": [{"id": 1}]}, None, 0.0)
+        task = planner.take_due(0.0)
+
+        # Single proxy failure (exhausted_proxies=False) does NOT increment source_failure_streak
+        planner.complete(task, 1.0, False, exhausted_proxies=False)
+        self.assertEqual(planner.sources["u"].source_failure_streak, 0)
+
+        # Both proxy attempts failed (exhausted_proxies=True) -> source_failure_streak = 2 -> 60s backoff
+        t2 = planner.take_due(10.0)
+        planner.complete(t2, 11.0, False, exhausted_proxies=True)
+        t3 = planner.take_due(50.0)
+        planner.complete(t3, 51.0, False, exhausted_proxies=True)
+        self.assertEqual(planner.sources["u"].source_failure_streak, 2)
+        self.assertGreaterEqual(planner.sources["u"].due_at - 51.0, 59.0)
+
+        # Requires 3 consecutive successes to step down source_failure_streak by 1
+        for step in range(3):
+            due = planner.sources["u"].due_at
+            tk = planner.take_due(due + 0.1)
+            planner.complete(tk, due + 0.2, True)
+        self.assertEqual(planner.sources["u"].source_failure_streak, 1)
