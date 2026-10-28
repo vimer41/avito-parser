@@ -875,37 +875,21 @@ async def process_collected_group_fanout(
             and (now_epoch - previous_processed_at) > (max_age_min * 60)
         )
         radar_created_epoch = parse_created_epoch(radar)
+        if is_resumed_radar:
+            effective_age_min = 10
+        elif is_downtime_catchup:
+            effective_age_min = config.CATCHUP_MAX_AGE_MINUTES
+        else:
+            effective_age_min = max_age_min
 
         ages = {}
         normal_fresh_flags = {}
         for item in new_items:
             disc_at = collection.discovery_times.get(item.item_id, now_epoch)
-            pub_age = publication_age_seconds(item.date, item.timestamp, now=disc_at)
-
-            if is_resumed_radar:
-                # Радар только что снят с паузы: догоняем и отправляем лоты за последние 10 минут!
-                is_fresh = (pub_age is not None and pub_age <= 10 * 60)
-            elif is_downtime_catchup:
-                is_fresh = (pub_age is not None and pub_age <= config.CATCHUP_MAX_AGE_MINUTES * 60)
-            elif radar_created_epoch is not None:
-                # Обычный скан (включая только что созданный радар):
-                # Если лот был опубликован ДО создания радара, мы его НЕ шлём (только для снятых с паузы)
-                if pub_age is not None:
-                    item_pub_epoch = disc_at - pub_age
-                    if item_pub_epoch < (radar_created_epoch - 30):
-                        is_fresh = False  # Существовал до создания радара
-                    else:
-                        is_fresh = (pub_age <= 30 * 60)
-                else:
-                    if (now_epoch - radar_created_epoch) < 120:
-                        is_fresh = False  # Первые 2 минуты без точной даты — считаем фоновыми
-                    else:
-                        is_fresh = None
-            else:
-                is_fresh = freshness_status(item.date, item.timestamp, 30, now=disc_at)
-
-            ages[item.item_id] = is_fresh
-            normal_fresh_flags[item.item_id] = is_fresh is True
+            ages[item.item_id] = freshness_status(item.date, item.timestamp, effective_age_min, now=disc_at)
+            normal_fresh_flags[item.item_id] = (
+                freshness_status(item.date, item.timestamp, max_age_min, now=disc_at) is True
+            )
 
         unknown_ids = {item_id for item_id, status in ages.items() if status is None}
         fresh_items = [item for item in new_items if ages[item.item_id] is True]
