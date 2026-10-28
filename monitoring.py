@@ -497,7 +497,11 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             if now - last_report >= float(config.METRICS_REPORT_INTERVAL):
                 outbox_metrics = await database.get_outbox_metrics()
                 MONITORING_STATS["outbox"] = outbox_metrics
-                is_direct_run = pool.is_direct_only or (len(pool.clients) == 1 and pool.clients[0].is_direct)
+                is_direct_run = getattr(pool, "is_direct_only", False) or (
+                    bool(getattr(pool, "clients", []))
+                    and len(pool.clients) == 1
+                    and pool.clients[0].is_direct
+                )
                 if is_direct_run:
                     from scan_planner import get_capacity_mode_intervals
                     planner.capacity_mode = "normal"

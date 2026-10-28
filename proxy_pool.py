@@ -676,6 +676,11 @@ class ProxyPool:
         with self._lock:
             return list(self._clients.values())
 
+    @property
+    def is_direct_only(self) -> bool:
+        clients = self.clients
+        return bool(clients) and all(c.is_direct for c in clients)
+
     def healthy_count(self) -> int:
         now = self._monotonic()
         return sum(1 for c in self.clients if c.is_available_for_scan(now))
