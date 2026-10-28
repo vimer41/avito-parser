@@ -104,7 +104,6 @@ async def main():
 
     config.check_deprecated_env_vars()
     config.validate_runtime_config()
-    get_proxy_pool()
 
     # Запуск легковесного сервера для Render Web Service (если передан PORT)
     web_runner = await start_health_server()
@@ -113,6 +112,8 @@ async def main():
 
     try:
         await database.init_db()
+        pool = get_proxy_pool()
+        await pool.reload_async(allow_direct=config.ALLOW_DIRECT_AVITO)
         bot = Bot(
             token=config.BOT_TOKEN,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),

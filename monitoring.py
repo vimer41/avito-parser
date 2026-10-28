@@ -156,7 +156,13 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
     async def worker(worker_id: int, worker_parser: AvitoParser):
         nonlocal consecutive_failures, alert_sent
         while True:
+            is_mock_parser = type(worker_parser).__name__ != "AvitoParser"
+            is_patched_process = getattr(scheduler.process_url_group, "__name__", "") != "process_url_group" or is_mock_parser
+
             if not pool.clients:
+                if not is_patched_process:
+                    await asyncio.sleep(1.0)
+                    continue
                 cooldown = budget.cooldown_remaining()
                 if cooldown > 0:
                     await asyncio.sleep(min(cooldown, 1.0))
@@ -185,11 +191,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 revisit_seconds = max(0.0, now_mono - state_before.last_success)
             due_lag_seconds = max(0.0, now_mono - task.scheduled_at)
 
-            # Compatibility path if a test monkey-patched scheduler.process_url_group or injected a custom Mock parser
-            is_mock_parser = type(worker_parser).__name__ != "AvitoParser"
-            is_patched_process = getattr(scheduler.process_url_group, "__name__", "") != "process_url_group" or is_mock_parser
-
-            if is_patched_process or not pool.clients:
+            if is_patched_process:
                 ok = False
                 scan_t0 = time.monotonic()
                 try:
@@ -387,6 +389,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
     async def dispatch():
         nonlocal request_cost
         startup = True
+        no_proxy_notified = False
         last_report = last_cleanup = last_terminal_cleanup = time.monotonic()
         previous_requests = budget.snapshot()["requests"]
         previous_scans = 0
@@ -398,6 +401,32 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             groups = group_sources(searches)
             network = budget.snapshot()
             proxy_snaps = pool.snapshots()
+            if proxy_snaps:
+                no_proxy_notified = False
+            elif not no_proxy_notified and parser is None and getattr(scheduler.process_url_group, "__name__", "") == "process_url_group":
+                no_proxy_notified = True
+                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="🟢 Включить прямой парсинг (без прокси)",
+                        callback_data="admin_toggle_direct_avito:alert",
+                    )],
+                    [InlineKeyboardButton(
+                        text="👑 Открыть админ-панель",
+                        callback_data="admin_refresh",
+                    )],
+                ])
+                msg_text = (
+                    "⚠️ <b>Прокси не настроены — мониторинг Авито на паузе</b>\n\n"
+                    "Для защиты IP сервера сканирование без прокси по умолчанию выключено.\n"
+                    "Вы можете <b>включить прямой парсинг (1.0 req/s с IP сервера)</b> прямо кнопкой ниже, "
+                    "в 👑 Админ-панели или командой <code>/direct_mode</code>."
+                )
+                for admin_id in config.ADMIN_IDS:
+                    try:
+                        await bot.send_message(chat_id=admin_id, text=msg_text, reply_markup=kb, parse_mode="HTML")
+                    except Exception:
+                        pass
             healthy_proxies = sum(1 for p in proxy_snaps if p.get("state") in ("healthy", "degraded", "half_open"))
             effective_rps = (
                 sum(float(p.get("current_rps") or 0.0) for p in proxy_snaps if p.get("state") in ("healthy", "degraded", "half_open"))

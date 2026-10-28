@@ -549,6 +549,16 @@ async def cmd_admin_panel(event, page: int = 0):
     end_idx = start_idx + USERS_PER_PAGE
     page_users = all_users[start_idx:end_idx]
 
+    from proxy_pool import get_proxy_pool
+    pool = get_proxy_pool()
+    real_proxies = [c for c in pool.clients if c.proxy_url is not None]
+    if real_proxies:
+        net_mode_str = f"🟢 <b>Пул прокси ({len(real_proxies)} шт.)</b>"
+    elif config.ALLOW_DIRECT_AVITO:
+        net_mode_str = "🟡 <b>Прямой без прокси (IP сервера, 1.0 req/s)</b>"
+    else:
+        net_mode_str = "⏸ <b>На паузе (прокси нет, прямой режим ВЫКЛ)</b>"
+
     page_info = f" (Стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
     text_lines = [
         "👑 <b>ПАНЕЛЬ УПРАВЛЕНИЯ СИСТЕМОЙ</b>\n"
@@ -557,6 +567,7 @@ async def cmd_admin_panel(event, page: int = 0):
         f"• 👥 Пользователей: <b>{stats['total_users']}</b> (🟢 {stats['allowed_users']} с доступом)\n"
         f"• 🎯 Всего радаров: <b>{stats['total_searches']}</b> (🟢 {stats['active_searches']} активно)\n"
         f"• 📦 Обработано лотов: <b>{stats['total_seen']}</b>\n"
+        f"• 🌐 Режим сети: {net_mode_str}\n"
         f"• 🛡 Защита: <b>TLS Chameleon / PoW Bypass</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>Пользователи и права доступа{page_info}:</b>\n"
@@ -632,6 +643,15 @@ async def cmd_admin_panel(event, page: int = 0):
     ])
     buttons.append([
         InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"admin_page:{page}")
+    ])
+    direct_btn_label = (
+        "🌐 Прямой парсинг (без прокси): ВКЛ 🟢"
+        if config.ALLOW_DIRECT_AVITO
+        else "🌐 Прямой парсинг (без прокси): ВЫКЛ 🔴"
+    )
+    buttons.append([
+        InlineKeyboardButton(text=direct_btn_label, callback_data=f"admin_toggle_direct_avito:panel:{page}"),
+        InlineKeyboardButton(text="📊 Статистика (/stats)", callback_data="admin_runtime_stats"),
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1100,20 +1120,131 @@ async def cmd_admin_stats(event):
             await message.answer("⛔ У вас нет прав администратора.")
             return
 
+    from proxy_pool import get_proxy_pool
     from runtime_metrics import METRICS
     try:
+        pool = get_proxy_pool()
         ob = await database.get_outbox_metrics()
         METRICS.update_outbox_state(
             pending_depth=ob.get("pending", 0),
             leased_depth=ob.get("leased", 0),
             oldest_pending_age_seconds=ob.get("oldest_seconds", 0),
         )
+        METRICS.snapshot(proxy_snapshots=pool.snapshots())
     except Exception:
         pass
 
+    direct_btn_label = (
+        "🌐 Прямой парсинг (без прокси): ВКЛ 🟢"
+        if config.ALLOW_DIRECT_AVITO
+        else "🌐 Прямой парсинг (без прокси): ВЫКЛ 🔴"
+    )
+    stats_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=direct_btn_label, callback_data="admin_toggle_direct_avito:stats")],
+        [
+            InlineKeyboardButton(text="🔄 Обновить /stats", callback_data="admin_runtime_stats"),
+            InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_refresh"),
+        ],
+    ])
+
     chunks = METRICS.format_stats_messages()
-    for chunk in chunks:
-        await message.answer(chunk, parse_mode="HTML")
+    for idx, chunk in enumerate(chunks):
+        is_last = idx == len(chunks) - 1
+        await message.answer(chunk, reply_markup=stats_kb if is_last else None, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("admin_toggle_direct_avito"))
+async def cb_admin_toggle_direct_avito(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+
+    from proxy_pool import get_proxy_pool
+    new_state = not bool(config.ALLOW_DIRECT_AVITO)
+    await database.set_bot_setting("allow_direct_avito", "1" if new_state else "0")
+    pool = get_proxy_pool()
+    res = await pool.set_direct_mode_async(new_state)
+
+    status_toast = (
+        f"✅ Прямой парсинг без прокси ВКЛЮЧЕН (активных каналов: {res['total']})"
+        if new_state
+        else f"🛑 Прямой парсинг без прокси ВЫКЛЮЧЕН (активных каналов: {res['total']})"
+    )
+    await call.answer(status_toast, show_alert=True)
+
+    parts = (call.data or "").split(":")
+    source = parts[1] if len(parts) > 1 else "panel"
+    if source == "panel":
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        await cmd_admin_panel(call, page=page)
+    elif source == "stats":
+        await cmd_admin_stats(call)
+    else:
+        state_badge = "🟢 <b>ВКЛЮЧЕН</b> (1.0 req/s с IP сервера)" if new_state else "🔴 <b>ВЫКЛЮЧЕН</b> (на паузе без прокси)"
+        toggle_label = (
+            "🌐 Прямой парсинг (без прокси): ВКЛ 🟢"
+            if new_state
+            else "🌐 Прямой парсинг (без прокси): ВЫКЛ 🔴"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=toggle_label, callback_data="admin_toggle_direct_avito:alert")],
+            [
+                InlineKeyboardButton(text="📊 Открыть /stats", callback_data="admin_runtime_stats"),
+                InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_refresh"),
+            ],
+        ])
+        try:
+            await call.message.edit_text(
+                f"🌐 <b>Режим прямого парсинга без прокси:</b> {state_badge}\n\n"
+                f"• Активных каналов в пуле: <code>{res['total']}</code>\n"
+                "Настройка сохранена в БД и действует сразу без перезапуска.",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+@router.message(Command("direct_mode"))
+@router.message(Command("direct"))
+async def cmd_admin_direct_mode(message: Message):
+    if not config.is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+
+    from proxy_pool import get_proxy_pool
+    parts = (message.text or "").strip().split()
+    if len(parts) > 1 and parts[1].lower() in ("1", "on", "true", "yes", "вкл"):
+        new_state = True
+    elif len(parts) > 1 and parts[1].lower() in ("0", "off", "false", "no", "выкл"):
+        new_state = False
+    else:
+        new_state = not bool(config.ALLOW_DIRECT_AVITO)
+
+    await database.set_bot_setting("allow_direct_avito", "1" if new_state else "0")
+    pool = get_proxy_pool()
+    res = await pool.set_direct_mode_async(new_state)
+
+    state_badge = "🟢 ВКЛЮЧЕН (1.0 req/s с IP сервера)" if new_state else "🔴 ВЫКЛЮЧЕН"
+    toggle_label = (
+        "🌐 Прямой парсинг (без прокси): ВКЛ 🟢"
+        if new_state
+        else "🌐 Прямой парсинг (без прокси): ВЫКЛ 🔴"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_label, callback_data="admin_toggle_direct_avito:alert")],
+        [
+            InlineKeyboardButton(text="📊 Открыть /stats", callback_data="admin_runtime_stats"),
+            InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_refresh"),
+        ],
+    ])
+    await message.answer(
+        f"🌐 <b>Прямой парсинг Авито (без прокси): {state_badge}</b>\n\n"
+        f"• Активных каналов в пуле: <code>{res['total']}</code>\n"
+        "• Настройка сохранена в базе данных и применена мгновенно.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("reload_proxies"))

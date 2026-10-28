@@ -827,10 +827,44 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_notification_events_expired_at "
             "ON notification_events(expired_at) WHERE expired_at IS NOT NULL;"
         )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
 
         await db.commit()
         await _run_migration_300(db, migration_started_at)
+        async with db.execute("SELECT value FROM bot_settings WHERE key = 'allow_direct_avito'") as cur:
+            s_row = await cur.fetchone()
+            if s_row is not None:
+                config.ALLOW_DIRECT_AVITO = str(s_row[0]) == "1"
         logger.info("База данных успешно инициализирована")
+
+
+async def get_bot_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        async with reader_connection() as db:
+            async with db.execute("SELECT value FROM bot_settings WHERE key = ?", (str(key),)) as cur:
+                row = await cur.fetchone()
+                return str(row[0]) if row is not None else default
+    except sqlite3.OperationalError:
+        return default
+
+
+async def set_bot_setting(key: str, value: str) -> None:
+    async with writer_connection() as db:
+        await db.execute(
+            """
+            INSERT INTO bot_settings (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (str(key), str(value)),
+        )
+        await db.commit()
 
 
 async def get_or_create_user(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> Dict[str, Any]:

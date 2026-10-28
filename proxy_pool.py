@@ -555,7 +555,9 @@ class ProxyPool:
         direct_ok = config.ALLOW_DIRECT_AVITO if allow_direct is None else bool(allow_direct)
 
         if pool_file:
-            return list(load_proxy_urls_from_file(pool_file))
+            p_path = Path(pool_file).expanduser()
+            if proxy_pool_file is not None or p_path.is_file():
+                return list(load_proxy_urls_from_file(pool_file))
 
         if single_proxy and str(single_proxy).strip():
             validated = parse_and_validate_proxy_line(str(single_proxy).strip(), line_number=1)
@@ -564,10 +566,12 @@ class ProxyPool:
         if direct_ok:
             return [None]
 
-        raise RuntimeError(
-            "Не настроен ни один прокси (PROXY_POOL_FILE или PROXY_URL), "
-            "а прямое подключение к Авито без прокси запрещено (ALLOW_DIRECT_AVITO=0)."
+        log.warning(
+            "⚠️ Не настроен ни один прокси (PROXY_POOL_FILE или PROXY_URL), "
+            "а прямое подключение без прокси выключено (ALLOW_DIRECT_AVITO=0). "
+            "Сканирование Авито ожидает включения прямого режима в боте или добавления прокси."
         )
+        return []
 
     def load_configuration(
         self,
@@ -636,6 +640,10 @@ class ProxyPool:
         )
         await self._cleanup_draining()
         return result
+
+    async def set_direct_mode_async(self, enabled: bool) -> dict[str, Any]:
+        config.ALLOW_DIRECT_AVITO = bool(enabled)
+        return await self.reload_async(allow_direct=bool(enabled))
 
     async def _cleanup_draining(self) -> None:
         still_draining: list[ProxyClient] = []

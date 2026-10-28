@@ -179,6 +179,15 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         reload_text = self.methods("SendMessage")[-1].text
         self.assertIn("Пул прокси", reload_text)
 
+        # Toggle direct mode via command and callback
+        await self.dispatch_message(text="/direct_mode off", user_id=config.ADMIN_ID)
+        self.assertFalse(config.ALLOW_DIRECT_AVITO)
+        self.assertEqual(await database.get_bot_setting("allow_direct_avito"), "0")
+
+        await self.dispatch_callback("admin_toggle_direct_avito:alert", config.ADMIN_ID)
+        self.assertTrue(config.ALLOW_DIRECT_AVITO)
+        self.assertEqual(await database.get_bot_setting("allow_direct_avito"), "1")
+
     async def test_admin_list_exposes_tariff_duration_confirmation_and_replay_safety(self):
         await self.dispatch_message(text="/admin", user_id=config.ADMIN_ID)
         self.assertIn(f"admin_user:{self.user_id}:0", self.callback_values())

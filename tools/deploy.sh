@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
+if [[ -z "${MOCK_ROOT:-}" ]]; then
+    export PATH="/usr/local/bin:/root/.local/bin:$PATH"
+fi
 
 : "${DEPLOY_SHA:?DEPLOY_SHA is required}"
 : "${DEPLOY_BRANCH:?DEPLOY_BRANCH is required}"
@@ -174,7 +177,7 @@ report_state
 git archive "$DEPLOY_SHA" | tar -x -C "$STAGE_DIR"
 mkdir -p "$TARGET_DIR/.releases"
 NEW_ENV="$(mktemp -d "$TARGET_DIR/.releases/venv-$DEPLOY_SHA-XXXXXX")"
-python3.11 -m venv "$NEW_ENV" 2>/dev/null || python3 -m venv "$NEW_ENV"
+python3.11 -m venv "$NEW_ENV" 2>/dev/null || { [[ -z "${MOCK_ROOT:-}" ]] && python3.12 -m venv "$NEW_ENV" 2>/dev/null; } || python3 -m venv "$NEW_ENV"
 "$NEW_ENV/bin/python" -B -c 'import sys; print("Deploy Python:", sys.version.split()[0], flush=True); sys.exit(0 if sys.version_info[:2] in ((3, 11), (3, 12)) else "Unsupported deploy Python; expected 3.11 or 3.12")'
 
 # Seed site-packages from existing active venv using hardlinks (zero disk space, instant)
