@@ -28,22 +28,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Prepare read-only production checks
-        env:
-          DIAGNOSTICS_NOTIFY_ADMIN: ${{ inputs.notify_admin && '1' || '' }}
         run: |
-          {
-            echo "sudo -E bash -s <<'AVITO_DIAGNOSTICS'"
-            echo "export DIAGNOSTICS_NOTIFY_ADMIN='${DIAGNOSTICS_NOTIFY_ADMIN}'"
-            cat tools/diagnose.sh
-            echo ""
-            echo "AVITO_DIAGNOSTICS"
-          } > .diagnostics-remote.sh
+          printf "bash -s <<'AVITO_DIAGNOSTICS'\n" > .diagnostics-remote.sh
+          cat tools/diagnose.sh >> .diagnostics-remote.sh
+          printf "\nAVITO_DIAGNOSTICS\n" >> .diagnostics-remote.sh
 
       - name: Check service, resources, SQLite, Avito and Telegram
-        run: |
-          ssh -p 2222 \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=10 \
-            ibssh_uxq4swo77vsikf7akpeenu53ue@ssh.instabox.sh < .diagnostics-remote.sh
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DIAGNOSTICS_NOTIFY_ADMIN: ${{ inputs.notify_admin && '1' || '' }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          command_timeout: 4m
+          envs: DIAGNOSTICS_NOTIFY_ADMIN
+          script_path: .diagnostics-remote.sh

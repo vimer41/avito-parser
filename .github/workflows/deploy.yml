@@ -70,38 +70,24 @@ jobs:
       - name: Checkout tested deploy script
         uses: actions/checkout@v4
 
-      - name: Migrate database and stop old VPS if needed
-        continue-on-error: true
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USERNAME }}
-          password: ${{ secrets.VPS_PASSWORD }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
-          port: 22
-          command_timeout: 3m
-          script: |
-            systemctl stop avito-bot 2>/dev/null || true
-            systemctl disable avito-bot 2>/dev/null || true
-            if [ -f /opt/avito_parser_bot/bot_database.db ]; then
-              ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ibssh_uxq4swo77vsikf7akpeenu53ue@ssh.instabox.sh \
-                "sudo bash -c 'if [ ! -f /opt/avito_parser_bot/bot_database.db ]; then cat > /opt/avito_parser_bot/bot_database.db && echo DB_MIGRATED_FROM_OLD_VPS; fi'" \
-                < /opt/avito_parser_bot/bot_database.db || true
-            fi
-            if [ -f /opt/avito_parser_bot/.env ]; then
-              ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ibssh_uxq4swo77vsikf7akpeenu53ue@ssh.instabox.sh \
-                "sudo bash -c 'cat > /opt/avito_parser_bot/.env && chmod 600 /opt/avito_parser_bot/.env && echo ENV_MIGRATED_FROM_OLD_VPS'" \
-                < /opt/avito_parser_bot/.env || true
-            fi
-
       - name: Wrap remote script in Bash regardless of the SSH login shell
+        run: |
+          printf "bash -s <<'AVITO_DEPLOY_SCRIPT'\n" > .deploy-remote.sh
+          cat tools/deploy.sh >> .deploy-remote.sh
+          printf "\nAVITO_DEPLOY_SCRIPT\n" >> .deploy-remote.sh
+
+      - name: SSH and deploy exact tested SHA
+        uses: appleboy/ssh-action@v1.2.0
         env:
           DEPLOY_SHA: ${{ github.sha }}
           DEPLOY_BRANCH: ${{ github.ref_name }}
+          # Temporary fast VPS preflight; CI still runs the complete suite.
+          # Set the Actions variable DEPLOY_FULL_TESTS=1 to restore VPS retests.
           DEPLOY_FULL_TESTS: ${{ vars.DEPLOY_FULL_TESTS || '0' }}
-          DEPLOY_STOP_BEFORE_PREFLIGHT: ${{ vars.DEPLOY_STOP_BEFORE_PREFLIGHT || '0' }}
-          DEPLOY_STARS_PAYMENTS_ENABLED: ${{ secrets.STARS_PAYMENTS_ENABLED || vars.STARS_PAYMENTS_ENABLED || '1' }}
+          # Stop the existing bot before preflight on constrained VPS (600MB RAM)
+          DEPLOY_STOP_BEFORE_PREFLIGHT: ${{ vars.DEPLOY_STOP_BEFORE_PREFLIGHT || '1' }}
+          # Empty preserves runtime settings; set explicitly to enable/disable sales.
+          DEPLOY_STARS_PAYMENTS_ENABLED: ${{ secrets.STARS_PAYMENTS_ENABLED || vars.STARS_PAYMENTS_ENABLED }}
           DEPLOY_STARS_PRICE_STANDART: ${{ secrets.STARS_PRICE_STANDART || vars.STARS_PRICE_STANDART || '170' }}
           DEPLOY_STARS_PRICE_PRO: ${{ secrets.STARS_PRICE_PRO || vars.STARS_PRICE_PRO || '470' }}
           DEPLOY_CLEANUP: ${{ vars.DEPLOY_CLEANUP || '1' }}
@@ -109,34 +95,16 @@ jobs:
           DEPLOY_KEEP_BACKUPS: ${{ vars.DEPLOY_KEEP_BACKUPS || '3' }}
           DEPLOY_RELEASE_MIN_AGE_DAYS: ${{ vars.DEPLOY_RELEASE_MIN_AGE_DAYS || '1' }}
           DEPLOY_BACKUP_MIN_AGE_DAYS: ${{ vars.DEPLOY_BACKUP_MIN_AGE_DAYS || '2' }}
-        run: |
-          {
-            echo "sudo -E bash -s <<'AVITO_DEPLOY_SCRIPT'"
-            echo "export DEPLOY_SHA='${DEPLOY_SHA}'"
-            echo "export DEPLOY_BRANCH='${DEPLOY_BRANCH}'"
-            echo "export DEPLOY_FULL_TESTS='${DEPLOY_FULL_TESTS}'"
-            echo "export DEPLOY_STOP_BEFORE_PREFLIGHT='${DEPLOY_STOP_BEFORE_PREFLIGHT}'"
-            echo "export DEPLOY_STARS_PAYMENTS_ENABLED='${DEPLOY_STARS_PAYMENTS_ENABLED}'"
-            echo "export DEPLOY_STARS_PRICE_STANDART='${DEPLOY_STARS_PRICE_STANDART}'"
-            echo "export DEPLOY_STARS_PRICE_PRO='${DEPLOY_STARS_PRICE_PRO}'"
-            echo "export DEPLOY_CLEANUP='${DEPLOY_CLEANUP}'"
-            echo "export DEPLOY_KEEP_RELEASES='${DEPLOY_KEEP_RELEASES}'"
-            echo "export DEPLOY_KEEP_BACKUPS='${DEPLOY_KEEP_BACKUPS}'"
-            echo "export DEPLOY_RELEASE_MIN_AGE_DAYS='${DEPLOY_RELEASE_MIN_AGE_DAYS}'"
-            echo "export DEPLOY_BACKUP_MIN_AGE_DAYS='${DEPLOY_BACKUP_MIN_AGE_DAYS}'"
-            cat tools/deploy.sh
-            echo ""
-            echo "AVITO_DEPLOY_SCRIPT"
-          } > .deploy-remote.sh
-
-      - name: SSH and deploy exact tested SHA to Instabox VPS
-        run: |
-          ssh -p 2222 \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=10 \
-            ibssh_uxq4swo77vsikf7akpeenu53ue@ssh.instabox.sh < .deploy-remote.sh
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          port: 22
+          command_timeout: 18m
+          envs: DEPLOY_SHA,DEPLOY_BRANCH,DEPLOY_FULL_TESTS,DEPLOY_STOP_BEFORE_PREFLIGHT,DEPLOY_STARS_PAYMENTS_ENABLED,DEPLOY_STARS_PRICE_STANDART,DEPLOY_STARS_PRICE_PRO,DEPLOY_CLEANUP,DEPLOY_KEEP_RELEASES,DEPLOY_KEEP_BACKUPS,DEPLOY_RELEASE_MIN_AGE_DAYS,DEPLOY_BACKUP_MIN_AGE_DAYS
+          script_path: .deploy-remote.sh
 
   diagnostics:
     name: Check installed bot and production resources
