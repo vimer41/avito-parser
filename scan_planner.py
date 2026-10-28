@@ -431,11 +431,9 @@ class DeadlineScheduler:
         if should_source_backoff:
             state.source_failure_streak += 1
             state.retry_attempt = task.retry_attempt + 1 if retryable else 0
-            max_backoff = min(10.0, float(config.SOURCE_BACKOFF_MAX)) if config.ALLOW_DIRECT_AVITO else float(config.SOURCE_BACKOFF_MAX)
-            base_backoff = min(2.0, float(config.SOURCE_BACKOFF_BASE)) if config.ALLOW_DIRECT_AVITO else float(config.SOURCE_BACKOFF_BASE)
             delay = min(
-                max_backoff,
-                base_backoff * (2 ** (state.source_failure_streak - 1)),
+                float(config.SOURCE_BACKOFF_MAX),
+                float(config.SOURCE_BACKOFF_BASE) * (2 ** (state.source_failure_streak - 1)),
             )
             state.backoff_until = now_val + max(delay, retry_after)
             state.due_at = state.backoff_until
