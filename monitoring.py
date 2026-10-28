@@ -320,20 +320,28 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     int(pool.healthy_count() == 0),
                     last_failure,
                 )
+                is_direct_run = getattr(pool, "is_direct_only", False) or (
+                    bool(getattr(pool, "clients", []))
+                    and len(pool.clients) == 1
+                    and pool.clients[0].is_direct
+                )
+                fast_retry = float(config.SCAN_INTERVAL_MIN) if is_direct_run else 0.0
                 planner.complete(
                     task,
                     time.monotonic(),
                     False,
-                    retry_after=last_failure.retry_after if last_failure else 0.0,
+                    retry_after=max(fast_retry, last_failure.retry_after if last_failure else 0.0),
                     retryable=last_failure.retryable if last_failure else True,
-                    exhausted_proxies=True,
+                    exhausted_proxies=False if is_direct_run else True,
                 )
                 state_after = planner.sources.get(task.key)
+                if is_direct_run and state_after:
+                    state_after.source_failure_streak = 0
                 await queue_state_update(
                     task.key,
                     task.previous_processed_at,
                     task.last_top_ids,
-                    state_after.source_failure_streak if state_after else 1,
+                    0 if is_direct_run else (state_after.source_failure_streak if state_after else 1),
                 )
                 changed.set()
                 stats["failed_scans"] += 1
