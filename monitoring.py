@@ -114,7 +114,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
     async def notify_admins_text(text: str):
         for admin_id in config.ADMIN_IDS:
             try:
-                await bot.send_message(chat_id=admin_id, text=text)
+                await bot.send_message(chat_id=admin_id, text=text, parse_mode=None)
             except Exception:
                 logger.warning("Не удалось отправить алерт администратору", exc_info=True)
 
