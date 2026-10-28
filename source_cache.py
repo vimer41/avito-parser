@@ -84,7 +84,7 @@ class SourceSnapshotCache:
                 parser = AvitoParser(proxy_client=client)
                 setattr(client, "_bound_parser", parser)
             try:
-                result = await collect_source(parser, key, max_age_minutes=30)
+                result = await collect_source(parser, key, max_age_minutes=30, max_pages=1)
                 if result is not None:
                     snapshot = SourceSnapshot(result.title, result.items, result.captured_at)
                     self.put(key, snapshot)
@@ -96,7 +96,7 @@ class SourceSnapshotCache:
         parser = None
         try:
             parser = AvitoParser(proxy=config.PROXY_URL)
-            result = await collect_source(parser, key, max_age_minutes=30)
+            result = await collect_source(parser, key, max_age_minutes=30, max_pages=1)
             if result is None:
                 return None
             snapshot = SourceSnapshot(result.title, result.items, result.captured_at)

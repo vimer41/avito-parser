@@ -255,7 +255,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 and any(database.classify_user_tariff(r)[0] == "pro" for r in task.radars)
             )
             collection_max_age = config.CATCHUP_MAX_AGE_MINUTES
-            collection_max_pages = config.CATCHUP_MAX_PAGES if has_pro_catchup else config.AVITO_MAX_PAGES_PER_SCAN
+            collection_max_pages = 1
 
             for _attempt in range(max(1, int(config.SCAN_PROXY_ATTEMPTS))):
                 lease = pool.acquire_client(exclude_ids=tried_proxy_ids)

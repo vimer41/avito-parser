@@ -227,7 +227,16 @@ class ProxyClient:
         return True
 
     def is_available(self, now: float | None = None) -> bool:
-        return self.is_available_for_scan(now)
+        if self._draining:
+            return False
+        cur = self._monotonic() if now is None else now
+        if self._state == "quarantined":
+            if cur < self.quarantined_until:
+                return False
+            self._state = "half_open"
+            self.quarantine_reason = ""
+            self._sync_metrics_state()
+        return True
 
     def cooldown_remaining(self, now: float | None = None) -> float:
         cur = self._monotonic() if now is None else now
