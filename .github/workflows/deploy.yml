@@ -71,7 +71,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Migrate database and stop old VPS if needed
-        if: secrets.VPS_HOST != '' && secrets.VPS_HOST != 'ssh.instabox.sh'
         continue-on-error: true
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -102,9 +101,9 @@ jobs:
           DEPLOY_BRANCH: ${{ github.ref_name }}
           DEPLOY_FULL_TESTS: ${{ vars.DEPLOY_FULL_TESTS || '0' }}
           DEPLOY_STOP_BEFORE_PREFLIGHT: ${{ vars.DEPLOY_STOP_BEFORE_PREFLIGHT || '0' }}
-          DEPLOY_STARS_PAYMENTS_ENABLED: ${{ vars.STARS_PAYMENTS_ENABLED }}
-          DEPLOY_STARS_PRICE_STANDART: ${{ vars.STARS_PRICE_STANDART || '170' }}
-          DEPLOY_STARS_PRICE_PRO: ${{ vars.STARS_PRICE_PRO || '470' }}
+          DEPLOY_STARS_PAYMENTS_ENABLED: ${{ secrets.STARS_PAYMENTS_ENABLED || vars.STARS_PAYMENTS_ENABLED || '1' }}
+          DEPLOY_STARS_PRICE_STANDART: ${{ secrets.STARS_PRICE_STANDART || vars.STARS_PRICE_STANDART || '170' }}
+          DEPLOY_STARS_PRICE_PRO: ${{ secrets.STARS_PRICE_PRO || vars.STARS_PRICE_PRO || '470' }}
           DEPLOY_CLEANUP: ${{ vars.DEPLOY_CLEANUP || '1' }}
           DEPLOY_KEEP_RELEASES: ${{ vars.DEPLOY_KEEP_RELEASES || '2' }}
           DEPLOY_KEEP_BACKUPS: ${{ vars.DEPLOY_KEEP_BACKUPS || '3' }}
