@@ -126,7 +126,7 @@ def _default_headers() -> dict[str, str]:
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Connection": "keep-alive",
         "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-cache, no-store, max-age=0, must-revalidate",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
@@ -134,6 +134,40 @@ def _default_headers() -> dict[str, str]:
         "Upgrade-Insecure-Requests": "1",
         "User-Agent": ua,
     }
+
+
+def apply_cache_busting(url: str) -> str:
+    """
+    Добавляет динамический timestamp (_t) к URL каталога Авито,
+    чтобы пробивать кэш CDN (Qrator / Nginx edge) и получать
+    свежие объявления без 30-60 секундного лага кэша.
+    """
+    try:
+        parsed = urlparse(url)
+        if not (parsed.hostname and (parsed.hostname == "avito.ru" or parsed.hostname.endswith(".avito.ru"))):
+            return url
+        if any(parsed.path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".js", ".css", ".ico")):
+            return url
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        qs["_t"] = [str(int(time.time() * 1000))]
+        new_query = urlencode(qs, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
+    except Exception:
+        return url
+
+
+def remove_cache_busting(url: str) -> str:
+    """Удаляет параметр _t из URL для сохранения канонического ключа в кэше и логах."""
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        if "_t" in qs:
+            del qs["_t"]
+            new_query = urlencode(qs, doseq=True)
+            return urlunparse(parsed._replace(query=new_query))
+        return url
+    except Exception:
+        return url
 
 
 def _copy_cookie_jar(source_jar, target_jar) -> None:
@@ -437,7 +471,7 @@ class AvitoParser:
         query_params = parse_qs(parsed.query)
 
         # Удаляем мусорные / сессионные параметры, меняющиеся между запросами
-        junk_keys = {"context", "localPriority", "presentationType", "from", "view", "p"}
+        junk_keys = {"context", "localPriority", "presentationType", "from", "view", "p", "_t"}
         for k in list(query_params.keys()):
             if k in junk_keys or k.startswith("utm_"):
                 query_params.pop(k, None)
@@ -552,17 +586,19 @@ class AvitoParser:
                 min(float(config.AVITO_READ_TIMEOUT), remaining),
             )
             req_t0 = time.monotonic()
-            response = await async_session.request("GET", url, timeout=timeout, allow_redirects=False)
+            req_url = apply_cache_busting(url)
+            response = await async_session.request("GET", req_url, timeout=timeout, allow_redirects=False)
             req_elapsed = max(0.0, time.monotonic() - req_t0)
             client.record_raw_http_response(response.status_code, req_elapsed)
             text = getattr(response, "text", "") or ""
+            clean_url = remove_cache_busting(url)
             if self._is_firewall(response) or self._needs_challenge(response, text, async_session):
-                return response, url, text
+                return response, clean_url, text
             if response.status_code not in (301, 302, 303, 307, 308):
-                return response, url, text
+                return response, clean_url, text
             location = response.headers.get("Location") or response.headers.get("location")
             if not location:
-                return response, url, text
+                return response, clean_url, text
             url = urljoin(url, location)
         raise ValueError("Avito redirect limit exceeded")
 
@@ -792,15 +828,17 @@ class AvitoParser:
         for _ in range(5):
             check_cancelled(cancel_event)
             self._validate_avito_url(url)
-            response = self.session.get(url, timeout=20, allow_redirects=False)
+            req_url = apply_cache_busting(url)
+            response = self.session.get(req_url, timeout=20, allow_redirects=False)
             check_cancelled(cancel_event)
+            clean_url = remove_cache_busting(url)
             if self._is_firewall(response) or extract_pow_challenge(response, self.session):
-                return response, url
+                return response, clean_url
             if response.status_code not in (301, 302, 303, 307, 308):
-                return response, url
+                return response, clean_url
             location = response.headers.get("Location") or response.headers.get("location")
             if not location:
-                return response, url
+                return response, clean_url
             url = urljoin(url, location)
         raise ValueError("Avito redirect limit exceeded")
 

@@ -70,20 +70,20 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MAX_SEARCHES_PER_USER = positive_int_setting("MAX_SEARCHES_PER_USER", "20")
 
 # --- Планировщик и интервалы ---
-SCAN_INTERVAL_MIN = positive_float_setting("SCAN_INTERVAL_MIN", "15.0")
-SCAN_INTERVAL_MAX = positive_float_setting("SCAN_INTERVAL_MAX", "20.0")
+SCAN_INTERVAL_MIN = positive_float_setting("SCAN_INTERVAL_MIN", "5.0")
+SCAN_INTERVAL_MAX = positive_float_setting("SCAN_INTERVAL_MAX", "10.0")
 SCAN_CAPACITY_MODE_WINDOWS = positive_int_setting("SCAN_CAPACITY_MODE_WINDOWS", "2")
 PROXY_INITIAL_HTTP_COST_PER_SCAN = positive_float_setting("PROXY_INITIAL_HTTP_COST_PER_SCAN", "1.3")
 HTTP_COST_MIN_SAMPLES = positive_int_setting("HTTP_COST_MIN_SAMPLES", "30")
-SOURCE_BACKOFF_BASE = positive_float_setting("SOURCE_BACKOFF_BASE", "30.0")
-SOURCE_BACKOFF_MAX = positive_float_setting("SOURCE_BACKOFF_MAX", "300.0")
+SOURCE_BACKOFF_BASE = positive_float_setting("SOURCE_BACKOFF_BASE", "5.0")
+SOURCE_BACKOFF_MAX = positive_float_setting("SOURCE_BACKOFF_MAX", "30.0")
 SOURCE_RECOVERY_SUCCESSES = positive_int_setting("SOURCE_RECOVERY_SUCCESSES", "3")
 SCAN_PROXY_ATTEMPTS = positive_int_setting("SCAN_PROXY_ATTEMPTS", "2")
 
 # --- Прокси и HTTP ---
 PROXY_POOL_FILE = (os.getenv("PROXY_POOL_FILE") or "").strip()
 ALLOW_DIRECT_AVITO = os.getenv("ALLOW_DIRECT_AVITO", "1" if TESTING else "0").strip() == "1"
-PROXY_RATE_LIMIT = positive_float_setting("PROXY_RATE_LIMIT", "1.0")
+PROXY_RATE_LIMIT = positive_float_setting("PROXY_RATE_LIMIT", "1.5")
 PROXY_RATE_RECOMMENDATION_MAX = positive_float_setting("PROXY_RATE_RECOMMENDATION_MAX", "2.0")
 PROXY_CAPACITY_RESERVE = non_negative_float_setting("PROXY_CAPACITY_RESERVE", "0.20")
 PROXY_MIN_RATE = positive_float_setting("PROXY_MIN_RATE", "0.1")
@@ -143,7 +143,7 @@ METRICS_WINDOW_SECONDS = positive_int_setting("METRICS_WINDOW_SECONDS", "3600")
 METRICS_REPORT_INTERVAL = positive_int_setting("METRICS_REPORT_INTERVAL", "60")
 
 # --- Совместимость со старыми ссылками в коде/тестах ---
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "20"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "5"))
 if CHECK_INTERVAL <= 0:
     raise ValueError("Параметр CHECK_INTERVAL должен быть положительным")
 MAX_CONCURRENT_WORKERS = min(32, max(1, int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))))

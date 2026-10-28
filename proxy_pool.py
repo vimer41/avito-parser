@@ -165,7 +165,7 @@ class ProxyClient:
         )
         self.is_direct: bool = (self.proxy_url is None)
         if self.is_direct:
-            self.configured_rate = max(1.0, self.configured_rate)
+            self.configured_rate = max(1.5, self.configured_rate)
         self.effective_rate: float = self.configured_rate
         self.max_in_flight: int = max(
             1, int(config.PROXY_MAX_IN_FLIGHT if max_in_flight is None else max_in_flight)
@@ -401,7 +401,7 @@ class ProxyClient:
         if self.is_direct:
             self.block_streak = 0
             self.recovery_success_streak = 0
-            self.effective_rate = max(1.0, float(self.configured_rate or 1.0))
+            self.effective_rate = max(1.5, float(self.configured_rate or 1.5))
             self.quarantined_until = 0.0
             self._state = "healthy"
             self._sync_metrics_state()

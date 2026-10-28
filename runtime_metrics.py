@@ -1034,9 +1034,10 @@ class RuntimeMetricsRegistry:
         # 3. Capacity deficit / proxy health
         total_p = cap["total_proxies"]
         healthy_p = cap["healthy_proxies"]
+        is_direct_only = (total_p == 1 and bool((proxy_snapshots or [{}])[0].get("is_direct", False)))
         reserve_floor = math.floor(total_p * (1.0 - config.PROXY_CAPACITY_RESERVE)) if total_p >= 2 else total_p
         has_cap_data = cap["unique_sources"] > 0 or total_p > 0
-        cap_bad = cap["deficit_now"] > 0 or (total_p > 0 and healthy_p < max(1, reserve_floor))
+        cap_bad = not is_direct_only and (cap["deficit_now"] > 0 or (total_p > 0 and healthy_p < max(1, reserve_floor)))
         _process_rule(
             "capacity_deficit",
             cap_bad,

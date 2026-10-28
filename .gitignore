@@ -38,4 +38,7 @@ backups/
 # Local Documentation & Guides
 DEPLOY_AND_MONETIZATION_GUIDE.md
 deploy_*.md
+.kilo/
+tests/run_vps_cmd.py
+tests/test_remix.py
 DEPLOY_*.md

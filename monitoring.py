@@ -497,7 +497,14 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             if now - last_report >= float(config.METRICS_REPORT_INTERVAL):
                 outbox_metrics = await database.get_outbox_metrics()
                 MONITORING_STATS["outbox"] = outbox_metrics
-                planner.update_capacity_mode(cap["available_rps"], cap["required_rps"], now)
+                is_direct_run = pool.is_direct_only or (len(pool.clients) == 1 and pool.clients[0].is_direct)
+                if is_direct_run:
+                    from scan_planner import get_capacity_mode_intervals
+                    planner.capacity_mode = "normal"
+                    intervals = get_capacity_mode_intervals()
+                    planner.interval_low, planner.interval_high = intervals["normal"]
+                else:
+                    planner.update_capacity_mode(cap["available_rps"], cap["required_rps"], now)
                 request_cost = float(metrics_snap["avg_http_requests_per_scan"] or 1.0)
                 logger.log(
                     logging.WARNING if MONITORING_STATS["overloaded"] else logging.INFO,

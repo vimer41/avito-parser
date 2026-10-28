@@ -14,12 +14,19 @@ from typing import Callable, Iterable, Optional
 import config
 
 
-CAPACITY_MODE_INTERVALS: dict[str, tuple[float, float]] = {
-    "normal": (15.0, 20.0),
-    "full_capacity": (16.0, 20.0),
-    "boundary": (18.0, 20.0),
-    "deficit": (19.0, 20.0),
-}
+def get_capacity_mode_intervals() -> dict[str, tuple[float, float]]:
+    base_low = float(config.SCAN_INTERVAL_MIN)
+    base_high = float(config.SCAN_INTERVAL_MAX)
+    spread = max(0.5, base_high - base_low)
+    return {
+        "normal": (base_low, base_high),
+        "full_capacity": (min(base_high, round(base_low + spread * 0.25, 1)), base_high),
+        "boundary": (min(base_high, round(base_low + spread * 0.50, 1)), base_high),
+        "deficit": (min(base_high, round(base_low + spread * 0.75, 1)), base_high),
+    }
+
+
+CAPACITY_MODE_INTERVALS: dict[str, tuple[float, float]] = get_capacity_mode_intervals()
 
 
 @dataclass
@@ -208,7 +215,10 @@ class DeadlineScheduler:
 
         if self._candidate_windows >= config.SCAN_CAPACITY_MODE_WINDOWS:
             self.capacity_mode = target
-            self.interval_low, self.interval_high = CAPACITY_MODE_INTERVALS[target]
+            intervals = get_capacity_mode_intervals()
+            self.interval_low, self.interval_high = intervals.get(
+                target, (float(config.SCAN_INTERVAL_MIN), float(config.SCAN_INTERVAL_MAX))
+            )
             self._candidate_mode = None
             self._candidate_windows = 0
 
@@ -421,9 +431,11 @@ class DeadlineScheduler:
         if should_source_backoff:
             state.source_failure_streak += 1
             state.retry_attempt = task.retry_attempt + 1 if retryable else 0
+            max_backoff = min(10.0, float(config.SOURCE_BACKOFF_MAX)) if config.ALLOW_DIRECT_AVITO else float(config.SOURCE_BACKOFF_MAX)
+            base_backoff = min(2.0, float(config.SOURCE_BACKOFF_BASE)) if config.ALLOW_DIRECT_AVITO else float(config.SOURCE_BACKOFF_BASE)
             delay = min(
-                float(config.SOURCE_BACKOFF_MAX),
-                float(config.SOURCE_BACKOFF_BASE) * (2 ** (state.source_failure_streak - 1)),
+                max_backoff,
+                base_backoff * (2 ** (state.source_failure_streak - 1)),
             )
             state.backoff_until = now_val + max(delay, retry_after)
             state.due_at = state.backoff_until
