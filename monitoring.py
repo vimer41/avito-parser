@@ -50,7 +50,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         config.SCAN_RETRY_MAX_DELAY,
         interval_low=config.SCAN_INTERVAL_MIN,
         interval_high=config.SCAN_INTERVAL_MAX,
-        use_source_backoff=True,
+        use_source_backoff=False,
     )
 
     worker_count = max(1, int(config.MAX_CONCURRENT_WORKERS), len(pool.clients))
@@ -254,11 +254,17 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 and (now_epoch - task.previous_processed_at) > (max_age * 60)
                 and any(database.classify_user_tariff(r)[0] == "pro" for r in task.radars)
             )
-            collection_max_age = config.CATCHUP_MAX_AGE_MINUTES if has_pro_catchup else max_age
+            collection_max_age = config.CATCHUP_MAX_AGE_MINUTES
             collection_max_pages = config.CATCHUP_MAX_PAGES if has_pro_catchup else config.AVITO_MAX_PAGES_PER_SCAN
 
             for _attempt in range(max(1, int(config.SCAN_PROXY_ATTEMPTS))):
                 lease = pool.acquire_client(exclude_ids=tried_proxy_ids)
+                if lease is None and len(pool.clients) == 1:
+                    only_client = pool.clients[0]
+                    only_client.quarantined_until = 0.0
+                    only_client._state = "healthy"
+                    only_client._half_open_probe_active = False
+                    lease = pool.acquire_client()
                 if lease is None:
                     break
                 client = lease.client

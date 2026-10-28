@@ -285,12 +285,7 @@ class ProxyClient:
         await self.reset_async_session()
 
     def _reserve_pacing_delay(self) -> float:
-        now = self._monotonic()
-        spacing = 1.0 / max(config.PROXY_MIN_RATE, self.effective_rate)
-        with self._pacing_lock:
-            scheduled = max(now, self._next_request_at)
-            self._next_request_at = scheduled + spacing
-            return max(0.0, scheduled - now)
+        return 0.0
 
     async def wait_for_rate_slot_async(self, deadline: float | None = None) -> None:
         delay = self._reserve_pacing_delay()
@@ -378,20 +373,7 @@ class ProxyClient:
 
         if status_code in (403, 429):
             self.recovery_success_streak = 0
-            total_10m, bad_10m = self._count_recent_403_429(now)
-            if (
-                total_10m >= config.PROXY_BLOCK_RATIO_MIN_REQUESTS
-                and (bad_10m / total_10m) > config.PROXY_BLOCK_RATIO_THRESHOLD
-            ):
-                self.effective_rate = max(
-                    config.PROXY_MIN_RATE,
-                    round(self.effective_rate * 0.5, 4),
-                )
-                self._enter_quarantine(
-                    now,
-                    float(config.PROXY_QUARANTINE_BASE),
-                    reason=f"block_ratio_10m={bad_10m}/{total_10m}",
-                )
+            self._sync_metrics_state()
 
     def record_final_block(
         self,

@@ -19,14 +19,22 @@ from logger_setup import log_user_event
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Множество нормализованных URL, где радар был только что снят с паузы (для однократного обхода fast-skip)
+# Множество нормализованных URL и ID радаров, где радар был только что снят с паузы
 RESUMED_SOURCE_URLS: set[str] = set()
+RESUMED_RADAR_IDS: set[int] = set()
 
 
 def pop_resumed_source_urls() -> set[str]:
     res = set(RESUMED_SOURCE_URLS)
     RESUMED_SOURCE_URLS.clear()
     return res
+
+
+def consume_resumed_radar_id(radar_id: int) -> bool:
+    if radar_id in RESUMED_RADAR_IDS:
+        RESUMED_RADAR_IDS.discard(radar_id)
+        return True
+    return False
 
 
 class SearchStates(StatesGroup):
@@ -187,22 +195,29 @@ async def process_avito_url(message: Message, state: FSMContext):
         snapshot = None
 
     if snapshot is None:
-        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Калибровка радара", f"Ошибка: Авито не вернул HTML («{normalized_url[:80]}»)", status="ERROR")
-        await status_msg.edit_text(
-            "❌ <b>Не удалось подключиться к странице Авито.</b>\n\n"
-            "Возможно, ссылка недействительна или сработала защита сайта. Попробуйте еще раз через минуту.",
-            parse_mode="HTML"
+        search_title = AvitoParser.extract_search_title("", normalized_url)
+        items = []
+        initial_items_arg = None
+        RESUMED_SOURCE_URLS.add(normalized_url)
+        log_user_event(
+            user_id,
+            message.from_user.username,
+            message.from_user.first_name,
+            "Калибровка радара",
+            f"Отложенная калибровка («{normalized_url[:80]}»)",
+            status="WARN",
         )
-        return
+    else:
+        search_title = snapshot.title
+        items = list(snapshot.items)
+        initial_items_arg = [(item.item_id, item.raw_price) for item in items]
 
-    search_title = snapshot.title
-    items = list(snapshot.items)
     is_title_only = 1 if "bt=1" in normalized_url else 0
 
     try:
         search_id = await database.add_search(
             user_id, search_title, normalized_url, search_in_title_only=is_title_only,
-            initial_items=[(item.item_id, item.raw_price) for item in items],
+            initial_items=initial_items_arg,
         )
     except (database.RadarLimitError, PermissionError) as exc:
         await status_msg.edit_text(f"⚠️ {html.escape(str(exc))}", parse_mode="HTML")
@@ -217,20 +232,23 @@ async def process_avito_url(message: Message, state: FSMContext):
     clean_title = html.escape(search_title)
     scope_icon = "🏷 Только в названиях" if is_title_only else "📄 Название + описание"
     scope_btn = "🔍 Выборка: Только в названиях 🏷" if is_title_only else "🔍 Выборка: Название + описание 📄"
+    existing_line = (
+        f"├ 📦 <b>Существующих объявлений:</b> <b>{len(items)}</b> (пропущены)\n"
+        if snapshot is not None
+        else "├ 📦 <b>Калибровка:</b> <i>выполнится автоматически при первом скане</i>\n"
+    )
     text = (
         "┌ 🎯 <b>РАДАР УСПЕШНО АКТИВИРОВАН!</b>\n"
         f"├ 📌 <b>Цель:</b> <b>{clean_title}</b>\n"
-        f"├ ⏱ <b>Свежесть лотов:</b> <b>до 5 мин. ⚡️</b>\n"
         f"├ 🔍 <b>Область выборки:</b> <b>{scope_icon}</b>\n"
-        f"├ 📦 <b>Существующих объявлений:</b> <b>{len(items)}</b> (пропущены)\n"
+        f"{existing_line}"
         f"├ 📡 <b>Статус:</b> 🟢 Мониторинг 24/7 активен\n"
         f"└ ⚡️ <b>Целевой интервал опроса:</b> {int(config.SCAN_INTERVAL_MIN)}–{int(config.SCAN_INTERVAL_MAX)} сек.\n\n"
-        "<i>При обнаружении свежего лота бот отправит уведомление с ценой, ссылкой и фото (для тарифов Standart и PRO).</i>"
+        "<i>При обнаружении нового лота бот сразу отправит уведомление с ценой, ссылкой и фото (для тарифов Standart и PRO).</i>"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="⏱ Свежесть: до 5 мин. ⚙️", callback_data=f"set_age:{search_id}"),
             InlineKeyboardButton(text=scope_btn, callback_data=f"toggle_title_scope:{search_id}")
         ],
         [
@@ -270,18 +288,10 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         scope_info = "<b>Название + описание</b> 📄"
         scope_btn_label = "🔍 Выборка: Название + описание 📄"
 
-    max_age = s.get("max_age_minutes")
-    if not max_age or max_age <= 0:
-        max_age = 5
-    elif max_age > 30:
-        max_age = 30
-    age_label = format_max_age_label(max_age)
-
     card_text = (
         f"🎯 <b>РАДАР: {title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>Статус:</b> {status_icon}\n"
-        f"⏱ <b>Свежесть лотов:</b> <b>{age_label}</b>\n"
         f"🔍 <b>Область выборки:</b> {scope_info}\n"
         f"🛡 <b>Стоп-слов:</b> <code>{stops_count}</code>\n"
         f"🔗 <b>Ссылка:</b> <a href=\"{s['url']}\">Открыть выдачу на Авито</a>\n"
@@ -290,9 +300,6 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
 
     toggle_btn_text = "⏸ Поставить на паузу" if is_active else "▶️ Запустить радар"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=f"⏱ Свежесть: {age_label} ⚙️", callback_data=f"set_age:{search_id}")
-        ],
         [
             InlineKeyboardButton(text=scope_btn_label, callback_data=f"toggle_title_scope:{search_id}")
         ],
@@ -440,10 +447,13 @@ async def cb_toggle_search(call: CallbackQuery):
         return
 
     if new_status:
+        RESUMED_RADAR_IDS.add(search_id)
         try:
             RESUMED_SOURCE_URLS.add(AvitoParser.normalize_url(s["url"]))
         except Exception:
             pass
+    else:
+        RESUMED_RADAR_IDS.discard(search_id)
 
     card_text, kb = build_radar_card(s)
     try:

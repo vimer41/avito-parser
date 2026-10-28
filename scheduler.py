@@ -834,6 +834,9 @@ async def process_collected_group_fanout(
                 seen_batch.append((radar_id, item_id, price or 0))
             continue
 
+        from handlers.searches import consume_resumed_radar_id
+        is_resumed_radar = consume_resumed_radar_id(radar_id)
+
         max_age_raw = radar.get("max_age_minutes")
         max_age_min = 5 if (not max_age_raw or int(max_age_raw) <= 0) else min(30, int(max_age_raw))
 
@@ -844,7 +847,12 @@ async def process_collected_group_fanout(
             and previous_processed_at > 0
             and (now_epoch - previous_processed_at) > (max_age_min * 60)
         )
-        effective_age_min = config.CATCHUP_MAX_AGE_MINUTES if is_downtime_catchup else max_age_min
+        if is_resumed_radar:
+            effective_age_min = 10
+        elif is_downtime_catchup:
+            effective_age_min = config.CATCHUP_MAX_AGE_MINUTES
+        else:
+            effective_age_min = 30
 
         ages = {}
         normal_fresh_flags = {}
@@ -915,7 +923,7 @@ async def process_collected_group_fanout(
 
         for it in reversed(deliverable_items):
             disc_at = collection.discovery_times.get(it.item_id, now_epoch)
-            item_is_catchup = bool(is_downtime_catchup and not normal_fresh_flags.get(it.item_id, True))
+            item_is_catchup = bool(is_resumed_radar or (is_downtime_catchup and not normal_fresh_flags.get(it.item_id, True)))
             task_dict = asdict(
                 NotificationTask(
                     user_id=user_id,

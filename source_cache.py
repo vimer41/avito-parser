@@ -67,11 +67,22 @@ class SourceSnapshotCache:
         pool = get_proxy_pool()
         excluded: set[str] = set()
         for _ in range(max(1, int(config.SCAN_PROXY_ATTEMPTS))):
-            client = await pool.acquire_client(exclude_ids=excluded, timeout=2.0)
-            if client is None:
+            lease = pool.acquire_client(exclude_ids=excluded)
+            if lease is None and len(pool.clients) == 1:
+                # Single client (e.g. direct mode or 1 proxy): clear quarantine/excluded and retry
+                only_client = pool.clients[0]
+                only_client.quarantined_until = 0.0
+                only_client._state = "healthy"
+                only_client._half_open_probe_active = False
+                lease = pool.acquire_client()
+            if lease is None:
                 break
+            client = lease.client
             excluded.add(client.proxy_id)
-            parser = AvitoParser(proxy_client=client)
+            parser = getattr(client, "_bound_parser", None)
+            if parser is None:
+                parser = AvitoParser(proxy_client=client)
+                setattr(client, "_bound_parser", parser)
             try:
                 result = await collect_source(parser, key, max_age_minutes=30)
                 if result is not None:
@@ -79,8 +90,7 @@ class SourceSnapshotCache:
                     self.put(key, snapshot)
                     return snapshot
             finally:
-                parser.close()
-                await pool.release_client(client)
+                lease.release()
 
         # Fallback for direct/legacy mode when pool has no clients
         parser = None
