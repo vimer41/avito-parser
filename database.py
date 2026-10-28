@@ -1312,7 +1312,9 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
                          AND so.status = 'paid'
                          AND so.tariff_plan = 'test'
                          AND so.subscription_after = u.subscription_until
-                   ) AS is_test_order
+                   ) AS is_test_order,
+                   CAST(strftime('%s', s.created_at) AS REAL) AS created_epoch,
+                   CAST(strftime('%s', s.initialized_at) AS REAL) AS initialized_epoch
             FROM searches s 
             JOIN users u ON s.user_id = u.user_id 
             WHERE s.is_active = 1

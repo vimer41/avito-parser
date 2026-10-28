@@ -22,7 +22,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboar
 
 import config
 import database
-from freshness import freshness_status
+from freshness import freshness_status, publication_age_seconds
 from request_budget import get_network_block_state, RequestDeferred, RequestBudgetExceeded
 from runtime_metrics import METRICS
 from parser import AvitoParser, AvitoItem
@@ -721,6 +721,33 @@ class ParserPool:
         return self.parsers[index % len(self.parsers)]
 
 
+def parse_created_epoch(radar: dict) -> Optional[float]:
+    """Parse radar creation timestamp into unix epoch seconds."""
+    epoch = radar.get("created_epoch")
+    if epoch is not None:
+        try:
+            return float(epoch)
+        except (ValueError, TypeError):
+            pass
+    raw = radar.get("created_at")
+    if not raw:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    try:
+        dt = datetime.datetime.strptime(str(raw).strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        pass
+    try:
+        dt = datetime.datetime.fromisoformat(str(raw).strip())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
 async def process_collected_group_fanout(
     clean_url: str,
     radars_for_url: List[dict],
@@ -847,21 +874,38 @@ async def process_collected_group_fanout(
             and previous_processed_at > 0
             and (now_epoch - previous_processed_at) > (max_age_min * 60)
         )
-        if is_resumed_radar:
-            effective_age_min = 10
-        elif is_downtime_catchup:
-            effective_age_min = config.CATCHUP_MAX_AGE_MINUTES
-        else:
-            effective_age_min = 30
+        radar_created_epoch = parse_created_epoch(radar)
 
         ages = {}
         normal_fresh_flags = {}
         for item in new_items:
             disc_at = collection.discovery_times.get(item.item_id, now_epoch)
-            ages[item.item_id] = freshness_status(item.date, item.timestamp, effective_age_min, now=disc_at)
-            normal_fresh_flags[item.item_id] = (
-                freshness_status(item.date, item.timestamp, max_age_min, now=disc_at) is True
-            )
+            pub_age = publication_age_seconds(item.date, item.timestamp, now=disc_at)
+
+            if is_resumed_radar:
+                # Радар только что снят с паузы: догоняем и отправляем лоты за последние 10 минут!
+                is_fresh = (pub_age is not None and pub_age <= 10 * 60)
+            elif is_downtime_catchup:
+                is_fresh = (pub_age is not None and pub_age <= config.CATCHUP_MAX_AGE_MINUTES * 60)
+            elif radar_created_epoch is not None:
+                # Обычный скан (включая только что созданный радар):
+                # Если лот был опубликован ДО создания радара, мы его НЕ шлём (только для снятых с паузы)
+                if pub_age is not None:
+                    item_pub_epoch = disc_at - pub_age
+                    if item_pub_epoch < (radar_created_epoch - 30):
+                        is_fresh = False  # Существовал до создания радара
+                    else:
+                        is_fresh = (pub_age <= 30 * 60)
+                else:
+                    if (now_epoch - radar_created_epoch) < 120:
+                        is_fresh = False  # Первые 2 минуты без точной даты — считаем фоновыми
+                    else:
+                        is_fresh = None
+            else:
+                is_fresh = freshness_status(item.date, item.timestamp, 30, now=disc_at)
+
+            ages[item.item_id] = is_fresh
+            normal_fresh_flags[item.item_id] = is_fresh is True
 
         unknown_ids = {item_id for item_id, status in ages.items() if status is None}
         fresh_items = [item for item in new_items if ages[item.item_id] is True]

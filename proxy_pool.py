@@ -163,6 +163,9 @@ class ProxyClient:
         self.configured_rate: float = float(
             config.PROXY_RATE_LIMIT if configured_rate is None else configured_rate
         )
+        self.is_direct: bool = (self.proxy_url is None)
+        if self.is_direct:
+            self.configured_rate = max(1.0, self.configured_rate)
         self.effective_rate: float = self.configured_rate
         self.max_in_flight: int = max(
             1, int(config.PROXY_MAX_IN_FLIGHT if max_in_flight is None else max_in_flight)
@@ -229,6 +232,8 @@ class ProxyClient:
     def is_available(self, now: float | None = None) -> bool:
         if self._draining:
             return False
+        if self.is_direct:
+            return True
         cur = self._monotonic() if now is None else now
         if self._state == "quarantined":
             if cur < self.quarantined_until:
@@ -239,6 +244,8 @@ class ProxyClient:
         return True
 
     def cooldown_remaining(self, now: float | None = None) -> float:
+        if self.is_direct:
+            return 0.0
         cur = self._monotonic() if now is None else now
         if self.state == "quarantined":
             return max(0.0, self.quarantined_until - cur)
@@ -391,6 +398,14 @@ class ProxyClient:
         retry_after_seconds: float | None = None,
     ) -> float:
         now = self._monotonic()
+        if self.is_direct:
+            self.block_streak = 0
+            self.recovery_success_streak = 0
+            self.effective_rate = max(1.0, float(self.configured_rate or 1.0))
+            self.quarantined_until = 0.0
+            self._state = "healthy"
+            self._sync_metrics_state()
+            return 0.0
         self.block_streak += 1
         self.recovery_success_streak = 0
         self.effective_rate = max(
@@ -416,6 +431,11 @@ class ProxyClient:
         return self.record_final_block(reason=reason, retry_after_seconds=retry_after)
 
     def record_transport_error(self, *, reason: str = "transport") -> float:
+        if self.is_direct:
+            self.quarantined_until = 0.0
+            self._state = "healthy"
+            self._sync_metrics_state()
+            return 0.0
         self.record_raw_http_response(None, 0.0, is_transport_error=True)
         return self.cooldown_remaining()
 
@@ -461,6 +481,12 @@ class ProxyClient:
         )
 
     def _enter_quarantine(self, now: float, duration_seconds: float, *, reason: str) -> None:
+        if self.is_direct:
+            self.quarantined_until = 0.0
+            self.quarantine_reason = ""
+            self._state = "healthy"
+            self._sync_metrics_state()
+            return
         until = now + max(1.0, float(duration_seconds))
         if until > self.quarantined_until:
             self.quarantined_until = until
