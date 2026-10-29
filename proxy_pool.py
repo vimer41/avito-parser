@@ -675,6 +675,18 @@ class ProxyPool:
         config.ALLOW_DIRECT_AVITO = bool(enabled)
         return await self.reload_async(allow_direct=bool(enabled))
 
+    async def set_single_proxy_async(self, proxy_url: str | None) -> dict[str, Any]:
+        """Switch to one proxy (or back to direct/env when None) without restarting the bot."""
+        normalized = parse_and_validate_proxy_line(proxy_url) if proxy_url else None
+        config.PROXY_URL = normalized
+        return await self.reload_async(fallback_proxy_url=normalized or "")
+
+    @staticmethod
+    def pool_file_overrides_single_proxy() -> bool:
+        """A readable PROXY_POOL_FILE always wins over PROXY_URL in _resolve_urls."""
+        pool_file = (config.PROXY_POOL_FILE or "").strip()
+        return bool(pool_file) and Path(pool_file).expanduser().is_file()
+
     async def _cleanup_draining(self) -> None:
         still_draining: list[ProxyClient] = []
         for client in list(self._draining_clients):

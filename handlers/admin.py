@@ -1274,3 +1274,142 @@ async def cmd_admin_reload_proxies(message: Message):
             "Текущий активный пул оставлен без изменений.",
             parse_mode="HTML",
         )
+
+
+# ── /proxy: подключение и проверка одного прокси без перезапуска ─────────
+
+PROXY_HELP = (
+    "• <code>/proxy http://логин:пароль@IP:порт</code> — проверить и подключить\n"
+    "  (подходит и формат <code>IP:порт:логин:пароль</code>, а также socks5://)\n"
+    "• <code>/proxy test</code> — проверить текущий канал (прокси или IP сервера)\n"
+    "• <code>/proxy off</code> — отключить прокси из бота"
+)
+
+FAILURE_LABELS = {
+    "timeout": "таймаут (прокси медленный или мёртвый)",
+    "network": "сетевая ошибка (прокси недоступен или неверные данные)",
+    "forbidden": "Авито заблокировал IP (403)",
+    "rate_limit": "Авито ограничил частоту (429)",
+    "challenge": "антибот-проверка не пройдена",
+    "cooldown": "канал на паузе после блокировки",
+    "catalog_missing": "страница без каталога (логин/заглушка)",
+}
+
+
+def _format_probe(result) -> str:
+    lines = [
+        f"🧪 <b>Проверка канала</b> <code>{html.escape(result.masked_url)}</code>",
+        f"Поиск: <code>{html.escape(result.target_url[:90])}</code>",
+        "",
+    ]
+    for index, attempt in enumerate(result.attempts, 1):
+        if attempt.ok:
+            lines.append(f"{index}) ✅ {attempt.elapsed_ms} мс · лотов: {attempt.items}")
+        else:
+            label = FAILURE_LABELS.get(attempt.failure, attempt.failure)
+            status = f" (HTTP {attempt.status})" if attempt.status else ""
+            lines.append(f"{index}) ❌ {attempt.elapsed_ms} мс · {html.escape(label)}{status}")
+    median = result.median_ok_ms
+    lines.append("")
+    lines.append(
+        f"Итог: <b>{result.successes}/{len(result.attempts)}</b> успешно"
+        + (f", медиана <b>{median} мс</b>" if median is not None else "")
+    )
+    return "\n".join(lines)
+
+
+async def _probe_target_url() -> str | None:
+    """Probe on a real radar link when there is one: that is what the proxy will be scanning."""
+    try:
+        searches = await database.get_all_active_searches()
+    except Exception:
+        return None
+    return searches[0]["url"] if searches else None
+
+
+def _current_channel_text(pool) -> str:
+    if pool.pool_file_overrides_single_proxy():
+        return f"📄 файл пула прокси ({len(pool.clients)} шт.)"
+    if config.PROXY_URL:
+        from runtime_metrics import mask_proxy_url
+        return f"🟢 прокси <code>{html.escape(mask_proxy_url(config.PROXY_URL))}</code>"
+    if config.ALLOW_DIRECT_AVITO:
+        return "🟡 IP сервера (прямой режим)"
+    return "⏸ нет канала (прокси не задан, прямой режим выключен)"
+
+
+@router.message(Command("proxy"))
+async def cmd_admin_proxy(message: Message):
+    if not config.is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+
+    from proxy_check import probe_channel
+    from proxy_pool import get_proxy_pool, parse_and_validate_proxy_line
+    from runtime_metrics import sanitize_proxy_credentials
+
+    pool = get_proxy_pool()
+    parts = (message.text or "").strip().split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if not arg:
+        lines = [f"🌐 <b>Текущий канал:</b> {_current_channel_text(pool)}"]
+        for snap in pool.snapshots():
+            lines.append(
+                f"• <code>{html.escape(str(snap.get('masked_url')))}</code> [{snap.get('state')}] "
+                f"rate <code>{float(snap.get('effective_rate') or 0):.2f}</code> req/s"
+            )
+        lines += ["", PROXY_HELP]
+        await message.answer("\n".join(lines), parse_mode="HTML")
+        return
+
+    if arg.lower() in ("off", "выкл", "0"):
+        await database.set_bot_setting("proxy_url", "")
+        await pool.set_single_proxy_async(config.parse_proxy(config.RAW_PROXY))
+        await message.answer(f"🔌 Прокси из бота отключён.\n🌐 <b>Сейчас:</b> {_current_channel_text(pool)}", parse_mode="HTML")
+        return
+
+    target = await _probe_target_url()
+
+    if arg.lower() in ("test", "тест", "check"):
+        status = await message.answer("⏳ Проверяю текущий канал: 3 запроса к Авито подряд…")
+        current = None if pool.pool_file_overrides_single_proxy() else config.PROXY_URL
+        result = await probe_channel(current, target)
+        await status.edit_text(_format_probe(result), parse_mode="HTML")
+        return
+
+    # The command text carries the proxy password: do not leave it in the chat history.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        normalized = parse_and_validate_proxy_line(arg)
+    except ValueError as exc:
+        await message.answer(
+            f"❌ {html.escape(sanitize_proxy_credentials(str(exc)))}\n\n{PROXY_HELP}", parse_mode="HTML"
+        )
+        return
+
+    status = await message.answer("⏳ Проверяю прокси: 3 запроса к Авито подряд…")
+    result = await probe_channel(normalized, target)
+    report = _format_probe(result)
+    if result.successes == 0:
+        await status.edit_text(
+            report + "\n\n🚫 <b>Прокси не подключён</b>: ни один запрос не прошёл. Текущий канал не изменён.",
+            parse_mode="HTML",
+        )
+        return
+
+    await database.set_bot_setting("proxy_url", normalized)
+    await pool.set_single_proxy_async(normalized)
+    note = ""
+    if pool.pool_file_overrides_single_proxy():
+        note = "\n⚠️ На сервере задан PROXY_POOL_FILE — он важнее, этот прокси не используется, пока файл существует."
+    await status.edit_text(
+        report
+        + f"\n\n✅ <b>Прокси подключён</b> и сохранён: радары уже сканируют через него, перезапуск не нужен.{note}"
+        + "\nСкорость и блокировки смотрите в /stats, вернуть IP сервера — <code>/proxy off</code>.",
+        parse_mode="HTML",
+    )
+    logger.info("Admin %s switched scanning to proxy %s", message.from_user.id, result.proxy_id)

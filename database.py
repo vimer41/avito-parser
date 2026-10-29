@@ -841,6 +841,11 @@ async def init_db():
             s_row = await cur.fetchone()
             if s_row is not None:
                 config.ALLOW_DIRECT_AVITO = str(s_row[0]) == "1"
+        # A proxy set from the bot (/proxy) overrides PROXY_URL from .env.
+        async with db.execute("SELECT value FROM bot_settings WHERE key = 'proxy_url'") as cur:
+            p_row = await cur.fetchone()
+            if p_row is not None and str(p_row[0]).strip():
+                config.PROXY_URL = str(p_row[0]).strip()
         logger.info("База данных успешно инициализирована")
 
 
