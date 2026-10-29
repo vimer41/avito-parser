@@ -18,6 +18,10 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.directory = tempfile.TemporaryDirectory(prefix="avito-ui-")
         self.db_patch = patch.object(database, "DB_PATH", Path(self.directory.name) / "test.db")
         self.db_patch.start()
+        # Network-mode buttons mutate process-wide config; keep it from leaking into other tests.
+        self.net_patches = [patch.object(config, "NET_MODE", "auto"), patch.object(config, "PROXY_URL", None)]
+        for net_patch in self.net_patches:
+            net_patch.start()
         await database.init_db()
         self.user_id = 123456
         await database.get_or_create_user(self.user_id, username="fixture_user", first_name="Fixture")
@@ -27,6 +31,8 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.close_dispatcher()
+        for net_patch in reversed(self.net_patches):
+            net_patch.stop()
         self.db_patch.stop()
         self.directory.cleanup()
 
@@ -183,13 +189,17 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_message(text="/direct_mode off", user_id=config.ADMIN_ID)
         self.assertFalse(config.ALLOW_DIRECT_AVITO)
         self.assertEqual(await database.get_bot_setting("allow_direct_avito"), "0")
+        self.assertEqual(config.NET_MODE, "proxy")
 
         await self.dispatch_callback("admin_toggle_direct_avito:alert", config.ADMIN_ID)
         self.assertTrue(config.ALLOW_DIRECT_AVITO)
         self.assertEqual(await database.get_bot_setting("allow_direct_avito"), "1")
+        self.assertEqual(config.NET_MODE, "direct")
 
     async def test_admin_list_exposes_tariff_duration_confirmation_and_replay_safety(self):
         await self.dispatch_message(text="/admin", user_id=config.ADMIN_ID)
+        self.assertTrue({"admin_page:0", "admin_net", "admin_runtime_stats"} <= set(self.callback_values()))
+        await self.dispatch_callback("admin_page:0", config.ADMIN_ID)
         self.assertIn(f"admin_user:{self.user_id}:0", self.callback_values())
         await self.dispatch_callback(f"admin_user:{self.user_id}:0", config.ADMIN_ID)
         self.assertIn(f"admin_sub_menu:{self.user_id}:0", self.callback_values())

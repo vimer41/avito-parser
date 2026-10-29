@@ -36,7 +36,7 @@ class OfflineTelegramSession(BaseSession):
             return Message(message_id=len(self.calls), date=datetime.now(timezone.utc),
                            chat=Chat(id=int(chat_id), type="private"),
                            from_user=User(id=bot.id, is_bot=True, first_name="Fixture Bot"),
-                           text=getattr(method, "text", None))
+                           text=getattr(method, "text", None)).as_(bot)  # like the real session: bound to the bot
         return True
 
     async def stream_content(self, url, headers=None, timeout=30, chunk_size=65536, raise_for_status=True):

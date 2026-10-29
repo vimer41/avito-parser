@@ -15,6 +15,7 @@ router = Router()
 
 class AdminStates(StatesGroup):
     waiting_for_user_query = State()
+    waiting_for_proxy = State()
 
 
 @router.callback_query(F.data == "admin_probe")
@@ -504,168 +505,173 @@ async def cb_admin_revoke_prompt(call: CallbackQuery):
 
 # ── Панель администратора (/admin, /users, кнопка в меню) ─────────────
 
-USERS_PER_PAGE = 5
+USERS_PER_PAGE = 8
+
+NET_MODE_TITLES = {
+    "direct": "🖥 Только сервер",
+    "proxy": "🛰 Только прокси",
+    "both": "🔀 Сервер + прокси",
+    "auto": "🤖 Авто",
+}
+NET_MODE_HINTS = {
+    "direct": "Сканирует только IP сервера. Бесплатно, но один IP — ниже скорость и выше риск блокировки.",
+    "proxy": "Сканируют только прокси, IP сервера Авито не видит.",
+    "both": "Сервер и прокси работают вместе и делят нагрузку — больше проверок в секунду.",
+    "auto": "Прокси, если подключён, иначе IP сервера (режим по умолчанию).",
+}
+CHANNEL_STATE_ICONS = {"healthy": "🟢", "degraded": "🟡", "half_open": "🟡", "quarantined": "🔴", "draining": "⚪"}
 
 
-@router.callback_query(F.data == "admin_noop")
-async def cb_admin_noop(call: CallbackQuery):
-    await call.answer()
+def _admin_event(event):
+    """(message, user_id) for both a command message and a button press."""
+    if isinstance(event, CallbackQuery):
+        return event.message, event.from_user.id
+    return event, event.from_user.id
+
+
+async def _show(event, text: str, kb: InlineKeyboardMarkup) -> None:
+    """Edit the screen in place for button presses, send a new message for commands."""
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+    message = event.message if isinstance(event, CallbackQuery) else event
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+def _short_until(dt_val) -> str:
+    """'до 28.11' in MSK for compact list rows."""
+    if not dt_val:
+        return ""
+    try:
+        from datetime import datetime, timedelta
+        raw = str(dt_val).strip()
+        fmt = "%Y-%m-%d %H:%M:%S" if len(raw) >= 19 else "%Y-%m-%d %H:%M"
+        msk = datetime.strptime(raw[:19] if len(raw) >= 19 else raw[:16], fmt) + timedelta(hours=3)
+        return f"до {msk:%d.%m}"
+    except ValueError:
+        return ""
+
+
+def _channel_label(snap: dict) -> str:
+    icon = CHANNEL_STATE_ICONS.get(str(snap.get("state")), "⚪")
+    url = str(snap.get("masked_url") or "")
+    name = "IP сервера" if url.startswith("direct://") else html.escape(url)
+    rate = float(snap.get("effective_rate") or 0.0)
+    extra = ""
+    if snap.get("state") == "quarantined":
+        extra = f" · пауза {int(float(snap.get('quarantine_remaining') or 0))} с"
+    return f"{icon} {name} · <code>{rate:.2f}</code> req/s{extra}"
+
+
+def _net_summary(pool) -> str:
+    clients = pool.clients
+    if not clients:
+        return "⏸ <b>на паузе</b> (нет каналов)"
+    return f"{NET_MODE_TITLES.get(config.NET_MODE, config.NET_MODE)} · каналов: <b>{len(clients)}</b>"
 
 
 @router.message(F.text.in_({"👑 Админ-панель", "👑 Админка"}))
 @router.message(Command("admin"))
-@router.message(Command("users"))
 @router.callback_query(F.data == "admin_refresh")
+async def cmd_admin_home(event):
+    message, user_id = _admin_event(event)
+    if not config.is_admin(user_id):
+        return
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+
+    from proxy_pool import get_proxy_pool
+    from scheduler import get_last_scan_info
+
+    stats = await database.get_system_stats()
+    text = (
+        "👑 <b>Админ-панель</b>\n\n"
+        f"👥 Пользователи: <b>{stats['total_users']}</b> · с доступом <b>{stats['allowed_users']}</b>\n"
+        f"🎯 Радары: <b>{stats['active_searches']}</b> активных из <b>{stats['total_searches']}</b>\n"
+        f"📦 Обработано лотов: <b>{stats['total_seen']}</b>\n"
+        f"🌐 Сеть: {_net_summary(get_proxy_pool())}\n"
+        f"⏱ Последняя проверка: <b>{get_last_scan_info()}</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_page:0"),
+            InlineKeyboardButton(text="🌐 Сеть и прокси", callback_data="admin_net"),
+        ],
+        [
+            InlineKeyboardButton(text="📊 Мониторинг", callback_data="admin_runtime_stats"),
+            InlineKeyboardButton(text="🔍 Найти", callback_data="admin_search_user_prompt"),
+        ],
+        [
+            InlineKeyboardButton(text="💾 База", callback_data="admin_backup"),
+            InlineKeyboardButton(text="📋 Логи", callback_data="admin_logs_menu"),
+        ],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_refresh")],
+    ])
+    await _show(event, text, kb)
+
+
+@router.message(Command("users"))
 @router.callback_query(F.data.startswith("admin_page:"))
 async def cmd_admin_panel(event, page: int = 0):
+    """Список пользователей: одна строка и одна кнопка на человека, все действия — в карточке."""
+    message, user_id = _admin_event(event)
     if isinstance(event, CallbackQuery):
-        message = event.message
-        user_id = event.from_user.id
         if event.data.startswith("admin_page:"):
             try:
                 page = int(event.data.split(":")[1])
             except (ValueError, IndexError):
                 page = 0
         await event.answer()
-    else:
-        message = event
-        user_id = message.from_user.id
-
     if not config.is_admin(user_id):
         return
 
-    stats = await database.get_system_stats()
     all_users = await database.get_all_users()
-    total_users_count = len(all_users)
-    total_pages = max(1, (total_users_count + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
-
-    # Защита границ страниц
-    if page < 0:
-        page = 0
-    elif page >= total_pages:
-        page = total_pages - 1
-
+    total_pages = max(1, (len(all_users) + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    page = min(max(0, page), total_pages - 1)
     start_idx = page * USERS_PER_PAGE
-    end_idx = start_idx + USERS_PER_PAGE
-    page_users = all_users[start_idx:end_idx]
+    page_users = all_users[start_idx:start_idx + USERS_PER_PAGE]
 
-    from proxy_pool import get_proxy_pool
-    pool = get_proxy_pool()
-    real_proxies = [c for c in pool.clients if c.proxy_url is not None]
-    if real_proxies:
-        net_mode_str = f"🟢 <b>Пул прокси ({len(real_proxies)} шт.)</b>"
-    elif config.ALLOW_DIRECT_AVITO:
-        net_mode_str = "🟡 <b>Прямой без прокси (IP сервера, 1.0 req/s)</b>"
-    else:
-        net_mode_str = "⏸ <b>На паузе (прокси нет, прямой режим ВЫКЛ)</b>"
-
-    page_info = f" (Стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
-    text_lines = [
-        "👑 <b>ПАНЕЛЬ УПРАВЛЕНИЯ СИСТЕМОЙ</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 <b>Сводная статистика:</b>\n"
-        f"• 👥 Пользователей: <b>{stats['total_users']}</b> (🟢 {stats['allowed_users']} с доступом)\n"
-        f"• 🎯 Всего радаров: <b>{stats['total_searches']}</b> (🟢 {stats['active_searches']} активно)\n"
-        f"• 📦 Обработано лотов: <b>{stats['total_seen']}</b>\n"
-        f"• 🌐 Режим сети: {net_mode_str}\n"
-        f"• 🛡 Защита: <b>TLS Chameleon / PoW Bypass</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>Пользователи и права доступа{page_info}:</b>\n"
-        "Нажмите «👤 Подписка» под пользователем → выдача / продление → тариф → срок → подтверждение.\n"
-    ]
-
+    page_info = f" · стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+    lines = [f"👥 <b>Пользователи</b> ({len(all_users)}){page_info}", ""]
     buttons = []
     for idx, u in enumerate(page_users, start=start_idx + 1):
         u_id = u["user_id"]
-        is_adm = config.is_admin(u_id)
-        is_allowed = bool(u.get("is_allowed"))
-        uname = f"@{u['username']}" if u.get("username") else f"ID: {u_id}"
-        fname = html.escape(u.get("first_name") or "Без имени")
-
-        has_access = await database.is_user_allowed(u_id)
-        trial_used = bool(u.get("trial_used"))
-        sub_until = u.get("subscription_until")
-        sub_str = database.format_subscription_date(sub_until)
-
-        # Компактный лейбл для кнопок, чтобы верстка не разъезжалась на экранах телефонов
-        btn_tag = f"@{u['username']}" if u.get("username") else str(u_id)
-        if len(btn_tag) > 13:
-            btn_tag = btn_tag[:11] + ".."
-
-        if is_adm:
-            text_lines.append(f"{idx}. 👑 <b>{fname}</b> ({uname}) — <i>Администратор</i>")
-        elif has_access and not is_allowed and trial_used:
-            text_lines.append(f"{idx}. 🎁 <b>{fname}</b> ({uname}) — <i>[Триал 6ч · 1 радар] {sub_str}</i>")
-            buttons.append([
-                InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke_prompt:{u_id}:{page}"),
-                InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")
-            ])
-        elif has_access:
-            plan = (u.get("tariff_plan") or "standart").upper()
-            text_lines.append(f"{idx}. 🟢 <b>{fname}</b> ({uname}) — <i>[{plan}] {sub_str}</i>")
-            buttons.append([
-                InlineKeyboardButton(text=f"🚫 Блок {btn_tag}", callback_data=f"admin_revoke_prompt:{u_id}:{page}"),
-                InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")
-            ])
+        fname = u.get("first_name") or "Без имени"
+        tag = f"@{u['username']}" if u.get("username") else str(u_id)
+        if config.is_admin(u_id):
+            icon, status = "👑", "админ"
+        elif await database.is_user_allowed(u_id):
+            trial = not u.get("is_allowed") and u.get("trial_used")
+            icon = "🎁" if trial else "🟢"
+            status = "триал" if trial else (u.get("tariff_plan") or "standart").upper()
+            until = _short_until(u.get("subscription_until"))
+            status = f"{status} {until}".strip()
         else:
-            text_lines.append(f"{idx}. 🔴 <b>{fname}</b> ({uname}) — <i>Истёк доступ ({sub_str})</i>")
-            buttons.append([
-                InlineKeyboardButton(text=f"💳 Выдать {btn_tag}", callback_data=f"admin_sub_menu:{u_id}:{page}"),
-                InlineKeyboardButton(text=f"🗑 Удалить {btn_tag}", callback_data=f"admin_purge_user:{u_id}:{page}")
-            ])
+            icon, status = "🔴", "нет доступа"
+        lines.append(f"{idx}. {icon} <b>{html.escape(fname)}</b> {html.escape(tag)} — {status}")
+        label = f"{icon} {fname[:18]} · {tag[:16]}"
+        callback = "admin_noop" if config.is_admin(u_id) else f"admin_user:{u_id}:{page}"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=callback)])
 
-        if not is_adm:
-            buttons.append([InlineKeyboardButton(text=f"👤 Подписка / платежи {btn_tag}", callback_data=f"admin_user:{u_id}:{page}")])
+    if not page_users:
+        lines.append("Пока никого нет.")
+    lines.append("\nНажмите на пользователя: подписка, радары, платежи, блок и удаление — в карточке.")
 
-    # Панель постраничной навигации (только если пользователей > 5)
     if total_pages > 1:
-        nav_buttons = []
-        if page > 0:
-            nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin_page:{page - 1}"))
-        else:
-            nav_buttons.append(InlineKeyboardButton(text="⏹", callback_data="admin_noop"))
-
-        nav_buttons.append(InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="admin_noop"))
-
-        if page < total_pages - 1:
-            nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin_page:{page + 1}"))
-        else:
-            nav_buttons.append(InlineKeyboardButton(text="⏹", callback_data="admin_noop"))
-
-        buttons.append(nav_buttons)
-
+        buttons.append([
+            InlineKeyboardButton(text="◀️", callback_data=f"admin_page:{page - 1}" if page > 0 else "admin_noop"),
+            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="admin_noop"),
+            InlineKeyboardButton(text="▶️", callback_data=f"admin_page:{page + 1}" if page < total_pages - 1 else "admin_noop"),
+        ])
     buttons.append([
-        InlineKeyboardButton(text="🔍 Поиск по ID / @username", callback_data="admin_search_user_prompt")
+        InlineKeyboardButton(text="🔍 Найти", callback_data="admin_search_user_prompt"),
+        InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh"),
     ])
-    buttons.append([
-        InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup"),
-        InlineKeyboardButton(text="📋 Скачать логи", callback_data="admin_logs_menu")
-    ])
-    buttons.append([
-        InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"admin_page:{page}")
-    ])
-    direct_btn_label = (
-        "🌐 Прямой парсинг (без прокси): ВКЛ 🟢"
-        if config.ALLOW_DIRECT_AVITO
-        else "🌐 Прямой парсинг (без прокси): ВЫКЛ 🔴"
-    )
-    buttons.append([
-        InlineKeyboardButton(text=direct_btn_label, callback_data=f"admin_toggle_direct_avito:panel:{page}"),
-        InlineKeyboardButton(text="📊 Статистика (/stats)", callback_data="admin_runtime_stats"),
-    ])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    full_text = "\n".join(text_lines)
-    if isinstance(event, CallbackQuery):
-        try:
-            await message.edit_text(full_text, reply_markup=kb, parse_mode="HTML")
-            return
-        except Exception as e:
-            if "message is not modified" in str(e).lower():
-                return
-            pass
-
-    await message.answer(full_text, reply_markup=kb, parse_mode="HTML")
+    await _show(event, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 @router.callback_query(F.data.startswith("admin_revoke:"))
@@ -1134,17 +1140,12 @@ async def cmd_admin_stats(event):
     except Exception:
         pass
 
-    direct_btn_label = (
-        "🌐 Прямой парсинг (без прокси): ВКЛ 🟢"
-        if config.ALLOW_DIRECT_AVITO
-        else "🌐 Прямой парсинг (без прокси): ВЫКЛ 🔴"
-    )
     stats_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=direct_btn_label, callback_data="admin_toggle_direct_avito:stats")],
         [
-            InlineKeyboardButton(text="🔄 Обновить /stats", callback_data="admin_runtime_stats"),
-            InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_refresh"),
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_runtime_stats"),
+            InlineKeyboardButton(text="🌐 Сеть и прокси", callback_data="admin_net"),
         ],
+        [InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh")],
     ])
 
     chunks = METRICS.format_stats_messages()
@@ -1153,56 +1154,32 @@ async def cmd_admin_stats(event):
         await message.answer(chunk, reply_markup=stats_kb if is_last else None, parse_mode="HTML")
 
 
+async def _set_direct_legacy(enabled: bool) -> dict:
+    """Old on/off switch for the server IP, mapped onto network modes."""
+    from proxy_pool import get_proxy_pool
+
+    pool = get_proxy_pool()
+    config.ALLOW_DIRECT_AVITO = bool(enabled)
+    await database.set_bot_setting("allow_direct_avito", "1" if enabled else "0")
+    mode = ("both" if pool.has_configured_proxy() else "direct") if enabled else "proxy"
+    await database.set_bot_setting("net_mode", mode)
+    return await pool.set_net_mode_async(mode)
+
+
 @router.callback_query(F.data.startswith("admin_toggle_direct_avito"))
 async def cb_admin_toggle_direct_avito(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
-
-    from proxy_pool import get_proxy_pool
     new_state = not bool(config.ALLOW_DIRECT_AVITO)
-    await database.set_bot_setting("allow_direct_avito", "1" if new_state else "0")
-    pool = get_proxy_pool()
-    res = await pool.set_direct_mode_async(new_state)
-
-    status_toast = (
-        f"✅ Прямой парсинг без прокси ВКЛЮЧЕН (активных каналов: {res['total']})"
-        if new_state
-        else f"🛑 Прямой парсинг без прокси ВЫКЛЮЧЕН (активных каналов: {res['total']})"
+    res = await _set_direct_legacy(new_state)
+    await call.answer(
+        f"{'✅ IP сервера подключён к сканированию' if new_state else '🛑 IP сервера отключён от сканирования'} "
+        f"(каналов: {res['total']})",
+        show_alert=True,
     )
-    await call.answer(status_toast, show_alert=True)
-
-    parts = (call.data or "").split(":")
-    source = parts[1] if len(parts) > 1 else "panel"
-    if source == "panel":
-        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-        await cmd_admin_panel(call, page=page)
-    elif source == "stats":
-        await cmd_admin_stats(call)
-    else:
-        state_badge = "🟢 <b>ВКЛЮЧЕН</b> (1.0 req/s с IP сервера)" if new_state else "🔴 <b>ВЫКЛЮЧЕН</b> (на паузе без прокси)"
-        toggle_label = (
-            "🌐 Прямой парсинг (без прокси): ВКЛ 🟢"
-            if new_state
-            else "🌐 Прямой парсинг (без прокси): ВЫКЛ 🔴"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=toggle_label, callback_data="admin_toggle_direct_avito:alert")],
-            [
-                InlineKeyboardButton(text="📊 Открыть /stats", callback_data="admin_runtime_stats"),
-                InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_refresh"),
-            ],
-        ])
-        try:
-            await call.message.edit_text(
-                f"🌐 <b>Режим прямого парсинга без прокси:</b> {state_badge}\n\n"
-                f"• Активных каналов в пуле: <code>{res['total']}</code>\n"
-                "Настройка сохранена в БД и действует сразу без перезапуска.",
-                reply_markup=kb,
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+    text, kb = await _render_net()
+    await _show(call, text, kb)
 
 
 @router.message(Command("direct_mode"))
@@ -1211,8 +1188,6 @@ async def cmd_admin_direct_mode(message: Message):
     if not config.is_admin(message.from_user.id):
         await message.answer("⛔ У вас нет прав администратора.")
         return
-
-    from proxy_pool import get_proxy_pool
     parts = (message.text or "").strip().split()
     if len(parts) > 1 and parts[1].lower() in ("1", "on", "true", "yes", "вкл"):
         new_state = True
@@ -1220,31 +1195,9 @@ async def cmd_admin_direct_mode(message: Message):
         new_state = False
     else:
         new_state = not bool(config.ALLOW_DIRECT_AVITO)
-
-    await database.set_bot_setting("allow_direct_avito", "1" if new_state else "0")
-    pool = get_proxy_pool()
-    res = await pool.set_direct_mode_async(new_state)
-
-    state_badge = "🟢 ВКЛЮЧЕН (1.0 req/s с IP сервера)" if new_state else "🔴 ВЫКЛЮЧЕН"
-    toggle_label = (
-        "🌐 Прямой парсинг (без прокси): ВКЛ 🟢"
-        if new_state
-        else "🌐 Прямой парсинг (без прокси): ВЫКЛ 🔴"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=toggle_label, callback_data="admin_toggle_direct_avito:alert")],
-        [
-            InlineKeyboardButton(text="📊 Открыть /stats", callback_data="admin_runtime_stats"),
-            InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_refresh"),
-        ],
-    ])
-    await message.answer(
-        f"🌐 <b>Прямой парсинг Авито (без прокси): {state_badge}</b>\n\n"
-        f"• Активных каналов в пуле: <code>{res['total']}</code>\n"
-        "• Настройка сохранена в базе данных и применена мгновенно.",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+    await _set_direct_legacy(new_state)
+    text, kb = await _render_net()
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @router.message(Command("reload_proxies"))
@@ -1276,13 +1229,13 @@ async def cmd_admin_reload_proxies(message: Message):
         )
 
 
-# ── /proxy: подключение и проверка одного прокси без перезапуска ─────────
+# ── Сеть и прокси: режимы, проверка каналов, подключение прокси без перезапуска ──
 
-PROXY_HELP = (
-    "• <code>/proxy http://логин:пароль@IP:порт</code> — проверить и подключить\n"
-    "  (подходит и формат <code>IP:порт:логин:пароль</code>, а также socks5://)\n"
-    "• <code>/proxy test</code> — проверить текущий канал (прокси или IP сервера)\n"
-    "• <code>/proxy off</code> — отключить прокси из бота"
+NET_MODE_BUTTONS = (("direct", "🖥 Сервер"), ("proxy", "🛰 Прокси"), ("both", "🔀 Оба"))
+
+PROXY_FORMAT_HELP = (
+    "Формат: <code>http://логин:пароль@IP:порт</code>\n"
+    "или <code>IP:порт:логин:пароль</code>, поддерживается <code>socks5://</code>."
 )
 
 FAILURE_LABELS = {
@@ -1295,13 +1248,14 @@ FAILURE_LABELS = {
     "catalog_missing": "страница без каталога (логин/заглушка)",
 }
 
+NET_BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🌐 К настройкам сети", callback_data="admin_net")],
+])
+
 
 def _format_probe(result) -> str:
-    lines = [
-        f"🧪 <b>Проверка канала</b> <code>{html.escape(result.masked_url)}</code>",
-        f"Поиск: <code>{html.escape(result.target_url[:90])}</code>",
-        "",
-    ]
+    name = "IP сервера" if result.masked_url.startswith("direct://") else result.masked_url
+    lines = [f"🧪 <b>{html.escape(name)}</b>"]
     for index, attempt in enumerate(result.attempts, 1):
         if attempt.ok:
             lines.append(f"{index}) ✅ {attempt.elapsed_ms} мс · лотов: {attempt.items}")
@@ -1310,7 +1264,6 @@ def _format_probe(result) -> str:
             status = f" (HTTP {attempt.status})" if attempt.status else ""
             lines.append(f"{index}) ❌ {attempt.elapsed_ms} мс · {html.escape(label)}{status}")
     median = result.median_ok_ms
-    lines.append("")
     lines.append(
         f"Итог: <b>{result.successes}/{len(result.attempts)}</b> успешно"
         + (f", медиана <b>{median} мс</b>" if median is not None else "")
@@ -1319,7 +1272,7 @@ def _format_probe(result) -> str:
 
 
 async def _probe_target_url() -> str | None:
-    """Probe on a real radar link when there is one: that is what the proxy will be scanning."""
+    """Probe on a real radar link when there is one: that is what the channel will be scanning."""
     try:
         searches = await database.get_all_active_searches()
     except Exception:
@@ -1327,89 +1280,220 @@ async def _probe_target_url() -> str | None:
     return searches[0]["url"] if searches else None
 
 
-def _current_channel_text(pool) -> str:
+async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    from proxy_pool import get_proxy_pool
+
+    pool = get_proxy_pool()
+    mode = config.NET_MODE
+    lines = [
+        "🌐 <b>Сеть и прокси</b>",
+        "",
+        f"Режим: <b>{NET_MODE_TITLES.get(mode, mode)}</b>",
+        f"<i>{NET_MODE_HINTS.get(mode, '')}</i>",
+        "",
+        "<b>Каналы сканирования:</b>",
+    ]
+    snaps = pool.snapshots()
+    lines += [_channel_label(snap) for snap in snaps] or ["⏸ нет активных каналов — сканирование стоит"]
+    if mode in ("proxy", "both") and not pool.has_configured_proxy():
+        lines += ["", "⚠️ Прокси не подключён — нажмите «➕ Подключить прокси»."]
     if pool.pool_file_overrides_single_proxy():
-        return f"📄 файл пула прокси ({len(pool.clients)} шт.)"
+        lines += ["", "📄 Прокси берутся из файла PROXY_POOL_FILE на сервере."]
+    if note:
+        lines += ["", note]
+
+    buttons = [
+        [
+            InlineKeyboardButton(text=("✅ " if key == mode else "") + title, callback_data=f"admin_net_mode:{key}")
+            for key, title in NET_MODE_BUTTONS
+        ],
+        [InlineKeyboardButton(text="🧪 Проверить каналы", callback_data="admin_net_probe")],
+    ]
     if config.PROXY_URL:
-        from runtime_metrics import mask_proxy_url
-        return f"🟢 прокси <code>{html.escape(mask_proxy_url(config.PROXY_URL))}</code>"
-    if config.ALLOW_DIRECT_AVITO:
-        return "🟡 IP сервера (прямой режим)"
-    return "⏸ нет канала (прокси не задан, прямой режим выключен)"
+        buttons.append([
+            InlineKeyboardButton(text="🔁 Заменить прокси", callback_data="admin_net_add"),
+            InlineKeyboardButton(text="🗑 Убрать прокси", callback_data="admin_net_proxy_off"),
+        ])
+    else:
+        buttons.append([InlineKeyboardButton(text="➕ Подключить прокси", callback_data="admin_net_add")])
+    buttons.append([
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_net"),
+        InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-@router.message(Command("proxy"))
-async def cmd_admin_proxy(message: Message):
-    if not config.is_admin(message.from_user.id):
-        await message.answer("⛔ У вас нет прав администратора.")
-        return
+async def _set_net_mode(mode: str) -> None:
+    from proxy_pool import get_proxy_pool
 
+    await database.set_bot_setting("net_mode", mode)
+    await get_proxy_pool().set_net_mode_async(mode)
+
+
+async def _probe_all_channels() -> str:
+    from proxy_check import DEFAULT_PROBE_URL, probe_channel
+    from proxy_pool import get_proxy_pool
+
+    clients = list(get_proxy_pool().clients)
+    if not clients:
+        return "⏸ Нет активных каналов — проверять нечего."
+    target = await _probe_target_url()
+    reports = [_format_probe(await probe_channel(client.proxy_url, target)) for client in clients]
+    shown = (target or DEFAULT_PROBE_URL)[:80]
+    return f"🧪 <b>Проверка каналов</b> · 3 запроса подряд\nПоиск: <code>{html.escape(shown)}</code>\n\n" + "\n\n".join(reports)
+
+
+async def _connect_proxy(message: Message, raw: str) -> None:
+    """Validate, live-probe and switch to a proxy; the message with the password is deleted."""
     from proxy_check import probe_channel
     from proxy_pool import get_proxy_pool, parse_and_validate_proxy_line
     from runtime_metrics import sanitize_proxy_credentials
 
-    pool = get_proxy_pool()
-    parts = (message.text or "").strip().split(maxsplit=1)
-    arg = parts[1].strip() if len(parts) > 1 else ""
-
-    if not arg:
-        lines = [f"🌐 <b>Текущий канал:</b> {_current_channel_text(pool)}"]
-        for snap in pool.snapshots():
-            lines.append(
-                f"• <code>{html.escape(str(snap.get('masked_url')))}</code> [{snap.get('state')}] "
-                f"rate <code>{float(snap.get('effective_rate') or 0):.2f}</code> req/s"
-            )
-        lines += ["", PROXY_HELP]
-        await message.answer("\n".join(lines), parse_mode="HTML")
-        return
-
-    if arg.lower() in ("off", "выкл", "0"):
-        await database.set_bot_setting("proxy_url", "")
-        await pool.set_single_proxy_async(config.parse_proxy(config.RAW_PROXY))
-        await message.answer(f"🔌 Прокси из бота отключён.\n🌐 <b>Сейчас:</b> {_current_channel_text(pool)}", parse_mode="HTML")
-        return
-
-    target = await _probe_target_url()
-
-    if arg.lower() in ("test", "тест", "check"):
-        status = await message.answer("⏳ Проверяю текущий канал: 3 запроса к Авито подряд…")
-        current = None if pool.pool_file_overrides_single_proxy() else config.PROXY_URL
-        result = await probe_channel(current, target)
-        await status.edit_text(_format_probe(result), parse_mode="HTML")
-        return
-
-    # The command text carries the proxy password: do not leave it in the chat history.
     try:
         await message.delete()
     except Exception:
         pass
     try:
-        normalized = parse_and_validate_proxy_line(arg)
+        normalized = parse_and_validate_proxy_line(raw)
     except ValueError as exc:
         await message.answer(
-            f"❌ {html.escape(sanitize_proxy_credentials(str(exc)))}\n\n{PROXY_HELP}", parse_mode="HTML"
+            f"❌ {html.escape(sanitize_proxy_credentials(str(exc)))}\n\n{PROXY_FORMAT_HELP}",
+            reply_markup=NET_BACK_KB, parse_mode="HTML",
         )
         return
 
     status = await message.answer("⏳ Проверяю прокси: 3 запроса к Авито подряд…")
-    result = await probe_channel(normalized, target)
+    result = await probe_channel(normalized, await _probe_target_url())
     report = _format_probe(result)
     if result.successes == 0:
         await status.edit_text(
-            report + "\n\n🚫 <b>Прокси не подключён</b>: ни один запрос не прошёл. Текущий канал не изменён.",
-            parse_mode="HTML",
+            report + "\n\n🚫 <b>Прокси не подключён</b>: ни один запрос не прошёл. Текущие настройки не изменены.",
+            reply_markup=NET_BACK_KB, parse_mode="HTML",
         )
         return
 
     await database.set_bot_setting("proxy_url", normalized)
-    await pool.set_single_proxy_async(normalized)
-    note = ""
-    if pool.pool_file_overrides_single_proxy():
-        note = "\n⚠️ На сервере задан PROXY_POOL_FILE — он важнее, этот прокси не используется, пока файл существует."
-    await status.edit_text(
-        report
-        + f"\n\n✅ <b>Прокси подключён</b> и сохранён: радары уже сканируют через него, перезапуск не нужен.{note}"
-        + "\nСкорость и блокировки смотрите в /stats, вернуть IP сервера — <code>/proxy off</code>.",
-        parse_mode="HTML",
+    await get_proxy_pool().set_single_proxy_async(normalized)
+    note = "✅ <b>Прокси подключён</b> — применено сразу, без перезапуска."
+    if config.NET_MODE == "direct":
+        # In server-only mode the new proxy would sit idle.
+        await _set_net_mode("proxy")
+        note += "\nРежим переключён на «🛰 Только прокси» — выберите «🔀 Оба», чтобы работали и сервер, и прокси."
+    text, kb = await _render_net(report + "\n\n" + note)
+    await status.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    logger.info("Admin %s connected proxy %s", message.from_user.id, result.proxy_id)
+
+
+async def _disconnect_proxy() -> str:
+    from proxy_pool import get_proxy_pool
+
+    pool = get_proxy_pool()
+    await database.set_bot_setting("proxy_url", "")
+    await pool.set_single_proxy_async(config.parse_proxy(config.RAW_PROXY))
+    note = "🗑 Прокси отключён."
+    if config.NET_MODE == "proxy" and not pool.has_configured_proxy():
+        await _set_net_mode("direct")
+        note += " Режим переключён на «🖥 Только сервер», чтобы сканирование не встало."
+    return note
+
+
+@router.callback_query(F.data == "admin_net")
+async def cb_admin_net(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await state.clear()
+    await call.answer()
+    text, kb = await _render_net()
+    await _show(call, text, kb)
+
+
+@router.callback_query(F.data.startswith("admin_net_mode:"))
+async def cb_admin_net_mode(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    from proxy_pool import get_proxy_pool
+
+    mode = call.data.split(":", 1)[1]
+    if mode not in config.NET_MODES:
+        await call.answer("Неизвестный режим", show_alert=True)
+        return
+    if mode in ("proxy", "both") and not get_proxy_pool().has_configured_proxy():
+        await call.answer("Сначала подключите прокси: кнопка «➕ Подключить прокси».", show_alert=True)
+        return
+    await _set_net_mode(mode)
+    await call.answer(f"Режим: {NET_MODE_TITLES[mode]}")
+    text, kb = await _render_net()
+    await _show(call, text, kb)
+
+
+@router.callback_query(F.data == "admin_net_probe")
+async def cb_admin_net_probe(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await call.answer("Проверяю, это займёт до минуты…")
+    try:
+        await call.message.edit_text("⏳ Проверяю каналы: по 3 запроса к Авито подряд…")
+    except Exception:
+        pass
+    report = await _probe_all_channels()
+    await _show(call, report, NET_BACK_KB)
+
+
+@router.callback_query(F.data == "admin_net_add")
+async def cb_admin_net_add(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_proxy)
+    await call.answer()
+    await _show(
+        call,
+        "➕ <b>Подключение прокси</b>\n\n"
+        "Пришлите прокси одним сообщением. Бот сразу удалит его из чата, сделает 3 запроса к Авито "
+        "и подключит прокси, только если он работает.\n\n" + PROXY_FORMAT_HELP,
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="admin_net")]]),
     )
-    logger.info("Admin %s switched scanning to proxy %s", message.from_user.id, result.proxy_id)
+
+
+@router.message(AdminStates.waiting_for_proxy, F.text, ~F.text.startswith("/"))
+async def msg_admin_proxy_input(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await _connect_proxy(message, message.text.strip())
+
+
+@router.callback_query(F.data == "admin_net_proxy_off")
+async def cb_admin_net_proxy_off(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    note = await _disconnect_proxy()
+    await call.answer("Прокси отключён")
+    text, kb = await _render_net(note)
+    await _show(call, text, kb)
+
+
+@router.message(Command("proxy"))
+async def cmd_admin_proxy(message: Message):
+    """/proxy — экран сети; /proxy <url> — подключить; /proxy test — проверить каналы; /proxy off — убрать."""
+    if not config.is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+    parts = (message.text or "").strip().split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if not arg:
+        text, kb = await _render_net()
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    elif arg.lower() in ("off", "выкл", "0"):
+        text, kb = await _render_net(await _disconnect_proxy())
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    elif arg.lower() in ("test", "тест", "check"):
+        status = await message.answer("⏳ Проверяю каналы: по 3 запроса к Авито подряд…")
+        await status.edit_text(await _probe_all_channels(), reply_markup=NET_BACK_KB, parse_mode="HTML")
+    else:
+        await _connect_proxy(message, arg)

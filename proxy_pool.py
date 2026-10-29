@@ -583,16 +583,26 @@ class ProxyPool:
         pool_file = config.PROXY_POOL_FILE if proxy_pool_file is None else str(proxy_pool_file or "").strip()
         single_proxy = config.PROXY_URL if fallback_proxy_url is None else fallback_proxy_url
         direct_ok = config.ALLOW_DIRECT_AVITO if allow_direct is None else bool(allow_direct)
+        mode = config.NET_MODE
 
-        if pool_file:
-            p_path = Path(pool_file).expanduser()
-            if proxy_pool_file is not None or p_path.is_file():
-                return list(load_proxy_urls_from_file(pool_file))
+        if mode == "direct":
+            return [None]
 
-        if single_proxy and str(single_proxy).strip():
-            validated = parse_and_validate_proxy_line(str(single_proxy).strip(), line_number=1)
-            return [validated]
+        proxies: list[str | None] = []
+        if pool_file and (proxy_pool_file is not None or Path(pool_file).expanduser().is_file()):
+            proxies = list(load_proxy_urls_from_file(pool_file))
+        elif single_proxy and str(single_proxy).strip():
+            proxies = [parse_and_validate_proxy_line(str(single_proxy).strip(), line_number=1)]
 
+        if mode == "both":
+            return proxies + [None]
+        if mode == "proxy":
+            if not proxies:
+                log.warning("⚠️ Режим сети «только прокси», но ни один прокси не задан — сканирование на паузе.")
+            return proxies
+
+        if proxies:
+            return proxies
         if direct_ok:
             return [None]
 
@@ -680,6 +690,16 @@ class ProxyPool:
         normalized = parse_and_validate_proxy_line(proxy_url) if proxy_url else None
         config.PROXY_URL = normalized
         return await self.reload_async(fallback_proxy_url=normalized or "")
+
+    async def set_net_mode_async(self, mode: str) -> dict[str, Any]:
+        if mode not in config.NET_MODES:
+            raise ValueError(f"Неизвестный режим сети: {mode}")
+        config.NET_MODE = mode
+        return await self.reload_async()
+
+    @staticmethod
+    def has_configured_proxy() -> bool:
+        return bool(config.PROXY_URL) or ProxyPool.pool_file_overrides_single_proxy()
 
     @staticmethod
     def pool_file_overrides_single_proxy() -> bool:

@@ -84,6 +84,12 @@ SCAN_PROXY_ATTEMPTS = positive_int_setting("SCAN_PROXY_ATTEMPTS", "2")
 # --- Прокси и HTTP ---
 PROXY_POOL_FILE = (os.getenv("PROXY_POOL_FILE") or "").strip()
 ALLOW_DIRECT_AVITO = os.getenv("ALLOW_DIRECT_AVITO", "1" if TESTING else "0").strip() == "1"
+# Network channels for scanning: auto (proxies if any, else server IP when ALLOW_DIRECT_AVITO),
+# direct (server IP only), proxy (proxies only), both (proxies and the server IP share the load).
+NET_MODES = ("auto", "direct", "proxy", "both")
+NET_MODE = (os.getenv("NET_MODE", "auto").strip().lower() or "auto")
+if NET_MODE not in NET_MODES:
+    raise ValueError(f"NET_MODE должен быть одним из: {', '.join(NET_MODES)}")
 PROXY_RATE_LIMIT = positive_float_setting("PROXY_RATE_LIMIT", "1.5")
 PROXY_RATE_RECOMMENDATION_MAX = positive_float_setting("PROXY_RATE_RECOMMENDATION_MAX", "2.0")
 PROXY_CAPACITY_RESERVE = non_negative_float_setting("PROXY_CAPACITY_RESERVE", "0.20")

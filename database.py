@@ -846,6 +846,10 @@ async def init_db():
             p_row = await cur.fetchone()
             if p_row is not None and str(p_row[0]).strip():
                 config.PROXY_URL = str(p_row[0]).strip()
+        async with db.execute("SELECT value FROM bot_settings WHERE key = 'net_mode'") as cur:
+            m_row = await cur.fetchone()
+            if m_row is not None and str(m_row[0]) in config.NET_MODES:
+                config.NET_MODE = str(m_row[0])
         logger.info("База данных успешно инициализирована")
 
 

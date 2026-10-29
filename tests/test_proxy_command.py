@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from tests import _environment
+from tests._dispatcher import DispatcherFixture
 import config
 import database
 import proxy_check
@@ -104,6 +105,78 @@ class TestProxyCommand(unittest.IsolatedAsyncioTestCase):
         with patch.object(proxy_check, "probe_channel", new=AsyncMock()) as probe:
             await admin.cmd_admin_proxy(message)
         probe.assert_not_awaited()
+
+
+class TestNetworkScreen(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.patches = [
+            patch.object(database, "DB_PATH", Path(self.temp_dir.name) / "net.db"),
+            patch.object(config, "PROXY_URL", None),
+            patch.object(config, "PROXY_POOL_FILE", ""),
+            patch.object(config, "ALLOW_DIRECT_AVITO", True),
+            patch.object(config, "NET_MODE", "auto"),
+        ]
+        for p in self.patches:
+            p.start()
+        await database.init_db()
+        self.pool = proxy_pool.ProxyPool(proxy_pool_file="", fallback_proxy_url="", allow_direct=True)
+        self.pool_patch = patch.object(proxy_pool, "get_proxy_pool", return_value=self.pool)
+        self.pool_patch.start()
+        self.setup_dispatcher(names=("admin",))
+
+    async def asyncTearDown(self):
+        await self.close_dispatcher()
+        self.pool_patch.stop()
+        for client in self.pool.clients:
+            await client.close()
+        for p in reversed(self.patches):
+            p.stop()
+        self.temp_dir.cleanup()
+
+    def channels(self):
+        return sorted((c.proxy_url or "direct") for c in self.pool.clients)
+
+    async def test_screen_lists_modes_and_refuses_proxy_mode_without_proxy(self):
+        await self.dispatch_callback("admin_net", config.ADMIN_ID)
+        self.assertTrue({"admin_net_mode:direct", "admin_net_mode:proxy", "admin_net_mode:both",
+                         "admin_net_probe", "admin_net_add"} <= set(self.callback_values()))
+        await self.dispatch_callback("admin_net_mode:proxy", config.ADMIN_ID)
+        self.assertTrue(self.methods("AnswerCallbackQuery")[-1].show_alert)
+        self.assertEqual(config.NET_MODE, "auto")
+        self.assertEqual(self.channels(), ["direct"])
+
+    async def test_button_flow_connects_proxy_then_both_mode_uses_two_channels(self):
+        await self.dispatch_callback("admin_net_add", config.ADMIN_ID)
+        probe = ProbeResult(proxy_id="p", masked_url="http://***@10.1.2.3:8080", target_url="u",
+                            attempts=[ProbeAttempt(True, 300, items=50)])
+        with patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe)):
+            await self.dispatch_message(text=PROXY_RAW, user_id=config.ADMIN_ID)
+        self.assertTrue(self.methods("DeleteMessage"), "the message with the password must be deleted")
+        self.assertEqual(self.channels(), [PROXY_URL])
+        self.assertIn("admin_net_proxy_off", self.callback_values())
+
+        await self.dispatch_callback("admin_net_mode:both", config.ADMIN_ID)
+        self.assertEqual(config.NET_MODE, "both")
+        self.assertEqual(await database.get_bot_setting("net_mode"), "both")
+        self.assertEqual(self.channels(), ["direct", PROXY_URL])
+
+        await self.dispatch_callback("admin_net_mode:proxy", config.ADMIN_ID)
+        self.assertEqual(self.channels(), [PROXY_URL])
+
+        # Removing the only proxy in proxy-only mode must not silently stop scanning.
+        await self.dispatch_callback("admin_net_proxy_off", config.ADMIN_ID)
+        self.assertEqual(config.NET_MODE, "direct")
+        self.assertEqual(self.channels(), ["direct"])
+
+    async def test_saved_mode_is_restored_on_startup(self):
+        await database.set_bot_setting("net_mode", "both")
+        await database.init_db()
+        self.assertEqual(config.NET_MODE, "both")
+
+    async def test_non_admin_cannot_switch_modes(self):
+        await self.dispatch_callback("admin_net_mode:direct", 123456)
+        self.assertEqual(config.NET_MODE, "auto")
 
 
 class TestProbeChannel(unittest.IsolatedAsyncioTestCase):
