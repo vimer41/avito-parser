@@ -135,6 +135,10 @@ TARIFF_DELIVERY_DELAY: dict[str, float] = {
 NOTIFICATION_WORKERS = positive_int_setting("NOTIFICATION_WORKERS", "10")
 TELEGRAM_GLOBAL_RATE = positive_float_setting("TELEGRAM_GLOBAL_RATE", "25.0")
 TELEGRAM_CHAT_INTERVAL = positive_float_setting("TELEGRAM_CHAT_INTERVAL", "1.0")
+# Telegram allows ~1 message/s per chat. When a chat has at least DIGEST_MIN ready notifications,
+# up to DIGEST_MAX of them go out as one list message instead of a minute-long queue.
+NOTIFICATION_DIGEST_MIN = positive_int_setting("NOTIFICATION_DIGEST_MIN", "4")
+NOTIFICATION_DIGEST_MAX = positive_int_setting("NOTIFICATION_DIGEST_MAX", "10")
 NOTIFICATION_MAX_AGE = positive_int_setting("NOTIFICATION_MAX_AGE", "1800")
 NOTIFICATION_LEASE_SECONDS = positive_int_setting("NOTIFICATION_LEASE_SECONDS", "60")
 NOTIFICATION_RETRY_MAX = positive_int_setting("NOTIFICATION_RETRY_MAX", "60")
@@ -151,6 +155,8 @@ SOURCE_SNAPSHOT_CACHE_SIZE = positive_int_setting("SOURCE_SNAPSHOT_CACHE_SIZE", 
 SOURCE_SNAPSHOT_TTL = positive_float_setting("SOURCE_SNAPSHOT_TTL", "20")
 BLACKLIST_CACHE_TTL = positive_float_setting("BLACKLIST_CACHE_TTL", "45")
 FAST_SKIP_FULL_SCAN_INTERVAL = positive_float_setting("FAST_SKIP_FULL_SCAN_INTERVAL", "60")
+# A live scan reads further pages only while every organic lot on the page is new (a flood on a broad radar).
+BROAD_RADAR_MAX_PAGES = positive_int_setting("BROAD_RADAR_MAX_PAGES", "3")
 # In-memory per-source memory of already processed item IDs (skips DB fanout when a scan brings nothing new).
 SEEN_CACHE_TTL_HOURS = positive_float_setting("SEEN_CACHE_TTL_HOURS", "48")
 SEEN_CACHE_MAX_PER_SOURCE = positive_int_setting("SEEN_CACHE_MAX_PER_SOURCE", "1000")

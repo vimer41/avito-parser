@@ -2180,11 +2180,23 @@ async def claim_notification_event(
     lease_seconds: float | None = None,
     now_epoch: float | None = None,
     now: float | None = None,
+    exclude_user_ids: Iterable[int] = (),
+    user_id: int | None = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Атомарно захватывает одно готовое к отправке событие (по ID из PriorityQueue или самое приоритетное готовое).
+    exclude_user_ids пропускает чаты, которые уже обслуживает другой отправщик; user_id берёт событие только этого чата.
     Возвращает событие вместе со списком агрегированных радаров.
     """
+    excluded = sorted({int(uid) for uid in exclude_user_ids})
+    user_filter = ""
+    user_params: list[Any] = []
+    if excluded:
+        user_filter += f" AND user_id NOT IN ({','.join('?' for _ in excluded)})"
+        user_params += excluded
+    if user_id is not None:
+        user_filter += " AND user_id = ?"
+        user_params.append(int(user_id))
     eff_now = float(now if now is not None else (time.time() if now_epoch is None else now_epoch))
     lease_dur = float(config.NOTIFICATION_LEASE_SECONDS if lease_seconds is None else lease_seconds)
     force_reclaim = lease_seconds is not None and float(lease_seconds) <= 0
@@ -2206,14 +2218,14 @@ async def claim_notification_event(
                 )
             else:
                 cur = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM notification_events
-                    WHERE (status = 'pending' AND next_attempt_at <= ?)
-                       OR (status = 'sending' AND (? = 1 OR (lease_until IS NOT NULL AND lease_until <= ?)))
+                    WHERE ((status = 'pending' AND next_attempt_at <= ?)
+                       OR (status = 'sending' AND (? = 1 OR (lease_until IS NOT NULL AND lease_until <= ?)))){user_filter}
                     ORDER BY priority ASC, deliver_at ASC, id ASC
                     LIMIT 1
                     """,
-                    (eff_now, 1 if force_reclaim else 0, eff_now),
+                    (eff_now, 1 if force_reclaim else 0, eff_now, *user_params),
                 )
             r = cur.fetchone()
             cur.close()

@@ -1057,8 +1057,11 @@ async def monitoring_worker(bot: Bot, parser: Optional[AvitoParser] = None):
     await run_monitoring(bot, parser)
 
 
-async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dict) -> bool:
-    """Deliver a leased notification event once; revalidates active radars, stop-words, and blacklists."""
+async def _prepare_delivery(row: dict) -> Optional[dict]:
+    """
+    Revalidate a leased event (active radars, stop-words, blacklist, freshness, access).
+    Returns the delivery context, or None when the event was already resolved (discarded / expired / released).
+    """
     notification_id, token = int(row["id"]), str(row["lease_token"])
     raw_payload_str = row.get("payload_json") or row.get("payload") or ""
     try:
@@ -1077,163 +1080,184 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
     except (ValueError, KeyError, TypeError):
         logger.error("Invalid outbox payload #%s", notification_id)
         await database.discard_notification(notification_id, token)
-        return False
+        return None
 
     if is_price_drop:
         # Price drop notifications are disabled in the 300-radar architecture
         await database.discard_notification(notification_id, token)
-        return False
+        return None
 
-    try:
-        now = time.time()
-        queued_at_raw = row.get("queued_at") or row.get("created_at") or discovered_at or now
-        if isinstance(queued_at_raw, str):
-            try:
-                queued_at = datetime.datetime.fromisoformat(queued_at_raw).replace(tzinfo=datetime.timezone.utc).timestamp()
-            except Exception:
-                queued_at = now
-        else:
-            queued_at = float(queued_at_raw)
+    now = time.time()
+    queued_at_raw = row.get("queued_at") or row.get("created_at") or discovered_at or now
+    if isinstance(queued_at_raw, str):
+        try:
+            queued_at = datetime.datetime.fromisoformat(queued_at_raw).replace(tzinfo=datetime.timezone.utc).timestamp()
+        except Exception:
+            queued_at = now
+    else:
+        queued_at = float(queued_at_raw)
 
-        # Expiration check (> 30m in outbox)
-        if queued_at > 0 and (now - queued_at) > float(config.NOTIFICATION_MAX_AGE) and freshness_verified and (now - queued_at) > 3600:
-            await database.mark_event_expired(notification_id, token, mark_seen=True)
-            METRICS.record_outbox_expired(1)
-            return False
+    # Expiration check (> 30m in outbox)
+    if queued_at > 0 and (now - queued_at) > float(config.NOTIFICATION_MAX_AGE) and freshness_verified and (now - queued_at) > 3600:
+        await database.mark_event_expired(notification_id, token, mark_seen=True)
+        METRICS.record_outbox_expired(1)
+        return None
 
-        if row.get("_fast_claimed"):
-            if not row.get("_user_allowed", True):
-                await database.discard_notification(notification_id, token)
-                return False
-            existing_searches = [
-                {
-                    "id": int(r["search_id"]),
-                    "user_id": user_id,
-                    "title": str(r["radar_title"]),
-                    "is_active": bool(r["is_active"]),
-                    "stop_words": list(r.get("stop_words") or []),
-                    "max_age_minutes": int(r.get("max_age_minutes") or 5),
-                }
-                for r in (row.get("radars") or [])
-                if r.get("exists")
-            ]
-        else:
-            if not await database.is_user_allowed(user_id):
-                await database.discard_notification(notification_id, token)
-                return False
-
-            raw_search_ids = list(row.get("search_ids") or [])
-            if not raw_search_ids and primary_radar_id:
-                raw_search_ids = [primary_radar_id]
-
-            existing_searches = []
-            for sid in raw_search_ids:
-                s = await database.get_search(int(sid))
-                if s and int(s["user_id"]) == user_id:
-                    existing_searches.append(s)
-
-        if not existing_searches:
+    if row.get("_fast_claimed"):
+        if not row.get("_user_allowed", True):
             await database.discard_notification(notification_id, token)
-            return False
-
-        active_searches = [s for s in existing_searches if s.get("is_active")]
-        if not active_searches:
-            if (now - queued_at) >= float(config.NOTIFICATION_MAX_AGE):
-                await database.mark_event_expired(notification_id, token, mark_seen=False)
-                METRICS.record_outbox_expired(1)
-            else:
-                await database.release_notification(notification_id, token, 30)
-            return False
-
-        # Legacy unverified freshness check
-        if not freshness_verified:
-            first_search = active_searches[0]
-            ref_time = discovered_at if discovered_at > 0 else queued_at
-            status = freshness_status(item.date, item.timestamp, first_search.get("max_age_minutes"), now=ref_time)
-            if status is False:
-                await database.discard_notification(notification_id, token)
-                for s in existing_searches:
-                    await database.mark_item_seen(int(s["id"]), item.item_id, item.raw_price or 0)
-                return False
-            if status is None:
-                await database.discard_notification(notification_id, token)
-                return False
-
-        blocked = await database.get_blocked_sellers(user_id)
-        if item.seller_name and item.seller_name.lower().strip() in blocked:
-            await database.discard_notification(notification_id, token)
-            return False
-
-        passing_searches = [
-            s for s in active_searches
-            if not is_stop_word_matched(item, s.get("stop_words", []))
+            return None
+        existing_searches = [
+            {
+                "id": int(r["search_id"]),
+                "user_id": user_id,
+                "title": str(r["radar_title"]),
+                "is_active": bool(r["is_active"]),
+                "stop_words": list(r.get("stop_words") or []),
+                "max_age_minutes": int(r.get("max_age_minutes") or 5),
+            }
+            for r in (row.get("radars") or [])
+            if r.get("exists")
         ]
-        if not passing_searches:
+    else:
+        if not await database.is_user_allowed(user_id):
             await database.discard_notification(notification_id, token)
+            return None
+
+        raw_search_ids = list(row.get("search_ids") or [])
+        if not raw_search_ids and primary_radar_id:
+            raw_search_ids = [primary_radar_id]
+
+        existing_searches = []
+        for sid in raw_search_ids:
+            s = await database.get_search(int(sid))
+            if s and int(s["user_id"]) == user_id:
+                existing_searches.append(s)
+
+    if not existing_searches:
+        await database.discard_notification(notification_id, token)
+        return None
+
+    active_searches = [s for s in existing_searches if s.get("is_active")]
+    if not active_searches:
+        if (now - queued_at) >= float(config.NOTIFICATION_MAX_AGE):
+            await database.mark_event_expired(notification_id, token, mark_seen=False)
+            METRICS.record_outbox_expired(1)
+        else:
+            await database.release_notification(notification_id, token, 30)
+        return None
+
+    # Legacy unverified freshness check
+    if not freshness_verified:
+        first_search = active_searches[0]
+        ref_time = discovered_at if discovered_at > 0 else queued_at
+        status = freshness_status(item.date, item.timestamp, first_search.get("max_age_minutes"), now=ref_time)
+        if status is False:
+            await database.discard_notification(notification_id, token)
+            for s in existing_searches:
+                await database.mark_item_seen(int(s["id"]), item.item_id, item.raw_price or 0)
+            return None
+        if status is None:
+            await database.discard_notification(notification_id, token)
+            return None
+
+    blocked = await database.get_blocked_sellers(user_id)
+    if item.seller_name and item.seller_name.lower().strip() in blocked:
+        await database.discard_notification(notification_id, token)
+        return None
+
+    passing_searches = [
+        s for s in active_searches
+        if not is_stop_word_matched(item, s.get("stop_words", []))
+    ]
+    if not passing_searches:
+        await database.discard_notification(notification_id, token)
+        return None
+
+    return {
+        "id": notification_id,
+        "token": token,
+        "item": item,
+        "user_id": user_id,
+        "user_label": user_label,
+        "discovered_at": discovered_at,
+        "queued_at": queued_at,
+        "radar_ids": [int(s["id"]) for s in passing_searches],
+        "radar_titles": [str(s.get("title") or search_title) for s in passing_searches],
+        "tariff": str(row.get("tariff") or payload.get("tariff") or "base").lower(),
+        "is_catchup": bool(row.get("is_catchup") or payload.get("is_catchup")),
+        "possible_dup": bool(row.get("possible_duplicate_after_crash")),
+    }
+
+
+async def _acknowledge_delivery(row: dict, ctx: dict) -> bool:
+    item = ctx["item"]
+    acknowledged = await database.acknowledge_notification(ctx["id"], ctx["token"], item.raw_price or 0)
+    if acknowledged:
+        t_sent = time.time()
+        t_seen_val = float(row.get("t_seen") or ctx["discovered_at"] or ctx["queued_at"] or t_sent)
+        deliver_at_val = float(row.get("deliver_at") or ctx["queued_at"] or t_sent)
+        METRICS.record_delivery(
+            tariff=ctx["tariff"],
+            t_pub=row.get("t_pub") or item.timestamp,
+            t_pub_reliable=bool(row.get("t_pub_reliable") or getattr(item, "t_pub_reliable", False)),
+            t_seen=t_seen_val,
+            t_queued=ctx["queued_at"],
+            deliver_at=deliver_at_val,
+            t_sent=t_sent,
+            is_catchup=ctx["is_catchup"],
+        )
+        logger.info(
+            "Delivery result: notification=%s discovery_to_send_ms=%d deliver_lag_ms=%d attempts=%s",
+            ctx["id"],
+            int(max(0.0, t_sent - t_seen_val) * 1000),
+            int(max(0.0, t_sent - deliver_at_val) * 1000),
+            row.get("attempts", 1),
+        )
+    return acknowledged
+
+
+async def _release_after_failure(row: dict, error: str) -> None:
+    notification_id, token = int(row["id"]), str(row["lease_token"])
+    attempts = int(row.get("attempts") or 1)
+    if attempts >= max(8, int(config.NOTIFICATION_GENERIC_ATTEMPTS)):
+        await database.mark_event_failed(notification_id, token, error=error)
+        METRICS.record_outbox_failed(1)
+    else:
+        delay = min(int(config.NOTIFICATION_RETRY_MAX), 2 ** min(attempts, 6))
+        await database.release_notification(notification_id, token, delay)
+
+
+async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dict) -> bool:
+    """Deliver a leased notification event once; revalidates active radars, stop-words, and blacklists."""
+    notification_id, token = int(row["id"]), str(row["lease_token"])
+    user_id = int(row.get("user_id") or 0)
+    try:
+        ctx = await _prepare_delivery(row)
+        if ctx is None:
             return False
-
-        active_radar_ids = [int(s["id"]) for s in passing_searches]
-        active_radar_titles = [str(s.get("title") or search_title) for s in passing_searches]
-        primary_active_id = active_radar_ids[0]
-        primary_active_title = active_radar_titles[0]
-
-        tariff = str(row.get("tariff") or payload.get("tariff") or "base").lower()
-        is_catchup = bool(row.get("is_catchup") or payload.get("is_catchup"))
-        possible_dup = bool(row.get("possible_duplicate_after_crash"))
-
+        user_id = ctx["user_id"]
         if not row.get("send_started_at"):
             await database.mark_event_send_started(notification_id, token)
         delivered = await send_ad_to_user(
             bot,
             parser,
             user_id,
-            primary_active_id,
-            primary_active_title,
-            item,
-            user_label=user_label,
+            ctx["radar_ids"][0],
+            ctx["radar_titles"][0],
+            ctx["item"],
+            user_label=ctx["user_label"],
             event_id=notification_id,
-            radar_titles=active_radar_titles,
-            search_ids=active_radar_ids,
-            is_catchup=is_catchup,
-            possible_duplicate_after_crash=possible_dup,
-            allow_uncached_photo=(tariff in ("pro", "standart")),
+            radar_titles=ctx["radar_titles"],
+            search_ids=ctx["radar_ids"],
+            is_catchup=ctx["is_catchup"],
+            possible_duplicate_after_crash=ctx["possible_dup"],
+            allow_uncached_photo=(ctx["tariff"] in ("pro", "standart")),
             preverified_delivery=bool(row.get("_fast_claimed")),
         )
         if delivered:
-            acknowledged = await database.acknowledge_notification(
-                notification_id, token, item.raw_price or 0
-            )
-            if acknowledged:
-                t_sent = time.time()
-                t_seen_val = float(row.get("t_seen") or discovered_at or queued_at or t_sent)
-                deliver_at_val = float(row.get("deliver_at") or queued_at or t_sent)
-                METRICS.record_delivery(
-                    tariff=tariff,
-                    t_pub=row.get("t_pub") or item.timestamp,
-                    t_pub_reliable=bool(row.get("t_pub_reliable") or getattr(item, "t_pub_reliable", False)),
-                    t_seen=t_seen_val,
-                    t_queued=queued_at,
-                    deliver_at=deliver_at_val,
-                    t_sent=t_sent,
-                    is_catchup=is_catchup,
-                )
-                logger.info(
-                    "Delivery result: notification=%s discovery_to_send_ms=%d deliver_lag_ms=%d attempts=%s",
-                    notification_id,
-                    int(max(0.0, t_sent - t_seen_val) * 1000),
-                    int(max(0.0, t_sent - deliver_at_val) * 1000),
-                    row.get("attempts", 1),
-                )
-            return acknowledged
-
-        attempts = int(row.get("attempts") or 1)
-        if attempts >= max(8, int(config.NOTIFICATION_GENERIC_ATTEMPTS)):
-            await database.mark_event_failed(notification_id, token, error="delivery_returned_false")
-            METRICS.record_outbox_failed(1)
-            return False
-
-        delay = min(int(config.NOTIFICATION_RETRY_MAX), 2 ** min(attempts, 6))
-        await database.release_notification(notification_id, token, delay)
+            return await _acknowledge_delivery(row, ctx)
+        await _release_after_failure(row, "delivery_returned_false")
         return False
     except asyncio.CancelledError:
         await asyncio.shield(database.release_notification(notification_id, token, 0))
@@ -1248,21 +1272,107 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
         return False
     except Exception as exc:
         logger.exception("Outbox delivery failed #%s", notification_id)
-        attempts = int(row.get("attempts") or 1)
-        if attempts >= max(8, int(config.NOTIFICATION_GENERIC_ATTEMPTS)):
-            await database.mark_event_failed(notification_id, token, error=str(exc))
-            METRICS.record_outbox_failed(1)
-        else:
-            delay = min(int(config.NOTIFICATION_RETRY_MAX), 2 ** min(attempts, 6))
-            await database.release_notification(notification_id, token, delay)
+        await _release_after_failure(row, str(exc))
         return False
+
+
+def build_digest_text(entries: list[dict]) -> str:
+    """One message for a burst of lots of one chat: numbered title links with price and age."""
+    radar_titles = {title for ctx in entries for title in ctx["radar_titles"][:1]}
+    header = f"🔥 <b>{len(entries)} {plural_form(len(entries), 'новый лот', 'новых лота', 'новых лотов')}</b>"
+    if len(radar_titles) == 1:
+        header += f" · «{html.escape(next(iter(radar_titles)))}»"
+    lines = [header, ""]
+    for index, ctx in enumerate(entries, 1):
+        item = ctx["item"]
+        title = html.escape((item.title or "Объявление")[:70])
+        url = html.escape(item.url or "", quote=True)
+        line = f"{index}. <a href=\"{url}\">{title}</a> — {html.escape(item.price or '')}"
+        age = format_item_age(item.date, getattr(item, "timestamp", None))
+        if age:
+            line += f" · {html.escape(age)}"
+        if len(radar_titles) > 1:
+            line += f" · <i>{html.escape(ctx['radar_titles'][0])}</i>"
+        lines.append(line)
+    lines += ["", "<i>Лотов много — прислал списком, чтобы не упереться в лимит Telegram.</i>"]
+    return "\n".join(lines)
+
+
+async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dict]) -> int:
+    """
+    Deliver several leased events of one chat. Each row passes the same checks as a single delivery;
+    a burst of at least NOTIFICATION_DIGEST_MIN valid lots goes out as one list message.
+    Returns how many events were acknowledged.
+    """
+    ready: list[tuple[dict, dict]] = []
+    for row in rows:
+        try:
+            ctx = await _prepare_delivery(row)
+        except asyncio.CancelledError:
+            await asyncio.shield(database.release_notification(int(row["id"]), str(row["lease_token"]), 0))
+            raise
+        except Exception as exc:
+            logger.exception("Outbox digest preparation failed #%s", row.get("id"))
+            await _release_after_failure(row, str(exc))
+            continue
+        if ctx is not None:
+            ready.append((row, ctx))
+
+    if len(ready) < max(2, int(config.NOTIFICATION_DIGEST_MIN)):
+        delivered = 0
+        for row, _ in ready:
+            delivered += int(await deliver_notification(bot, parser, row))
+        return delivered
+
+    user_id = ready[0][1]["user_id"]
+    try:
+        for row, ctx in ready:
+            if not row.get("send_started_at"):
+                await database.mark_event_send_started(ctx["id"], ctx["token"])
+        await _await_rate_limit(user_id)
+        await bot.send_message(
+            chat_id=user_id,
+            text=build_digest_text([ctx for _, ctx in ready]),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except asyncio.CancelledError:
+        for row, ctx in ready:
+            await asyncio.shield(database.release_notification(ctx["id"], ctx["token"], 0))
+        raise
+    except TelegramForbiddenError:
+        await database.deactivate_user_searches(user_id)
+        for row, ctx in ready:
+            await database.discard_notification(ctx["id"], ctx["token"])
+        return 0
+    except TelegramRetryAfter as exc:
+        retry_delay = float(exc.retry_after) + random.uniform(0.5, 1.5)
+        for row, ctx in ready:
+            await database.release_notification(ctx["id"], ctx["token"], retry_delay)
+        return 0
+    except Exception as exc:
+        logger.exception("Outbox digest delivery failed for chat %s", user_id)
+        for row, _ in ready:
+            await _release_after_failure(row, str(exc))
+        return 0
+
+    logger.info("📦 Пачка из %s лотов доставлена одним сообщением [chat %s]", len(ready), user_id)
+    delivered = 0
+    for row, ctx in ready:
+        delivered += int(await _acknowledge_delivery(row, ctx))
+    return delivered
+
+
+# Chats a sender is working on right now. Other senders skip them, so one flooded chat
+# waiting for its Telegram per-chat slot never blocks notifications to everybody else.
+CHATS_IN_DELIVERY: dict[int, int] = {}
 
 
 async def notification_worker(bot: Bot, parser: Optional[AvitoParser] = None, worker_id: int = 1):
     logger.info("📬 Persistent Outbox #%s started", worker_id)
     while True:
         try:
-            row = await database.claim_notification_event()
+            row = await database.claim_notification_event(exclude_user_ids=list(CHATS_IN_DELIVERY))
             if row is None:
                 NOTIFICATION_WAKEUP_EVENT.clear()
                 try:
@@ -1270,7 +1380,23 @@ async def notification_worker(bot: Bot, parser: Optional[AvitoParser] = None, wo
                 except asyncio.TimeoutError:
                     pass
                 continue
-            await deliver_notification(bot, parser, row)
+            chat_id = int(row.get("user_id") or 0)
+            CHATS_IN_DELIVERY[chat_id] = CHATS_IN_DELIVERY.get(chat_id, 0) + 1
+            try:
+                rows = [row]
+                while len(rows) < max(1, int(config.NOTIFICATION_DIGEST_MAX)):
+                    more = await database.claim_notification_event(user_id=chat_id)
+                    if more is None:
+                        break
+                    rows.append(more)
+                if len(rows) == 1:
+                    await deliver_notification(bot, parser, row)
+                else:
+                    await deliver_digest(bot, parser, rows)
+            finally:
+                CHATS_IN_DELIVERY[chat_id] -= 1
+                if CHATS_IN_DELIVERY[chat_id] <= 0:
+                    CHATS_IN_DELIVERY.pop(chat_id, None)
         except asyncio.CancelledError:
             raise
         except Exception:

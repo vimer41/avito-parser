@@ -21,6 +21,8 @@ import config
 class SeenStore(Protocol):
     async def all_known(self, source: str, revision: str, item_ids: Iterable[str]) -> bool: ...
 
+    async def none_known(self, source: str, revision: str, item_ids: Iterable[str]) -> bool: ...
+
     async def remember(self, source: str, revision: str, item_ids: Iterable[str]) -> None: ...
 
     async def forget(self, source: str) -> None: ...
@@ -77,6 +79,20 @@ class InMemorySeenStore:
             ids.move_to_end(item_id)
         while len(ids) > self.max_per_source:
             ids.popitem(last=False)
+
+    async def none_known(self, source: str, revision: str, item_ids: Iterable[str]) -> bool:
+        """True only when this source has history for the revision and none of the IDs is in it (a flood)."""
+        entry = self._sources.get(source)
+        if entry is None or entry.revision != revision or not entry.ids:
+            return False
+        now = self._monotonic()
+        checked = False
+        for item_id in item_ids:
+            checked = True
+            expires_at = entry.ids.get(item_id)
+            if expires_at is not None and expires_at > now:
+                return False
+        return checked
 
     async def forget(self, source: str) -> None:
         self._sources.pop(source, None)

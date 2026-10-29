@@ -272,7 +272,11 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 and any(database.classify_user_tariff(r)[0] == "pro" for r in task.radars)
             )
             collection_max_age = config.CATCHUP_MAX_AGE_MINUTES
-            collection_max_pages = 1
+            collection_max_pages = max(1, int(config.BROAD_RADAR_MAX_PAGES))
+
+            async def page_is_all_new(page_items, _task=task) -> bool:
+                organic = [item.item_id for item in page_items if not item.is_promotion]
+                return await seen_store.none_known(_task.key, _task.group_revision, organic)
 
             for _attempt in range(max(1, int(config.SCAN_PROXY_ATTEMPTS))):
                 lease = pool.acquire_client(exclude_ids=tried_proxy_ids)
@@ -297,6 +301,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                         collection_max_age,
                         max_pages=collection_max_pages,
                         can_fast_skip=(task.can_fast_skip and not has_pro_catchup),
+                        read_next_page=page_is_all_new,
                         last_top_ids=task.last_top_ids,
                     )
                     total_http_reqs += max(1, int(proxy_parser.last_http_requests or 1))

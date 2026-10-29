@@ -133,6 +133,33 @@ def _default_headers() -> dict[str, str]:
     }
 
 
+_PROXY_STATUS_RE = re.compile(r"CONNECT tunnel failed, response (\d{3})|HTTP code (\d{3}) from proxy", re.I)
+
+
+def classify_proxy_error(exc: BaseException) -> Optional[tuple[str, Optional[int]]]:
+    """
+    Tell proxy-side failures from network noise using libcurl's message:
+    407 = wrong login/password (or IP not whitelisted), 403 on CONNECT = the provider forbids the target site.
+    """
+    text = str(exc)
+    match = _PROXY_STATUS_RE.search(text)
+    if match:
+        status = int(match.group(1) or match.group(2))
+        if status == 407:
+            return "proxy_auth", status
+        if status == 403:
+            return "proxy_forbidden", status
+        return "proxy_error", status
+    lowered = text.lower()
+    if "socks" in lowered and ("auth" in lowered or "user" in lowered):
+        return "proxy_auth", None
+    if "could not resolve proxy" in lowered:
+        return "proxy_dns", None
+    if "connection refused" in lowered or "couldn't connect to server" in lowered or "failed to connect" in lowered:
+        return "proxy_refused", None
+    return None
+
+
 def apply_cache_busting(url: str) -> str:
     """
     Добавляет динамический timestamp (_t) к URL каталога Авито,
@@ -793,6 +820,13 @@ class AvitoParser:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    proxy_failure = classify_proxy_error(exc) if client.proxy_url else None
+                    if proxy_failure is not None:
+                        kind, status = proxy_failure
+                        cooldown = client.record_transport_error(reason=kind)
+                        self.last_failure = self.last_failure or FetchFailure(kind, retry_after=cooldown, status=status)
+                        logger.warning("🌐 %s [%s]: ошибка прокси %s%s", human, client.proxy_id, kind, f" (HTTP {status})" if status else "")
+                        return None
                     is_timeout = "timeout" in type(exc).__name__.lower() or isinstance(exc, TimeoutError)
                     cooldown = client.record_transport_error(reason="timeout" if is_timeout else "network")
                     self.last_failure = self.last_failure or FetchFailure(
