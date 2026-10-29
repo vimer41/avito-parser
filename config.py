@@ -150,6 +150,8 @@ OUTBOX_MAX_PENDING = positive_int_setting("OUTBOX_MAX_PENDING", "3000")
 OUTBOX_ALERT_DEPTH = positive_int_setting("OUTBOX_ALERT_DEPTH", "200")
 # Telegram sends ~1 message/s per chat, so a burst of lots always waits a few seconds; alert only on real stalls.
 DELIVERY_SLA_ALERT_SECONDS = positive_float_setting("DELIVERY_SLA_ALERT_SECONDS", "30.0")
+# "Catalog unavailable" alert fires only after this long without a single successful scan.
+HEALTH_ALERT_AFTER_SECONDS = positive_float_setting("HEALTH_ALERT_AFTER_SECONDS", "600")
 
 # --- БД, fanout, catch-up и метрики ---
 DB_READ_POOL_SIZE = positive_int_setting("DB_READ_POOL_SIZE", "2")

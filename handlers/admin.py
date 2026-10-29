@@ -245,14 +245,30 @@ async def render_user_card_data(target_id: int, page: int = 0):
         "Управление пользователем:"
     )
 
+    limit_row = [
+        InlineKeyboardButton(text="➖5 радаров", callback_data=f"admin_radar_limit:{target_id}:-5:{page}"),
+        InlineKeyboardButton(text="➕5 радаров", callback_data=f"admin_radar_limit:{target_id}:5:{page}"),
+        InlineKeyboardButton(text="➕20 радаров", callback_data=f"admin_radar_limit:{target_id}:20:{page}"),
+    ]
+    back_row = [
+        InlineKeyboardButton(text="🔍 Найти другого", callback_data="admin_search_user_prompt"),
+        InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{page}"),
+    ]
+    if config.is_admin(target_id):
+        # Admins have no subscription: only radars and the radar limit are managed here.
+        text = text.replace(f"• Статус: {status_line}\n", "• Статус: 👑 <b>Администратор</b>\n")
+        return text, InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}")],
+            limit_row,
+            back_row,
+        ])
+
     buttons = [
         [InlineKeyboardButton(text="💳 Выдать / продлить → выбрать тариф", callback_data=f"admin_sub_menu:{target_id}:{page}")],
         [InlineKeyboardButton(text="🎁 Выдать / обновить триал (5 ч)", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
         [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}"),
          InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
-        [InlineKeyboardButton(text="➖5 радаров", callback_data=f"admin_radar_limit:{target_id}:-5:{page}"),
-         InlineKeyboardButton(text="➕5 радаров", callback_data=f"admin_radar_limit:{target_id}:5:{page}"),
-         InlineKeyboardButton(text="➕20 радаров", callback_data=f"admin_radar_limit:{target_id}:20:{page}")],
+        limit_row,
     ]
     if has_access:
         buttons.append([InlineKeyboardButton(text="🚫 Отозвать доступ", callback_data=f"admin_revoke_prompt:{target_id}:{page}")])
@@ -260,10 +276,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
         InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admin_purge_user:{target_id}:{page}"),
         InlineKeyboardButton(text="✍️ Написать пользователю", callback_data=f"support_reply:{target_id}")
     ])
-    buttons.append([
-        InlineKeyboardButton(text="🔍 Найти другого", callback_data="admin_search_user_prompt"),
-        InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{page}")
-    ])
+    buttons.append(back_row)
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -313,7 +326,7 @@ async def cb_admin_user(call: CallbackQuery):
     if not user:
         await call.answer("Пользователь не найден", show_alert=True)
         return
-    if config.is_admin(target_id):
+    if config.is_admin(target_id) and parts[0] != "admin_user":
         await call.answer("Доступ администратора не требует подписки и не меняется здесь.", show_alert=True)
         return
 

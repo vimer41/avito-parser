@@ -89,6 +89,19 @@ class TestAdminRadars(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(database.RadarLimitError):
             await database.add_search(USER_ID, "R10", "https://www.avito.ru/moskva?q=u10")
 
+    async def test_admin_card_of_an_admin_opens_with_limit_buttons(self):
+        other_admin = next(a for a in config.ADMIN_IDS if a != config.ADMIN_ID)
+        await database.get_or_create_user(other_admin, "admin2", "Admin2")
+        await self.dispatch_callback(f"admin_user:{other_admin}:0", config.ADMIN_ID)
+        edit = [m for m in self.session.calls if type(m).__name__ == "EditMessageText"][-1]
+        self.assertIn("Администратор", edit.text)
+        buttons = [b.callback_data for row in edit.reply_markup.inline_keyboard for b in row]
+        self.assertIn(f"admin_radar_limit:{other_admin}:20:0", buttons)
+        self.assertFalse(any(b.startswith("admin_sub_menu:") for b in buttons))
+
+        await self.dispatch_callback(f"admin_radar_limit:{other_admin}:20:0", config.ADMIN_ID)
+        self.assertEqual(await database.get_user_max_radars(other_admin), config.MAX_SEARCHES_PER_USER + 20)
+
     async def test_non_admin_cannot_change_limits(self):
         await self.dispatch_callback(f"admin_radar_limit:{USER_ID}:20:0", USER_ID)
         self.assertEqual(await database.get_user_max_radars(USER_ID), 9)

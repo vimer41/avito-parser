@@ -90,6 +90,11 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
     stats = {"successful_scans": 0, "failed_scans": 0, "coverage_gaps": 0, "fast_skipped_scans": 0}
     consecutive_failures = 0
     alert_sent = False
+    last_ok_at = time.monotonic()
+
+    def catalog_down() -> bool:
+        # 403s on single scans are routine; alert admins only when nothing succeeded for a long time.
+        return consecutive_failures >= 5 and time.monotonic() - last_ok_at >= float(config.HEALTH_ALERT_AFTER_SECONDS)
 
     logger.info(
         "📡 Планировщик: %s HTTP-воркеров, %s fanout-воркеров, прокси в пуле=%s, целевой интервал %.1f-%.1f с",
@@ -119,7 +124,10 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         text = (
             "✅ Получение каталога Авито возобновилось."
             if recovered
-            else "⚠️ Повторяющиеся ошибки получения каталога Авито. Проверки отложены; уведомления в outbox сохранены. Подробности и общий cooldown — в логах."
+            else (
+                f"⚠️ Авито не отдаёт каталог уже {int(config.HEALTH_ALERT_AFTER_SECONDS) // 60} мин.: ни одного удачного скана. "
+                "Проверки продолжаются; уведомления в outbox сохранены. Подробности — в логах."
+            )
         )
         for admin_id in config.ADMIN_IDS:
             try:
@@ -171,7 +179,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 fanout_queue.task_done()
 
     async def worker(worker_id: int, worker_parser: AvitoParser):
-        nonlocal consecutive_failures, alert_sent
+        nonlocal consecutive_failures, alert_sent, last_ok_at
         while True:
             is_mock_parser = type(worker_parser).__name__ != "AvitoParser"
             is_patched_process = getattr(scheduler.process_url_group, "__name__", "") != "process_url_group" or is_mock_parser
@@ -251,10 +259,12 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 stats["successful_scans" if ok else "failed_scans"] += 1
                 stats["coverage_gaps"] += int(gap)
                 consecutive_failures = 0 if ok else consecutive_failures + 1
+                if ok:
+                    last_ok_at = time.monotonic()
                 if ok and alert_sent:
                     alert_sent = False
                     await notify_health(True)
-                elif consecutive_failures >= 5 and not alert_sent:
+                elif catalog_down() and not alert_sent:
                     alert_sent = True
                     await notify_health(False)
                 continue
@@ -376,7 +386,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 changed.set()
                 stats["failed_scans"] += 1
                 consecutive_failures += 1
-                if consecutive_failures >= 5 and not alert_sent:
+                if catalog_down() and not alert_sent:
                     alert_sent = True
                     await notify_health(False)
                 continue
@@ -393,6 +403,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             stats["coverage_gaps"] += int(gap)
             stats["fast_skipped_scans"] += int(fast_skipped)
             consecutive_failures = 0
+            last_ok_at = time.monotonic()
             if alert_sent:
                 alert_sent = False
                 await notify_health(True)
