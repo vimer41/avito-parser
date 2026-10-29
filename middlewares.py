@@ -6,6 +6,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import TelegramObject, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 import config
+import ui
 import database
 
 from logger_setup import log_user_event
@@ -129,12 +130,7 @@ class AccessControlMiddleware(BaseMiddleware):
                 "/paysupport", "/terms", "/agreement", "/privacy", "/policy", "/offer", "/docs",
             }
             command = (event.text.split(maxsplit=1) or [""])[0].split("@", 1)[0]
-            public_menu = {
-                "💳 Тарифы", "💳 Тарифы и подписка", "Тарифы", "Подписка", "💳 Подписка",
-                "💬 Поддержка", "Поддержка", "Контакты", "Помощь", "SOS",
-                "👤 Мой профиль", "📊 Мой статус", "📖 Инструкция", "❓ Помощь", "❌ Отмена",
-                "📄 Документы", "Документы",
-            }
+            public_menu = ui.menu_texts("tariffs", "support", "profile", "help", "docs") | ui.CANCEL_TEXTS
             if command in public_commands or event.text.strip() in public_menu:
                 state = data.get("state")
                 if state is not None:
@@ -156,17 +152,7 @@ class AccessControlMiddleware(BaseMiddleware):
             # Автоматический сброс FSM-состояния при нажатии любой кнопки главного меню или команд
             if isinstance(event, Message) and event.text:
                 txt = event.text.strip()
-                menu_keywords = {
-                    "🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск",
-                    "📁 Мои радары", "📂 Мои радары", "📋 Мои поиски", "Мои радары",
-                    "💳 Тарифы", "💳 Тарифы и подписка", "Тарифы", "Подписка", "💳 Подписка",
-                    "💬 Поддержка", "Поддержка", "Помощь",
-                    "👤 Мой профиль", "📊 Мой статус", "Мой профиль",
-                    "📖 Инструкция", "Инструкция",
-                    "📄 Документы", "Документы",
-                    "👑 Админ-панель", "👑 Админка",
-                    "❌ Отмена", "Отмена"
-                }
+                menu_keywords = ui.ALL_MENU_TEXTS
                 if txt.startswith("/") or txt in menu_keywords:
                     fsm_state = data.get("state")
                     if fsm_state:
@@ -180,22 +166,20 @@ class AccessControlMiddleware(BaseMiddleware):
         trial_used = bool(user_record.get("trial_used"))
         if trial_used:
             text_for_user = (
-                "🔒 <b>Срок действия пробного периода завершился</b>\n\n"
-                "Ваш бесплатный 5-часовой доступ подошёл к концу. "
-                "Чтобы продолжить отслеживать новые лоты на Авито без ограничений, выберите подходящий тариф подписки "
-                "или свяжитесь со службой поддержки прямо в этом боте!"
+                f"{ui.e('lock')} <b>Доступ закончился</b>\n\n"
+                "Чтобы бот снова присылал новые лоты, выберите тариф. "
+                "Радары и настройки сохранены и заработают сразу после оплаты."
             )
         else:
             text_for_user = (
-                "🔒 <b>Доступ к боту ограничен</b>\n\n"
-                "Этот бот является приватным. Ваша заявка передана администраторам сервиса.\n"
-                "Как только доступ будет подтверждён — вы получите уведомление и сможете начать поиск!"
+                f"{ui.e('lock')} <b>Доступ к боту ограничен</b>\n\n"
+                "Заявка передана администраторам. Как только доступ подтвердят, придёт уведомление."
             )
 
-        user_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="open_subscription_menu")],
-            [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="support_start_ticket")]
-        ])
+        user_kb = ui.kb(
+            [ui.btn("Выбрать тариф", "tariffs", callback_data="open_subscription_menu", style="primary")],
+            [ui.btn("Написать в поддержку", "support", callback_data="support_start_ticket")],
+        )
 
         if isinstance(event, Message):
             await event.answer(text_for_user, reply_markup=user_kb, parse_mode="HTML")

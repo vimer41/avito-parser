@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 import billing
 import config
 import database
+import ui
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -41,15 +42,13 @@ async def payment_terms(event):
         "• При подтверждении возврата доступ деактивируется, средства возвращаются тем же способом, которым была совершена оплата.\n\n"
         "Совершая оплату, вы подтверждаете согласие с настоящими Условиями и Пользовательским соглашением."
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Пользовательское соглашение", callback_data="doc_agreement"),
-         InlineKeyboardButton(text="🔒 Конфиденциальность", callback_data="doc_privacy")],
-        [InlineKeyboardButton(text="💳 Тарифы", callback_data="open_subscription_menu"),
-         InlineKeyboardButton(text="💬 Поддержка платежей", callback_data="payment_support")],
-        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")]
-    ]))
-    if isinstance(event, CallbackQuery):
-        await event.answer()
+    await ui.show(event, f"{ui.e('card')} {text}", ui.kb(
+        [ui.btn("Соглашение", "docs", callback_data="doc_agreement"),
+         ui.btn("Конфиденциальность", "lock", callback_data="doc_privacy")],
+        [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
+         ui.btn("Вопрос по оплате", "support", callback_data="payment_support")],
+        [ui.home_btn()],
+    ))
 
 
 @router.callback_query(F.data.startswith(("demo_tariff:", "pay_request:")))
@@ -140,14 +139,15 @@ async def successful_payment(message: Message, bot: Bot):
         await message.answer("Этот платёж уже обработан. Текущая подписка доступна в /profile; вопросы — /paysupport.")
         return
     await message.answer(
-        f"✅ <b>Оплата {order['total_amount']} ⭐ подтверждена!</b>\n"
-        f"Тариф: <b>{config.plan_title(order['tariff_plan'])}</b>, радаров — до {await database.get_user_max_radars(order['user_id'])}.\n"
-        f"Добавлено {order['days']} дней. Действует: {database.format_subscription_date(order['subscription_after'])}\n"
-        f"Номер заказа: <code>{order['id']}</code>. Без автосписания. Поддержка: /paysupport.",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")],
-            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")],
-        ]),
+        f"{ui.e('ok')} <b>Оплата {order['total_amount']} ⭐ прошла</b>\n\n"
+        f"Тариф <b>«{config.plan_title(order['tariff_plan'])}»</b>, радаров до {await database.get_user_max_radars(order['user_id'])}.\n"
+        f"+{order['days']} дней, действует до {database.format_subscription_date(order['subscription_after'])}.\n"
+        f"Заказ <code>{order['id']}</code>, без автосписания. Вопросы: /paysupport.",
+        parse_mode="HTML", reply_markup=ui.kb(
+            [ui.btn("Добавить радар", "radar", callback_data="add_search_prompt", style="primary")],
+            [ui.btn("Мои радары", "radars", callback_data="list_searches"),
+             ui.btn("Профиль", "profile", callback_data="refresh_profile")],
+        ),
     )
     logger.info("Stars payment fulfilled: order=%s user=%s plan=%s amount=%s", order["id"], order["user_id"], order["tariff_plan"], order["total_amount"])
 
@@ -158,20 +158,20 @@ async def payment_support(event, state: FSMContext):
     from handlers.support import SupportStates
     user = event.from_user
     orders = await billing.list_orders(user.id)
-    text = "💬 <b>ПОДДЕРЖКА ПЛАТЕЖЕЙ / ВОЗВРАТ</b>\n\n📧 <b>Email:</b> bernardgofov@gmail.com\n\n"
+    text = f"{ui.e('support')} <b>Оплата и возврат</b>\n\n{ui.e('mail')} bernardgofov@gmail.com\n\n"
     if orders:
-        text += "Последние платежи:\n" + "\n".join(
+        text += "<b>Последние платежи:</b>\n" + "\n".join(
             f"• #{o['id']} · {config.plan_title(o['tariff_plan'])} · {o['total_amount']} ⭐ · "
             f"{'возвращён' if o['status'] == 'refunded' else 'возврат обрабатывается' if o['status'] == 'refunding' else 'оплачен'}"
             for o in orders
         ) + "\n\n"
-    text += "Опишите проблему или запрос возврата следующим сообщением; укажите номер заказа, если он известен. Администраторы ответят прямо здесь."
+    text += "Опишите проблему или запрос возврата следующим сообщением, укажите номер заказа, если знаете. Ответим прямо здесь."
     await state.set_state(SupportStates.waiting_for_user_message)
     await state.update_data(payment_support=True)
     message = event.message if isinstance(event, CallbackQuery) else event
-    await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="support_cancel")],
-    ]))
+    await message.answer(text, parse_mode="HTML", reply_markup=ui.kb(
+        [ui.btn("Отмена", "cancel", callback_data="support_cancel")],
+    ))
     if isinstance(event, CallbackQuery):
         await event.answer()
 

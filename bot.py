@@ -13,6 +13,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
 import database
+import ui
 from handlers import main_router
 from middlewares import AccessControlMiddleware, ActionLoggingMiddleware
 from proxy_pool import close_proxy_pool, get_proxy_pool
@@ -117,6 +118,8 @@ async def main():
             token=config.BOT_TOKEN,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
+        await ui.load()
+        bot.session.middleware(ui.PremiumEmojiFallback())
         dp = Dispatcher(storage=MemoryStorage())
         dp.message.middleware(ActionLoggingMiddleware())
         dp.callback_query.middleware(ActionLoggingMiddleware())

@@ -166,7 +166,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_message(text="/paysupport@fixture_bot")
         state = self.dp.fsm.get_context(bot=self.bot, chat_id=self.user_id, user_id=self.user_id)
         self.assertEqual(await state.get_state(), "SupportStates:waiting_for_user_message")
-        self.assertIn("ПОДДЕРЖКА ПЛАТЕЖЕЙ", self.methods("SendMessage")[-1].text)
+        self.assertIn("Оплата и возврат", self.methods("SendMessage")[-1].text)
         await self.dispatch_message(text="Не пришла подписка, заказ 42")
         admin_notices = [m for m in self.methods("SendMessage") if m.chat_id in config.ADMIN_IDS]
         self.assertEqual(len(admin_notices), len(config.ADMIN_IDS))

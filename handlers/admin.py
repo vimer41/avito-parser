@@ -9,6 +9,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 import config
 import database
+import ui
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -17,6 +18,8 @@ router = Router()
 class AdminStates(StatesGroup):
     waiting_for_user_query = State()
     waiting_for_proxy = State()
+    waiting_for_emoji_pack = State()
+    waiting_for_emoji_slot = State()
 
 
 @router.callback_query(F.data == "admin_probe")
@@ -624,7 +627,7 @@ def _net_summary(pool) -> str:
     return f"{NET_MODE_TITLES.get(config.NET_MODE, config.NET_MODE)} · каналов: <b>{len(clients)}</b>"
 
 
-@router.message(F.text.in_({"👑 Админ-панель", "👑 Админка"}))
+@router.message(F.text.in_(ui.menu_texts("admin")))
 @router.message(Command("admin"))
 @router.callback_query(F.data == "admin_refresh")
 async def cmd_admin_home(event):
@@ -639,28 +642,25 @@ async def cmd_admin_home(event):
 
     stats = await database.get_system_stats()
     text = (
-        "👑 <b>Админ-панель</b>\n\n"
-        f"👥 Пользователи: <b>{stats['total_users']}</b> · с доступом <b>{stats['allowed_users']}</b>\n"
-        f"🎯 Радары: <b>{stats['active_searches']}</b> активных из <b>{stats['total_searches']}</b>\n"
-        f"📦 Обработано лотов: <b>{stats['total_seen']}</b>\n"
-        f"🌐 Сеть: {_net_summary(get_proxy_pool())}\n"
-        f"⏱ Последняя проверка: <b>{get_last_scan_info()}</b>"
+        f"{ui.e('admin')} <b>Админ-панель</b>\n\n"
+        f"{ui.e('users')} Пользователи: <b>{stats['total_users']}</b> · с доступом <b>{stats['allowed_users']}</b>\n"
+        f"{ui.e('radar')} Радары: <b>{stats['active_searches']}</b> активных из <b>{stats['total_searches']}</b>\n"
+        f"{ui.e('box')} Обработано лотов: <b>{stats['total_seen']}</b>\n"
+        f"{ui.e('net')} Сеть: {_net_summary(get_proxy_pool())}\n"
+        f"{ui.e('time')} Последняя проверка: <b>{get_last_scan_info()}</b>\n"
+        f"{ui.e('palette')} Премиум-эмодзи: <b>{len(ui.IDS)}</b> из {len(ui.SLOTS)}"
+        + ("" if ui.ENABLED else " (выключены)")
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_page:0"),
-            InlineKeyboardButton(text="🌐 Сеть и прокси", callback_data="admin_net"),
-        ],
-        [
-            InlineKeyboardButton(text="📊 Мониторинг", callback_data="admin_runtime_stats"),
-            InlineKeyboardButton(text="🔍 Найти", callback_data="admin_search_user_prompt"),
-        ],
-        [
-            InlineKeyboardButton(text="💾 База", callback_data="admin_backup"),
-            InlineKeyboardButton(text="📋 Логи", callback_data="admin_logs_menu"),
-        ],
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_refresh")],
-    ])
+    kb = ui.kb(
+        [ui.btn("Пользователи", "users", callback_data="admin_page:0"),
+         ui.btn("Сеть и прокси", "net", callback_data="admin_net")],
+        [ui.btn("Мониторинг", "stats", callback_data="admin_runtime_stats"),
+         ui.btn("Найти", "scope", callback_data="admin_search_user_prompt")],
+        [ui.btn("База", "db", callback_data="admin_backup"),
+         ui.btn("Логи", "logs", callback_data="admin_logs_menu")],
+        [ui.btn("Премиум-эмодзи", "palette", callback_data="admin_emoji"),
+         ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
+    )
     await _show(event, text, kb)
 
 
@@ -1701,3 +1701,227 @@ async def cmd_admin_proxy(message: Message):
         await status.edit_text(await _probe_all_channels(), reply_markup=NET_BACK_KB, parse_mode="HTML")
     else:
         await _add_proxies(message, arg)
+
+
+# ── Премиум-эмодзи интерфейса ──────────────────────────────────────────
+
+EMOJI_SLOTS_PER_PAGE = 24
+
+
+def _emoji_home() -> tuple[str, InlineKeyboardMarkup]:
+    filled = len(ui.IDS)
+    total = len(ui.SLOTS)
+    status = f"{ui.e('on')} включены" if ui.ENABLED else f"{ui.e('pause')} выключены"
+    lines = [
+        f"{ui.e('palette')} <b>Премиум-эмодзи</b>",
+        "",
+        f"Статус: {status} · заполнено <b>{filled}</b> из {total}",
+        "",
+        "<b>Как заполнить:</b> «Загрузить пак» → пришлите любой премиум-эмодзи из понравившегося пака. "
+        "Бот возьмёт весь пак и поставит анимированные версии везде, где совпадает обычный эмодзи. "
+        "Остальное можно назначить по одному.",
+        "",
+    ]
+    lines += [f"{ui.e(name)} {desc}" + ("" if name in ui.IDS else " <i>(обычный)</i>")
+              for name, (_char, desc) in ui.SLOTS.items()]
+    markup = ui.kb(
+        [ui.btn("Загрузить пак", "box", callback_data="admin_emoji_pack", style="primary")],
+        [ui.btn("Назначить по одному", "write", callback_data="admin_emoji_slots:0")],
+        [ui.btn("Выключить" if ui.ENABLED else "Включить", "pause" if ui.ENABLED else "play",
+                callback_data="admin_emoji_toggle"),
+         ui.btn("Сбросить все", "trash", callback_data="admin_emoji_reset")],
+        [ui.btn("« Админ-панель", callback_data="admin_refresh")],
+    )
+    return "\n".join(lines), markup
+
+
+@router.callback_query(F.data == "admin_emoji")
+async def cb_admin_emoji(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        return
+    await state.clear()
+    await call.answer()
+    text, markup = _emoji_home()
+    await _show(call, text, markup)
+
+
+@router.callback_query(F.data == "admin_emoji_toggle")
+async def cb_admin_emoji_toggle(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        return
+    await ui.save(enabled=not ui.ENABLED)
+    await call.answer("Премиум-эмодзи включены" if ui.ENABLED else "Премиум-эмодзи выключены")
+    text, markup = _emoji_home()
+    await _show(call, text, markup)
+
+
+@router.callback_query(F.data == "admin_emoji_reset")
+async def cb_admin_emoji_reset(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        return
+    await call.answer()
+    await _show(call, f"{ui.e('trash')} <b>Сбросить все премиум-эмодзи?</b>\n\nВезде вернутся обычные.", ui.kb([
+        ui.btn("Да, сбросить", callback_data="admin_emoji_reset_yes", style="danger"),
+        ui.btn("Отмена", callback_data="admin_emoji"),
+    ]))
+
+
+@router.callback_query(F.data == "admin_emoji_reset_yes")
+async def cb_admin_emoji_reset_yes(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        return
+    await ui.save(ids={})
+    await call.answer("Сброшено")
+    text, markup = _emoji_home()
+    await _show(call, text, markup)
+
+
+@router.callback_query(F.data == "admin_emoji_pack")
+async def cb_admin_emoji_pack(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_for_emoji_pack)
+    await call.answer()
+    await _show(call, (
+        f"{ui.e('box')} <b>Загрузка пака</b>\n\n"
+        "Пришлите одно или несколько премиум-эмодзи. Бот загрузит их паки целиком "
+        "и заполнит все подходящие места. Эмодзи из самого сообщения важнее остальных: "
+        "так можно точно выбрать, например, свой 🎯 для радара."
+    ), ui.kb([ui.btn("Отмена", "cancel", callback_data="admin_emoji")]))
+
+
+@router.callback_query(F.data.startswith("admin_emoji_slots:"))
+async def cb_admin_emoji_slots(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        return
+    await state.clear()
+    await call.answer()
+    page = int(call.data.split(":")[1] or 0)
+    names = list(ui.SLOTS)
+    pages = max(1, -(-len(names) // EMOJI_SLOTS_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    chunk = names[page * EMOJI_SLOTS_PER_PAGE:(page + 1) * EMOJI_SLOTS_PER_PAGE]
+    rows, row = [], []
+    for name in chunk:
+        row.append(ui.btn(ui.SLOTS[name][1].split(",")[0][:18], name, callback_data=f"admin_emoji_slot:{name}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    nav = []
+    if page > 0:
+        nav.append(ui.btn("«", callback_data=f"admin_emoji_slots:{page - 1}"))
+    if page < pages - 1:
+        nav.append(ui.btn("»", callback_data=f"admin_emoji_slots:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([ui.btn("« Эмодзи", callback_data="admin_emoji")])
+    await _show(call, f"{ui.e('write')} <b>Какое место заменить?</b> · стр. {page + 1}/{pages}", ui.kb(*rows))
+
+
+@router.callback_query(F.data.startswith("admin_emoji_slot:"))
+async def cb_admin_emoji_slot(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        return
+    name = call.data.split(":", 1)[1]
+    if name not in ui.SLOTS:
+        await call.answer("Такого места больше нет", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_emoji_slot)
+    await state.update_data(emoji_slot=name)
+    await call.answer()
+    rows = [[ui.btn("Отмена", "cancel", callback_data="admin_emoji_slots:0")]]
+    if name in ui.IDS:
+        rows.insert(0, [ui.btn("Вернуть обычный", "refresh", callback_data=f"admin_emoji_clear:{name}")])
+    await _show(call, (
+        f"{ui.e(name)} <b>{ui.SLOTS[name][1]}</b>\n\n"
+        f"Обычный: {ui.plain(name)}. Пришлите один премиум-эмодзи для этого места."
+    ), ui.kb(*rows))
+
+
+@router.callback_query(F.data.startswith("admin_emoji_clear:"))
+async def cb_admin_emoji_clear(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        return
+    await state.clear()
+    name = call.data.split(":", 1)[1]
+    await ui.save(ids={k: v for k, v in ui.IDS.items() if k != name})
+    await call.answer("Вернул обычный")
+    text, markup = _emoji_home()
+    await _show(call, text, markup)
+
+
+async def _pack_pairs(bot: Bot, emoji_ids: list[str]) -> list[tuple[str, str]]:
+    """(plain emoji, custom_emoji_id) for every emoji of the packs these custom emoji belong to."""
+    pairs: list[tuple[str, str]] = []
+    try:
+        stickers = await bot.get_custom_emoji_stickers(custom_emoji_ids=emoji_ids[:200])
+    except Exception as exc:
+        logger.warning("getCustomEmojiStickers не удался: %s", exc)
+        return pairs
+    for set_name in dict.fromkeys(s.set_name for s in stickers if s.set_name):
+        try:
+            sticker_set = await bot.get_sticker_set(name=set_name)
+        except Exception as exc:
+            logger.warning("getStickerSet %s не удался: %s", set_name, exc)
+            continue
+        pairs += [(s.emoji or "", s.custom_emoji_id) for s in sticker_set.stickers if s.custom_emoji_id]
+    return pairs
+
+
+@router.message(AdminStates.waiting_for_emoji_pack)
+async def msg_admin_emoji_pack(message: Message, state: FSMContext, bot: Bot):
+    if not config.is_admin(message.from_user.id):
+        return
+    own = ui.custom_emoji_in(message)
+    if not own:
+        await message.answer("В сообщении нет премиум-эмодзи. Пришлите эмодзи из пака (не обычный смайлик).",
+                             reply_markup=ui.kb([ui.btn("Отмена", "cancel", callback_data="admin_emoji")]))
+        return
+    await state.clear()
+    status = await message.answer(f"{ui.e('wait')} Загружаю пак…", parse_mode="HTML")
+    found = ui.match_slots(await _pack_pairs(bot, [cid for _c, cid in own]))
+    found.update(ui.match_slots(own))
+    await ui.save(ids={**ui.IDS, **found})
+    missing = [ui.SLOTS[n][0] for n in ui.SLOTS if n not in ui.IDS]
+    text = f"{ui.e('ok')} <b>Заполнено мест: {len(found)}</b>\n" + " ".join(ui.e(n) for n in found)
+    if missing:
+        text += f"\n\nНе нашлось в паке ({len(missing)}): {' '.join(missing)}\nИх можно назначить по одному или загрузить ещё пак."
+    await status.edit_text(text, reply_markup=ui.kb(
+        [ui.btn("Загрузить ещё пак", "box", callback_data="admin_emoji_pack")],
+        [ui.btn("« Эмодзи", callback_data="admin_emoji")],
+    ), parse_mode="HTML")
+
+
+@router.message(AdminStates.waiting_for_emoji_slot)
+async def msg_admin_emoji_slot(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        return
+    own = ui.custom_emoji_in(message)
+    name = (await state.get_data()).get("emoji_slot")
+    if not own or name not in ui.SLOTS:
+        await message.answer("Нужен премиум-эмодзи (из пака), не обычный смайлик.",
+                             reply_markup=ui.kb([ui.btn("Отмена", "cancel", callback_data="admin_emoji_slots:0")]))
+        return
+    await state.clear()
+    await ui.save(ids={**ui.IDS, name: own[0][1]})
+    await message.answer(f"{ui.e(name)} <b>Готово:</b> {ui.SLOTS[name][1]}", parse_mode="HTML", reply_markup=ui.kb(
+        [ui.btn("Ещё одно место", "write", callback_data="admin_emoji_slots:0")],
+        [ui.btn("« Эмодзи", callback_data="admin_emoji")],
+    ))
+
+
+@router.message(Command("emoji_id"))
+async def cmd_emoji_id(message: Message):
+    """/emoji_id с премиум-эмодзи в сообщении (или ответом на сообщение с ними) — их ID."""
+    if not config.is_admin(message.from_user.id):
+        return
+    found = ui.custom_emoji_in(message)
+    if not found and message.reply_to_message:
+        found = ui.custom_emoji_in(message.reply_to_message)
+    if not found:
+        await message.answer("Пришлите /emoji_id вместе с премиум-эмодзи или ответом на сообщение с ними.")
+        return
+    await message.answer("\n".join(f'<tg-emoji emoji-id="{cid}">{char}</tg-emoji> <code>{cid}</code>'
+                                   for char, cid in found), parse_mode="HTML")

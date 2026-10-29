@@ -4,19 +4,12 @@ import re
 from typing import Optional
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton
-)
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 
 import config
 import database
+import ui
 from logger_setup import log_user_event
 
 logger = logging.getLogger(__name__)
@@ -24,7 +17,7 @@ router = Router()
 
 
 DOCS_HUB_TEXT = (
-    "📄 <b>ДОКУМЕНТЫ И РЕГЛАМЕНТЫ СЕРВИСА AVITO RADAR</b>\n"
+    "<b>ДОКУМЕНТЫ И РЕГЛАМЕНТЫ СЕРВИСА AVITO RADAR</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "<i>Редакция от 26.10.2026 г. · Код верификации: mekbuda</i>\n\n"
     "Официальные условия предоставления услуг, политика обработки данных и правила расчётов.\n\n"
@@ -36,7 +29,7 @@ DOCS_HUB_TEXT = (
 )
 
 AGREEMENT_TEXT = (
-    "📄 <b>ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ</b>\n"
+    "<b>ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ</b>\n"
     "<i>Публичная оферта сервиса Avito Radar</i>\n"
     "<i>Редакция от 26.10.2026 г. · Код верификации: mekbuda</i>\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -59,7 +52,7 @@ AGREEMENT_TEXT = (
 )
 
 PRIVACY_TEXT = (
-    "🔒 <b>ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ</b>\n"
+    "<b>ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ</b>\n"
     "<i>Политика обработки данных сервиса Avito Radar</i>\n"
     "<i>Редакция от 26.10.2026 г. · Код верификации: mekbuda</i>\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -84,37 +77,49 @@ PRIVACY_TEXT = (
 
 
 def get_docs_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Пользовательское соглашение", callback_data="doc_agreement")],
-        [InlineKeyboardButton(text="🔒 Политика конфиденциальности", callback_data="doc_privacy")],
-        [InlineKeyboardButton(text="💳 Условия подписки и возврата", callback_data="payment_terms")],
-        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")]
-    ])
+    return ui.kb(
+        [ui.btn("Пользовательское соглашение", "docs", callback_data="doc_agreement")],
+        [ui.btn("Политика конфиденциальности", "lock", callback_data="doc_privacy")],
+        [ui.btn("Условия подписки и возврата", "card", callback_data="payment_terms")],
+        [ui.home_btn()],
+    )
 
 
 def get_doc_nav_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="« К списку документов", callback_data="open_docs_menu")],
-        [InlineKeyboardButton(text="💳 Тарифы", callback_data="open_subscription_menu"),
-         InlineKeyboardButton(text="💬 Поддержка", callback_data="support_start_ticket")],
-        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")]
-    ])
+    return ui.kb(
+        [ui.btn("« К списку документов", callback_data="open_docs_menu")],
+        [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
+         ui.btn("Поддержка", "support", callback_data="support_start_ticket")],
+        [ui.home_btn()],
+    )
 
 
 def get_main_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
-    """Главная клавиатура бота."""
+    """Нижняя клавиатура: кнопки присылают свой текст, поэтому эмодзи в них обычные."""
+    label = {key: ui.MENU[key][0] for key in ui.MENU}
     kb = [
-        [KeyboardButton(text="🎯 Добавить радар"), KeyboardButton(text="📁 Мои радары")],
-        [KeyboardButton(text="💳 Тарифы"), KeyboardButton(text="👤 Мой профиль")],
-        [KeyboardButton(text="📖 Инструкция"), KeyboardButton(text="📄 Документы")],
-        [KeyboardButton(text="💬 Поддержка")]
+        [KeyboardButton(text=label["add"]), KeyboardButton(text=label["radars"])],
+        [KeyboardButton(text=label["tariffs"]), KeyboardButton(text=label["profile"])],
+        [KeyboardButton(text=label["help"]), KeyboardButton(text=label["support"])],
     ]
     if user_id and config.is_admin(user_id):
-        kb.append([KeyboardButton(text="👑 Админ-панель")])
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+        kb.append([KeyboardButton(text=label["admin"])])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, input_field_placeholder="Пришлите ссылку на поиск Авито")
 
 
-PLAN_ICONS = {"lite": "🟢", "standart": "🔵", "pro": "🔥"}
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return ui.kb(
+        [ui.btn("Добавить радар", "radar", callback_data="add_search_prompt", style="primary")],
+        [ui.btn("Мои радары", "radars", callback_data="list_searches"),
+         ui.btn("Профиль", "profile", callback_data="refresh_profile")],
+        [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
+         ui.btn("Инструкция", "help", callback_data="open_help_menu")],
+        [ui.btn("Поддержка", "support", callback_data="support_start_ticket"),
+         ui.btn("Документы", "docs", callback_data="open_docs_menu")],
+    )
+
+
+TRIAL_HOURS = 6
 
 
 def radars_word(count: int) -> str:
@@ -125,11 +130,15 @@ def radars_word(count: int) -> str:
     return f"{count} радаров"
 
 
+def plan_icon(plan: str) -> str:
+    return ui.e(plan if plan in ("lite", "standart", "pro") else "standart")
+
+
 def plan_summary(plan: str) -> str:
-    """«🔵 Средний — 449 ₽ / 30 дней» plus its limits, for tariff lists."""
+    """«🚀 Средний — 449 ₽ / 30 дней» plus its limits, for tariff lists."""
     return (
-        f"{PLAN_ICONS[plan]} <b>{config.plan_title(plan)}</b> — {config.rub_price(plan)} ₽ / 30 дней\n"
-        f"    {radars_word(config.plan_radars(plan))}, проверка раз в {config.plan_interval(plan)} с"
+        f"{plan_icon(plan)} <b>{config.plan_title(plan)}</b> — {config.rub_price(plan)} ₽ / 30 дней\n"
+        f"{radars_word(config.plan_radars(plan))} · проверка раз в {config.plan_interval(plan)} с"
     )
 
 
@@ -149,247 +158,169 @@ def access_status(user: dict, user_id: int) -> str:
     return "Подписка не активна"
 
 
+def can_take_trial(user: dict, user_id: int) -> bool:
+    return not config.is_admin(user_id) and not user.get("subscription_until") and not user.get("trial_used")
+
+
 @router.message(CommandStart())
 @router.callback_query(F.data == "start_approved")
 async def cmd_start(event, state: FSMContext):
     await state.clear()
-    if isinstance(event, CallbackQuery):
-        message = event.message
-        user = event.from_user
-        await event.answer()
-    else:
-        message = event
-        user = message.from_user
-
-    user_id = user.id
-    username = user.username
+    user = event.from_user
     first_name = user.first_name or "Пользователь"
-
-    user_record = await database.get_or_create_user(user_id, username, first_name)
-    badge = access_status(user_record, user_id)
+    user_record = await database.get_or_create_user(user.id, user.username, first_name)
 
     text = (
-        "<b>Avito Radar</b> — новые объявления Авито прямо в Telegram\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👋 <b>{html.escape(first_name)}</b> · {badge}\n\n"
-        "<b>Как начать:</b>\n"
+        f"{ui.e('logo')} <b>Avito Radar</b>\n"
+        "Новые объявления Авито в Telegram через секунды после публикации.\n\n"
+        f"{ui.e('hello')} <b>{html.escape(first_name)}</b> · {access_status(user_record, user.id)}\n\n"
+        "<b>Как начать</b>\n"
         "1. Откройте <code>avito.ru</code>, задайте поиск и фильтры.\n"
-        "2. Скопируйте ссылку из адресной строки и пришлите её сюда.\n\n"
-        "Бот будет проверять выдачу и присылать каждый новый лот."
+        "2. Скопируйте ссылку из адресной строки и пришлите сюда.\n"
+        "Бот запомнит выдачу и будет присылать каждый новый лот."
     )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
-            InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")
-        ],
-        [
-            InlineKeyboardButton(text="💳 Тарифы", callback_data="open_subscription_menu"),
-            InlineKeyboardButton(text="👤 Мой профиль", callback_data="refresh_profile")
-        ],
-        [
-            InlineKeyboardButton(text="📖 Инструкция", callback_data="open_help_menu"),
-            InlineKeyboardButton(text="📄 Документы", callback_data="open_docs_menu")
-        ],
-        [
-            InlineKeyboardButton(text="💬 Поддержка", callback_data="support_start_ticket")
-        ]
-    ])
+    markup = main_menu_kb()
+    if can_take_trial(user_record, user.id):
+        markup.inline_keyboard.insert(0, [ui.btn(
+            f"Попробовать бесплатно — {TRIAL_HOURS} часов", "trial", callback_data="activate_trial_btn", style="success",
+        )])
 
     if isinstance(event, CallbackQuery):
-        try:
-            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-            return
-        except Exception:
-            pass
-
-    await message.answer(text, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
+        await ui.show(event, text, markup)
+        return
+    # A typed /start also refreshes the bottom keyboard (new labels, admin button).
+    await event.answer("Меню закреплено внизу экрана.", reply_markup=get_main_keyboard(user.id))
+    await event.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
-@router.message(F.text.in_({"📖 Инструкция", "❓ Помощь"}))
+@router.message(F.text.in_(ui.menu_texts("help")))
 @router.callback_query(F.data == "open_help_menu")
 @router.message(Command("help"))
 async def cmd_help(event):
-    if isinstance(event, CallbackQuery):
-        message = event.message
-        await event.answer()
-    else:
-        message = event
-
-    help_text = (
-        "<b>Как пользоваться Avito Radar</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>1. Добавьте радар</b>\n"
-        "• Откройте <code>avito.ru</code>, задайте запрос и фильтры: город, цену, состояние.\n"
-        "• Скопируйте ссылку из адресной строки и пришлите её боту.\n"
-        "• Сортировку по дате бот включит сам. Уже выложенные лоты не придут — только новые.\n\n"
-        "<b>2. Отсекайте лишнее</b>\n"
-        "• <b>Стоп-слова</b> — лоты с этими словами не придут («запчасти», «реплика»).\n"
-        "• <b>Чёрный список</b> — кнопка под лотом скрывает все объявления продавца.\n"
-        "• <b>Область поиска</b> — только заголовок или заголовок с описанием.\n\n"
-        "<b>3. Тарифы</b>\n"
-        f"• Пробный период: {config.TRIAL_RADARS} радар на 6 часов.\n"
+    text = (
+        f"{ui.e('help')} <b>Как пользоваться</b>\n\n"
+        f"{ui.e('radar')} <b>1. Добавьте радар</b>\n"
+        "Откройте <code>avito.ru</code>, задайте запрос и фильтры: город, цену, состояние. "
+        "Скопируйте ссылку из адресной строки и пришлите боту. "
+        "Сортировку по дате бот включит сам; уже выложенные лоты не придут, только новые.\n\n"
+        f"{ui.e('shield')} <b>2. Отсекайте лишнее</b>\n"
+        "• <b>Стоп-слова</b>: лоты с этими словами не придут («запчасти», «реплика»).\n"
+        "• <b>Чёрный список</b>: кнопка под лотом скрывает все объявления продавца.\n"
+        "• <b>Область поиска</b>: только заголовок или заголовок с описанием.\n\n"
+        f"{ui.e('tariffs')} <b>3. Тарифы</b>\n"
+        f"Пробный период: {radars_word(config.TRIAL_RADARS)} на {TRIAL_HOURS} часов.\n"
         f"{plan_summary('lite')}\n"
         f"{plan_summary('standart')}\n"
         f"{plan_summary('pro')}\n"
-        "• На «Полном» после технических пауз приходят до 10 свежих лотов, найденных за время паузы.\n\n"
-        "Документы: /docs. Поддержка: /support."
+        "На «Полном» после технических пауз приходят до 10 свежих лотов, найденных за паузу."
     )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="💳 Тарифы", callback_data="open_subscription_menu")
-        ],
-        [
-            InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
-            InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")
-        ],
-        [
-            InlineKeyboardButton(text="📄 Документы", callback_data="open_docs_menu"),
-            InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
-        ]
-    ])
-    if isinstance(event, CallbackQuery):
-        try:
-            await message.edit_text(help_text, reply_markup=kb, parse_mode="HTML")
-            return
-        except Exception:
-            pass
-    await message.answer(help_text, reply_markup=kb, parse_mode="HTML")
+    markup = ui.kb(
+        [ui.btn("Добавить радар", "radar", callback_data="add_search_prompt", style="primary")],
+        [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
+         ui.btn("Поддержка", "support", callback_data="support_start_ticket")],
+        [ui.home_btn()],
+    )
+    await ui.show(event, text, markup)
 
 
-@router.message(F.text.in_({"👤 Мой профиль", "📊 Мой статус"}))
+@router.message(F.text.in_(ui.menu_texts("profile")))
 @router.callback_query(F.data == "refresh_profile")
 @router.message(Command("profile"))
 async def cmd_profile(event):
+    user_id = event.from_user.id
     if isinstance(event, CallbackQuery):
-        message = event.message
-        user_id = event.from_user.id
-        await event.answer("Профиль обновлён")
-    else:
-        message = event
-        user_id = message.from_user.id
+        await event.answer("Обновлено")
 
     user = await database.get_or_create_user(user_id)
     searches = await database.get_user_searches(user_id)
     searches_count = len(searches)
     active_count = sum(1 for s in searches if s.get("is_active"))
-
     is_adm = config.is_admin(user_id)
-    sub_until = user.get("subscription_until")
-    trial_used = bool(user.get("trial_used"))
     max_radars = await database.get_user_max_radars(user_id)
     scan_interval = config.plan_interval(database.classify_user_tariff(user)[0])
 
     from scheduler import get_last_scan_info
-    scan_info = get_last_scan_info()
-    blocked_sellers_list = await database.get_user_blocked_sellers_list(user_id)
-    blocked_count = len(blocked_sellers_list)
+    blocked_count = len(await database.get_user_blocked_sellers_list(user_id))
 
     text = (
-        "<b>Мой профиль</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Доступ:</b> {access_status(user, user_id)}\n"
-        f"• <b>Радары:</b> {active_count} активных, всего {searches_count} из {max_radars}\n"
-        f"• <b>Проверка:</b> раз в {scan_interval} с\n"
-        f"• <b>Чёрный список:</b> {blocked_count} продавцов\n"
-        f"• <b>Мониторинг:</b> {scan_info}\n"
-        f"• <b>ID:</b> <code>{user_id}</code>\n"
+        f"{ui.e('profile')} <b>Профиль</b>\n\n"
+        f"<b>Доступ:</b> {access_status(user, user_id)}\n"
+        f"<b>Радары:</b> {searches_count} из {max_radars}, работают {active_count}\n"
+        f"<b>Проверка:</b> раз в {scan_interval} с\n"
+        f"<b>Чёрный список:</b> {blocked_count}\n"
+        f"<b>Последний скан:</b> {get_last_scan_info()}\n"
+        f"<b>ID:</b> <code>{user_id}</code>"
     )
 
-    buttons = []
-    if not is_adm and not sub_until and not trial_used:
-        buttons.append([InlineKeyboardButton(text="🎁 Пробный период 6 часов", callback_data="activate_trial_btn")])
+    rows = []
+    if can_take_trial(user, user_id):
+        rows.append([ui.btn(f"Пробный период {TRIAL_HOURS} часов", "trial", callback_data="activate_trial_btn", style="success")])
     if not is_adm:
-        sub_btn_text = "💳 Продлить или сменить тариф" if sub_until or user.get("is_allowed") else "💳 Выбрать тариф"
-        buttons.append([InlineKeyboardButton(text=sub_btn_text, callback_data="open_subscription_menu")])
-
-    buttons.append([
-        InlineKeyboardButton(text=f"📁 Мои радары ({searches_count})", callback_data="list_searches"),
-        InlineKeyboardButton(text=f"🚷 Чёрный список ({blocked_count})", callback_data="manage_blacklist")
+        has_plan = user.get("subscription_until") or user.get("is_allowed")
+        rows.append([ui.btn("Продлить или сменить тариф" if has_plan else "Выбрать тариф", "tariffs",
+                            callback_data="open_subscription_menu", style=None if has_plan else "primary")])
+    rows.append([
+        ui.btn(f"Радары ({searches_count})", "radars", callback_data="list_searches"),
+        ui.btn(f"Чёрный список ({blocked_count})", "ban", callback_data="manage_blacklist"),
     ])
-    buttons.append([
-        InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_profile"),
-        InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
-    ])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    if isinstance(event, CallbackQuery):
-        try:
-            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-            return
-        except Exception:
-            pass
-
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    rows.append([ui.btn("Обновить", "refresh", callback_data="refresh_profile"), ui.home_btn()])
+    await ui.show(event, text, ui.kb(*rows), answer=False)
 
 
 @router.callback_query(F.data == "activate_trial_btn")
 async def cb_activate_trial(call: CallbackQuery):
     res = await database.activate_trial(call.from_user.id)
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Активация триала", res["message"], status="OK" if res["success"] else "WARN")
-    if res["success"]:
-        formatted_until = database.format_subscription_date(res.get("until"))
-        await call.answer(f"Пробный период 6 часов активирован!\nДействует: {formatted_until}", show_alert=True)
-        await cmd_profile(call)
-    else:
+    if not res["success"]:
         await call.answer(res["message"], show_alert=True)
+        return
+    until = database.format_subscription_date(res.get("until"))
+    text = (
+        f"{ui.e('trial')} <b>Пробный период включён</b>\n\n"
+        f"Действует до {until}: {radars_word(config.TRIAL_RADARS)}, все фильтры.\n"
+        "Пришлите ссылку на поиск Авито, и первый радар заработает."
+    )
+    await ui.show(call, text, ui.kb(
+        [ui.btn("Добавить радар", "radar", callback_data="add_search_prompt", style="primary")],
+        [ui.btn("Инструкция", "help", callback_data="open_help_menu"), ui.home_btn()],
+    ))
 
 
-@router.message(F.text.in_({"💳 Тарифы", "💳 Тарифы и подписка", "Тарифы", "Подписка", "💳 Подписка"}))
+@router.message(F.text.in_(ui.menu_texts("tariffs")))
 @router.message(Command("subscribe"))
 @router.message(Command("tariffs"))
 @router.callback_query(F.data == "open_subscription_menu")
 async def cmd_subscription_menu(event):
-    if isinstance(event, CallbackQuery):
-        message = event.message
-        user_id = event.from_user.id
-        await event.answer()
-    else:
-        message = event
-        user_id = message.from_user.id
-
+    user_id = event.from_user.id
     user = await database.get_or_create_user(user_id)
-    is_adm = config.is_admin(user_id)
     current = (user.get("tariff_plan") or "").lower() if user.get("is_allowed") else ""
 
     text = (
-        "<b>Тарифы Avito Radar</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{ui.e('tariffs')} <b>Тарифы</b>\n"
         f"Сейчас: <b>{access_status(user, user_id)}</b>\n\n"
         f"{plan_summary('lite')}\n\n"
         f"{plan_summary('standart')}\n\n"
         f"{plan_summary('pro')}\n"
-        "    + догон свежих лотов после технических пауз\n\n"
-        "Чем чаще проверка, тем раньше вы увидите лот и успеете позвонить первым.\n"
-        "Оплата разовая на 30 дней, без автосписаний: СБП, Telegram Stars или криптовалюта. "
-        "Оплаченные дни суммируются с текущим сроком."
+        "+ догон свежих лотов после технических пауз\n\n"
+        "<blockquote>Чем чаще проверка, тем раньше вы увидите лот и успеете написать первым.</blockquote>\n"
+        "Оплата разовая на 30 дней, без автосписаний. Оплаченные дни добавляются к текущему сроку."
     )
 
-    buttons = []
-    if not is_adm and not user.get("subscription_until") and not user.get("trial_used"):
-        buttons.append([InlineKeyboardButton(text="🎁 Пробный период 6 часов", callback_data="activate_trial_btn")])
+    rows = []
+    if can_take_trial(user, user_id):
+        rows.append([ui.btn(f"Пробный период {TRIAL_HOURS} часов", "trial", callback_data="activate_trial_btn")])
     for plan in config.PAID_PLANS:
         mark = " · ваш" if plan == current else ""
-        buttons.append([InlineKeyboardButton(
-            text=f"{PLAN_ICONS[plan]} {config.plan_title(plan)} — {config.rub_price(plan)} ₽{mark}",
-            callback_data=f"buy_tariff:{plan}",
+        rows.append([ui.btn(
+            f"{config.plan_title(plan)} — {config.rub_price(plan)} ₽{mark}", plan,
+            callback_data=f"buy_tariff:{plan}", style="primary" if plan == "standart" and not current else None,
         )])
-    buttons.append([
-        InlineKeyboardButton(text="📄 Условия", callback_data="payment_terms"),
-        InlineKeyboardButton(text="💬 Вопрос по оплате", callback_data="payment_support")
+    rows.append([
+        ui.btn("Условия", "docs", callback_data="payment_terms"),
+        ui.btn("Вопрос по оплате", "support", callback_data="payment_support"),
     ])
-    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    if isinstance(event, CallbackQuery):
-        try:
-            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-            return
-        except Exception:
-            pass
-
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    rows.append([ui.home_btn()])
+    await ui.show(event, text, ui.kb(*rows))
 
 
 PLAN_PERKS = {
@@ -416,40 +347,30 @@ async def cb_select_tariff(call: CallbackQuery):
     # "test" is a hidden 1-day plan for checking Stars checkout end to end; it grants the Средний tariff.
     plan = "standart" if is_test else tariff_key
     text = (
-        f"{PLAN_ICONS[plan]} <b>Тариф «{title}»</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"• Радаров: <b>до {config.plan_radars(plan)}</b>\n"
-        f"• Проверка каждого радара: <b>раз в {config.plan_interval(plan)} с</b>\n"
-        "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n"
-        f"• Цена: <b>{price_label}</b> за {'1 день' if is_test else '30 дней'}\n\n"
-        f"{PLAN_PERKS[plan]}\n\n"
-        "Разовая оплата без автосписаний, доступ включается сразу после оплаты. "
-        "Оплачивая, вы соглашаетесь с /terms.\n\n"
-        "<b>Выберите способ оплаты:</b>"
+        f"{plan_icon(plan)} <b>Тариф «{title}»</b> — {price_label} за {'1 день' if is_test else '30 дней'}\n\n"
+        f"• До <b>{radars_word(config.plan_radars(plan))}</b>\n"
+        f"• Проверка каждого радара раз в <b>{config.plan_interval(plan)} с</b>\n"
+        "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n\n"
+        f"<i>{PLAN_PERKS[plan]}</i>\n\n"
+        "Разовая оплата без автосписаний, доступ включается сразу. Оплачивая, вы соглашаетесь с /terms.\n\n"
+        "<b>Способ оплаты:</b>"
     )
 
-    buttons = []
+    rows = []
     if not is_test:
-        buttons.append([InlineKeyboardButton(text=f"💳 СБП — {config.rub_price(tariff_key)} ₽",
-                                             callback_data=f"pay_method:sbp:{tariff_key}")])
+        rows.append([ui.btn(f"СБП — {config.rub_price(tariff_key)} ₽", "card",
+                            callback_data=f"pay_method:sbp:{tariff_key}", style="success")])
     if config.STARS_PAYMENTS_ENABLED:
-        buttons.append([InlineKeyboardButton(text=f"⭐ Telegram Stars — {stars} ⭐",
-                                             callback_data=f"stars_buy:{tariff_key}:{stars}")])
+        rows.append([ui.btn(f"Telegram Stars — {stars} ⭐", "star", callback_data=f"stars_buy:{tariff_key}:{stars}")])
     else:
         text += "\n\n⏸ Оплата Telegram Stars временно выключена."
     if not is_test:
-        buttons.append([InlineKeyboardButton(text="🪙 Криптовалюта", callback_data=f"pay_method:crypto:{tariff_key}")])
-    buttons.append([
-        InlineKeyboardButton(text="« Все тарифы", callback_data="open_subscription_menu"),
-        InlineKeyboardButton(text="💬 Вопрос по оплате", callback_data="payment_support")
+        rows.append([ui.btn("Криптовалюта", "coin", callback_data=f"pay_method:crypto:{tariff_key}")])
+    rows.append([
+        ui.btn("« Все тарифы", callback_data="open_subscription_menu"),
+        ui.btn("Вопрос по оплате", "support", callback_data="payment_support"),
     ])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
+    await ui.show(call, text, ui.kb(*rows))
 
 
 PAY_METHOD_TITLES = {"sbp": "СБП", "crypto": "криптовалютой"}
@@ -472,99 +393,51 @@ async def cb_other_payment_methods(call: CallbackQuery):
 
 # ── Документы и регламенты ─────────────────────────────────────────────
 
-@router.message(F.text.in_({"📄 Документы", "Документы"}))
+@router.message(F.text.in_(ui.menu_texts("docs")))
 @router.message(Command("docs"))
 @router.callback_query(F.data == "open_docs_menu")
 async def cmd_docs_hub(event):
-    message = event.message if isinstance(event, CallbackQuery) else event
-    if isinstance(event, CallbackQuery):
-        await event.answer()
-        try:
-            await message.edit_text(DOCS_HUB_TEXT, reply_markup=get_docs_keyboard(), parse_mode="HTML")
-            return
-        except Exception:
-            pass
-    await message.answer(DOCS_HUB_TEXT, reply_markup=get_docs_keyboard(), parse_mode="HTML")
+    await ui.show(event, f"{ui.e('docs')} {DOCS_HUB_TEXT}", get_docs_keyboard())
 
 
 @router.message(Command("agreement", "offer", "contract"))
 @router.callback_query(F.data == "doc_agreement")
 async def cmd_doc_agreement(event):
-    message = event.message if isinstance(event, CallbackQuery) else event
-    if isinstance(event, CallbackQuery):
-        await event.answer()
-        try:
-            await message.edit_text(AGREEMENT_TEXT, reply_markup=get_doc_nav_keyboard(), parse_mode="HTML")
-            return
-        except Exception:
-            pass
-    await message.answer(AGREEMENT_TEXT, reply_markup=get_doc_nav_keyboard(), parse_mode="HTML")
+    await ui.show(event, f"{ui.e('docs')} {AGREEMENT_TEXT}", get_doc_nav_keyboard())
 
 
 @router.message(Command("privacy", "policy"))
 @router.callback_query(F.data == "doc_privacy")
 async def cmd_doc_privacy(event):
-    message = event.message if isinstance(event, CallbackQuery) else event
-    if isinstance(event, CallbackQuery):
-        await event.answer()
-        try:
-            await message.edit_text(PRIVACY_TEXT, reply_markup=get_doc_nav_keyboard(), parse_mode="HTML")
-            return
-        except Exception:
-            pass
-    await message.answer(PRIVACY_TEXT, reply_markup=get_doc_nav_keyboard(), parse_mode="HTML")
+    await ui.show(event, f"{ui.e('lock')} {PRIVACY_TEXT}", get_doc_nav_keyboard())
 
 
 # ── Служба поддержки и контакты ───────────────────────────────────────
 
 @router.message(Command("support", "contacts"))
-@router.message(F.text.in_({"💬 Поддержка", "Поддержка", "Контакты", "Помощь", "SOS"}))
+@router.message(F.text.in_(ui.menu_texts("support")))
 @router.callback_query(F.data == "open_support_stub")
 async def cmd_support(event, state: Optional[FSMContext] = None):
     if state:
         await state.clear()
-    if isinstance(event, CallbackQuery):
-        message = event.message
-        await event.answer()
-    else:
-        message = event
-
     text = (
-        "<b>Служба поддержки клиентов</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Сервис мониторинга объявлений: <b>Avito Radar</b>\n\n"
-        "По вопросам работы сервиса, оплаты тарифов, возвратов и технической консультации:\n"
-        "• <b>Email:</b> bernardgofov@gmail.com\n"
-        "• <b>Поддержка в Telegram:</b> тикет-система прямо в боте (кнопка ниже)\n"
-        "• <b>График работы:</b> ежедневно с 09:00 до 23:00 (МСК)\n"
-        "• <b>Регламент ответа:</b> 5–15 минут (возвраты: в течение 24 часов)\n\n"
-        "Нажмите кнопку ниже, чтобы задать вопрос — оператор ответит вам в этом чате."
+        f"{ui.e('support')} <b>Поддержка</b>\n\n"
+        "Вопросы о работе бота, оплате и возвратах.\n"
+        "• Ежедневно с 09:00 до 23:00 (МСК), ответ за 5–15 минут\n"
+        "• Возвраты рассматриваем в течение 24 часов\n"
+        f"• {ui.e('mail')} bernardgofov@gmail.com\n\n"
+        "Нажмите кнопку ниже и опишите вопрос: оператор ответит в этом чате."
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✍️ Задать вопрос / Написать в поддержку", callback_data="support_start_ticket")
-        ],
-        [
-            InlineKeyboardButton(text="📄 Документы", callback_data="open_docs_menu"),
-            InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="open_subscription_menu")
-        ],
-        [
-            InlineKeyboardButton(text="👤 В профиль", callback_data="refresh_profile"),
-            InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
-        ]
-    ])
-    if isinstance(event, CallbackQuery):
-        try:
-            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-            return
-        except Exception:
-            pass
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await ui.show(event, text, ui.kb(
+        [ui.btn("Написать в поддержку", "write", callback_data="support_start_ticket", style="primary")],
+        [ui.btn("Документы", "docs", callback_data="open_docs_menu"),
+         ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu")],
+        [ui.home_btn()],
+    ))
 
 
 @router.callback_query(F.data == "support_stub_click")
 async def cb_support_stub(call: CallbackQuery):
-    await call.answer()
     await cmd_support(call)
 
 
@@ -572,53 +445,31 @@ async def cb_support_stub(call: CallbackQuery):
 
 @router.callback_query(F.data == "manage_blacklist")
 async def cb_manage_blacklist(call: CallbackQuery):
-    user_id = call.from_user.id
-    blocked = await database.get_user_blocked_sellers_list(user_id)
-
+    blocked = await database.get_user_blocked_sellers_list(call.from_user.id)
+    back_row = [ui.btn("« Профиль", callback_data="refresh_profile"), ui.home_btn()]
     if not blocked:
         text = (
-            "<b>Чёрный список продавцов</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Ваш чёрный список пока пуст.\n\n"
-            "Чтобы заблокировать продавца, нажмите кнопку «Забанить продавца» под карточкой лота. "
-            "Объявления от него больше не будут поступать ни по одному из ваших радаров."
+            f"{ui.e('ban')} <b>Чёрный список пуст</b>\n\n"
+            "Нажмите «Скрыть продавца» под лотом: его объявления перестанут приходить по всем радарам."
         )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="« Назад в профиль", callback_data="refresh_profile"),
-                InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
-            ]
-        ])
-    else:
-        text = (
-            f"<b>Чёрный список продавцов ({len(blocked)})</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Объявления от указанных продавцов автоматически блокируются:\n\n"
-            "<i>Нажмите на продавца для разблокировки:</i>"
-        )
-        buttons = []
-        for b in blocked[:12]:
-            buttons.append([
-                InlineKeyboardButton(text=f"❌ {b['seller_name'][:25]}", callback_data=f"unban_seller:{b['id']}")
-            ])
-        buttons.append([
-            InlineKeyboardButton(text="« Назад в профиль", callback_data="refresh_profile"),
-            InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
-        ])
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
+        await ui.show(call, text, ui.kb(back_row))
+        return
+    text = (
+        f"{ui.e('ban')} <b>Чёрный список</b> · {len(blocked)}\n\n"
+        "Объявления этих продавцов не приходят. Нажмите на продавца, чтобы вернуть его."
+    )
+    if len(blocked) > 12:
+        text += f"\n<i>Показаны первые 12 из {len(blocked)}.</i>"
+    rows = [[ui.btn(f"✖ {b['seller_name'][:30]}", callback_data=f"unban_seller:{b['id']}")] for b in blocked[:12]]
+    rows.append(back_row)
+    await ui.show(call, text, ui.kb(*rows))
 
 
 @router.callback_query(F.data.startswith("unban_seller:"))
 async def cb_unban_seller(call: CallbackQuery):
     block_id = int(call.data.split(":")[1])
     await database.remove_blocked_seller_by_id(call.from_user.id, block_id)
-    await call.answer("✅ Продавец разблокирован!", show_alert=True)
+    await call.answer("Продавец убран из чёрного списка")
     await cb_manage_blacklist(call)
 
 
@@ -644,15 +495,14 @@ async def cb_ban_seller(call: CallbackQuery):
         seller_name = (item_obj.get("seller_name") or "").strip()
 
     if not seller_name and call.message:
+        # Old notifications: the seller line is "👤 Продавец: Имя" in the plain message text.
         msg_text = call.message.caption or call.message.text or ""
-        m = re.search(r"👤\s*<b>Продавец:</b>\s*([^·\n<]+)", msg_text)
-        if not m:
-            m = re.search(r"👤\s*Продавец:\s*([^·\n]+)", msg_text)
+        m = re.search(r"👤\s*Продавец:\s*([^·\n]+)", msg_text)
         if m:
             seller_name = m.group(1).strip()
 
     if not seller_name or seller_name.lower() in {"продавец", "компания", "частное лицо"}:
-        await call.answer("Не удалось определить имя продавца для блокировки", show_alert=True)
+        await call.answer("Не удалось определить имя продавца", show_alert=True)
         return
 
     await database.add_blocked_seller(user_id, seller_name)
@@ -660,6 +510,6 @@ async def cb_ban_seller(call: CallbackQuery):
     logger.info(f"🚷 [ЧЕРНЫЙ СПИСОК] Пользователь ID:{user_id} заблокировал продавца «{seller_name}»")
 
     await call.answer(
-        f"🚷 Продавец «{seller_name}» добавлен в ваш Чёрный список!\nЛоты от него больше не будут приходить.",
+        f"🚫 «{seller_name}» в чёрном списке.\nЕго лоты больше не придут. Вернуть: Профиль → Чёрный список.",
         show_alert=True
     )

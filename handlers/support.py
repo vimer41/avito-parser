@@ -18,6 +18,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
 import config
 import database
+import ui
 from logger_setup import log_user_event
 
 logger = logging.getLogger(__name__)
@@ -36,32 +37,18 @@ async def cb_support_start(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(SupportStates.waiting_for_user_message)
     text = (
-        "💬 <b>ОБРАЩЕНИЕ В СЛУЖБУ ПОДДЕРЖКИ</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Напишите ваш вопрос, проблему или пожелание одним сообщением.\n\n"
-        "📧 Также вы можете написать на почту: <b>bernardgofov@gmail.com</b>\n\n"
-        "<i>Вы можете отправить текст или прикрепить скриншот/фото с описанием. "
-        "Администраторы получат сообщение и ответят вам прямо в этом боте.</i>"
+        f"{ui.e('write')} <b>Сообщение в поддержку</b>\n\n"
+        "Опишите вопрос одним сообщением. Можно приложить скриншот, фото или голосовое.\n"
+        "Оператор ответит прямо в этом чате.\n\n"
+        f"{ui.e('mail')} Или на почту: bernardgofov@gmail.com"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="support_cancel")],
-        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")]
-    ])
-    try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
+    await ui.show(call, text, ui.kb([ui.btn("Отмена", "cancel", callback_data="support_cancel")]))
 
 
 @router.callback_query(F.data == "support_cancel")
 async def cb_support_cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")]
-    ])
-    await call.message.edit_text("❌ <b>Обращение в службу поддержки отменено.</b>", reply_markup=cancel_kb, parse_mode="HTML")
-    await call.answer()
+    await ui.show(call, f"{ui.e('cancel')} <b>Обращение отменено</b>", ui.kb([ui.home_btn()]))
 
 
 
@@ -72,10 +59,9 @@ async def handle_user_support_message(message: Message, state: FSMContext, bot: 
     user = message.from_user
     user_id = user.id
 
-    # Проверка на отмену текстом
-    if message.text and message.text.strip().lower() in {"отмена", "❌ отмена", "/cancel"}:
-        await state.clear()
-        await message.answer("❌ <b>Обращение в службу поддержки отменено.</b>", parse_mode="HTML")
+    # A bottom-menu button or a command is navigation, not the ticket text.
+    from handlers.searches import route_menu_text
+    if await route_menu_text(message, state):
         return
 
     text_content = message.text or message.caption or "(без текста, вложение)"
@@ -155,8 +141,9 @@ async def handle_user_support_message(message: Message, state: FSMContext, bot: 
     )
 
     await message.answer(
-        "✅ <b>Ваше обращение принято и передано администрации!</b>\n\n"
-        "Мы уже получили ваш запрос и ответим вам прямо в этом боте в ближайшее время.",
+        f"{ui.e('ok')} <b>Обращение отправлено</b>\n\n"
+        "Ответ придёт в этот чат. Обычно отвечаем за 5–15 минут с 09:00 до 23:00 (МСК).",
+        reply_markup=ui.kb([ui.home_btn()]),
         parse_mode="HTML"
     )
 
@@ -287,13 +274,8 @@ async def send_reply_to_user(bot: Bot, target_user_id: int, message: Message) ->
     reply_text = message.text or message.caption or ""
     clean_text = html.escape(reply_text.strip())
 
-    user_header = (
-        "💬 <b>ОТВЕТ СЛУЖБЫ ПОДДЕРЖКИ:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{clean_text}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Если у вас остались вопросы — вы можете написать нам снова через кнопку «💬 Поддержка».</i>"
-    )
+    user_header = f"{ui.e('support')} <b>Ответ поддержки</b>\n\n{clean_text}"
+    reply_kb = ui.kb([ui.btn("Ответить", "write", callback_data="support_start_ticket")])
 
     try:
         if message.photo:
@@ -302,6 +284,7 @@ async def send_reply_to_user(bot: Bot, target_user_id: int, message: Message) ->
                 chat_id=target_user_id,
                 photo=photo_id,
                 caption=user_header,
+                reply_markup=reply_kb,
                 parse_mode="HTML"
             )
         elif message.document:
@@ -309,6 +292,7 @@ async def send_reply_to_user(bot: Bot, target_user_id: int, message: Message) ->
                 chat_id=target_user_id,
                 document=message.document.file_id,
                 caption=user_header,
+                reply_markup=reply_kb,
                 parse_mode="HTML"
             )
         elif message.voice:
@@ -316,6 +300,7 @@ async def send_reply_to_user(bot: Bot, target_user_id: int, message: Message) ->
                 chat_id=target_user_id,
                 voice=message.voice.file_id,
                 caption=user_header,
+                reply_markup=reply_kb,
                 parse_mode="HTML"
             )
         elif message.video:
@@ -323,12 +308,14 @@ async def send_reply_to_user(bot: Bot, target_user_id: int, message: Message) ->
                 chat_id=target_user_id,
                 video=message.video.file_id,
                 caption=user_header,
+                reply_markup=reply_kb,
                 parse_mode="HTML"
             )
         else:
             await bot.send_message(
                 chat_id=target_user_id,
                 text=user_header,
+                reply_markup=reply_kb,
                 parse_mode="HTML"
             )
         return True, ""

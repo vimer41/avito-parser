@@ -22,6 +22,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboar
 
 import config
 import database
+import ui
 from freshness import freshness_status, publication_age_seconds
 from request_budget import get_network_block_state, RequestDeferred, RequestBudgetExceeded
 from runtime_metrics import METRICS
@@ -326,12 +327,13 @@ def format_radar_footer(search_title: str = "", radar_titles: Optional[List[str]
         if t not in unique_titles:
             unique_titles.append(t)
 
+    icon = ui.e("radar")
     if len(unique_titles) == 1:
-        return f"🎯 Радар: <b>{html.escape(unique_titles[0])}</b>"
+        return f"{icon} Радар: <b>{html.escape(unique_titles[0])}</b>"
     if len(unique_titles) == 2:
-        return f"🎯 Радары: <b>{html.escape(unique_titles[0])}</b>, <b>{html.escape(unique_titles[1])}</b>"
+        return f"{icon} Радары: <b>{html.escape(unique_titles[0])}</b>, <b>{html.escape(unique_titles[1])}</b>"
     extra = len(unique_titles) - 2
-    return f"🎯 Радары: <b>{html.escape(unique_titles[0])}</b>, <b>{html.escape(unique_titles[1])}</b> (+{extra})"
+    return f"{icon} Радары: <b>{html.escape(unique_titles[0])}</b>, <b>{html.escape(unique_titles[1])}</b> (+{extra})"
 
 
 def build_notification_text(
@@ -353,24 +355,25 @@ def build_notification_text(
     # Бейджи статуса объявления (резерв / продвижение)
     badges = []
     if getattr(item, "is_reserved", False):
-        badges.append("🔒 <b>В РЕЗЕРВЕ</b>")
+        badges.append(f"{ui.e('lock')} в резерве")
     if getattr(item, "is_promotion", False):
-        badges.append("⚡️ <b>ПРОДВИНУТО</b>")
-    badge_header = f" [{ ' · '.join(badges) }]" if badges else ""
+        badges.append("продвинуто")
+    badge_header = f" · {' · '.join(badges)}" if badges else ""
 
     discount_badge = ""
     if getattr(item, "was_lowered", False) and getattr(item, "discount_percent", None):
-        discount_badge = f" 🏷 <i>(-{item.discount_percent}%)</i>"
+        discount_badge = f" <i>(−{item.discount_percent}%)</i>"
 
     header_lines = [
-        f"⚡️ <b>НОВЫЙ ЛОТ · AVITO RADAR</b>{badge_header}",
-        f"🏷 <b>{clean_price}</b>{discount_badge} · <b>{clean_title}</b>",
+        f"{ui.e('new')} <b>Новый лот</b>{badge_header}",
+        f"<b>{clean_title}</b>",
+        f"{ui.e('price')} <b>{clean_price}</b>{discount_badge}",
     ]
     if is_catchup:
-        header_lines.append("🕒 найдено после паузы")
+        header_lines.append(f"{ui.e('time')} <i>найдено после паузы</i>")
     if possible_duplicate_after_crash:
-        header_lines.append("🔁 повторное уведомление после перезапуска")
-    header_lines.append("────────────────────")
+        header_lines.append("🔁 <i>повторное уведомление после перезапуска</i>")
+    header_lines.append("")
 
     detail_lines = []
     # Локация / Адрес
@@ -380,43 +383,39 @@ def build_notification_text(
         if m:
             address = m.group(1).strip()
     if address:
-        detail_lines.append(f"📍 <b>Адрес:</b> {html.escape(address)}")
+        detail_lines.append(f"{ui.e('place')} {html.escape(address)}")
 
     # Состояние и доставка
-    details = []
-    if item.condition:
-        details.append(f"✨ {html.escape(item.condition)}")
-    if item.delivery:
-        details.append(f"🚚 {html.escape(item.delivery)}")
+    details = [html.escape(v) for v in (item.condition, item.delivery) if v]
     if details:
-        detail_lines.append(f"📦 <b>Детали:</b> {' · '.join(details)}")
+        detail_lines.append(f"{ui.e('box')} {' · '.join(details)}")
 
     # Преимущества и бейджи (Скидка на доставку, 14 дней на возврат, Торг и т.д.)
     if getattr(item, "badges", None):
         clean_badges = [html.escape(b) for b in item.badges[:3]]
-        detail_lines.append(f"🛡 <b>Преимущества:</b> {' · '.join(clean_badges)}")
+        detail_lines.append(f"{ui.e('ok')} {' · '.join(clean_badges)}")
 
     # Просмотры (если подгружены)
     if getattr(item, "views_total", None) is not None:
         today_str = f" (+{item.views_today} сегодня)" if getattr(item, "views_today", None) is not None else ""
-        detail_lines.append(f"👁 <b>Просмотры:</b> {item.views_total}{today_str}")
+        detail_lines.append(f"{ui.e('views')} {item.views_total}{today_str}")
 
-    # Продавец
+    # Продавец: строка «👤 Продавец: …» нужна и старой кнопке бана, которая ищет её в тексте
     if item.seller:
-        detail_lines.append(f"👤 <b>Продавец:</b> {html.escape(item.seller)}")
+        detail_lines.append(f"{ui.e('profile')} Продавец: {html.escape(item.seller)}")
 
     # Время: возраст считается на момент отправки, а не на момент скана
     item_age = format_item_age(item.date, item.timestamp) if item.timestamp else item.date
     if item_age:
-        detail_lines.append(f"🕒 <b>Опубликовано:</b> {html.escape(item_age)}")
+        detail_lines.append(f"{ui.e('time')} {html.escape(item_age)}")
 
     footer_lines = [
-        "────────────────────",
+        "",
         format_radar_footer(clean_search, radar_titles),
     ]
 
-    # Безопасный динамический расчет длины для Telegram caption (жесткий лимит Telegram = 1024 символа для фото)
-    base_chars = sum(len(l) + 1 for l in (header_lines + detail_lines + footer_lines))
+    # Лимит подписи к фото в Telegram — 1024 видимых символа (теги и премиум-эмодзи не считаются)
+    base_chars = sum(ui.visible_len(l) + 1 for l in (header_lines + detail_lines + footer_lines))
     max_desc_budget = max(0, 960 - base_chars)
 
     desc_lines = []
@@ -425,7 +424,7 @@ def build_notification_text(
         allowed_len = min(280, max_desc_budget)
         if len(raw_desc) > allowed_len:
             raw_desc = raw_desc[: allowed_len - 3].rstrip() + "..."
-        desc_lines = ["", f"📝 <i>«{html.escape(raw_desc)}»</i>"]
+        desc_lines = ["", f"<blockquote>{html.escape(raw_desc)}</blockquote>"]
 
     all_lines = header_lines + detail_lines + desc_lines + footer_lines
     return "\n".join(all_lines)
@@ -439,11 +438,11 @@ def build_notification_keyboard(
     use_event_callbacks: bool = True,
 ) -> InlineKeyboardMarkup:
     """Инлайн-кнопки под карточкой товара (привязаны к event_id для групповых событий)."""
-    row1 = [InlineKeyboardButton(text="↗️ Открыть на Авито", url=item_url)]
+    row1 = [ui.btn("Открыть на Авито", "link", url=item_url, style="primary")]
     stop_cb = f"event_stop:{target_id}" if use_event_callbacks else f"add_stop_from_item:{target_id}"
-    row2 = [InlineKeyboardButton(text="🛡 Стоп-слово", callback_data=stop_cb)]
+    row2 = [ui.btn("Стоп-слово", "shield", callback_data=stop_cb)]
     if has_seller:
-        row2.append(InlineKeyboardButton(text="🚷 Забанить продавца", callback_data=f"ban_seller:{target_id}"))
+        row2.append(ui.btn("Скрыть продавца", "ban", callback_data=f"ban_seller:{target_id}"))
     return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
 
 
@@ -1280,7 +1279,7 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
 def build_digest_text(entries: list[dict]) -> str:
     """One message for a burst of lots of one chat: numbered title links with price and age."""
     radar_titles = {title for ctx in entries for title in ctx["radar_titles"][:1]}
-    header = f"🔥 <b>{len(entries)} {plural_form(len(entries), 'новый лот', 'новых лота', 'новых лотов')}</b>"
+    header = f"{ui.e('pro')} <b>{len(entries)} {plural_form(len(entries), 'новый лот', 'новых лота', 'новых лотов')}</b>"
     if len(radar_titles) == 1:
         header += f" · «{html.escape(next(iter(radar_titles)))}»"
     lines = [header, ""]
