@@ -40,8 +40,6 @@ class SearchStates(StatesGroup):
     waiting_for_url = State()
     waiting_for_stop_word = State()
     waiting_for_custom_age = State()
-    waiting_for_rename = State()
-    waiting_for_new_url = State()
 
 
 async def route_menu_text(message: Message, state: FSMContext) -> bool:
@@ -207,66 +205,6 @@ def _url_error_kb() -> InlineKeyboardMarkup:
     )
 
 
-def search_url_error(raw_url: str) -> Optional[str]:
-    """Why a text is not a usable Avito search link, or None."""
-    if "avito.ru" not in raw_url.lower():
-        return (f"{ui.e('warn')} <b>Нужна ссылка с avito.ru</b>\n\n"
-                "Например: <code>https://www.avito.ru/moskva/telefony?q=iphone</code>")
-    if "/item/" in raw_url or re.search(r"_\d{8,}", raw_url):
-        return (f"{ui.e('warn')} <b>Это ссылка на одно объявление</b>\n\n"
-                "Радару нужна ссылка на <b>страницу поиска</b>: со списком объявлений и фильтрами.")
-    return None
-
-
-# Registered before process_avito_url: a link sent while replacing a radar's link must not become a new radar.
-@router.message(SearchStates.waiting_for_new_url)
-async def process_new_url(message: Message, state: FSMContext):
-    if await route_menu_text(message, state):
-        return
-    raw_url = (message.text or "").strip()
-    search_id = (await state.get_data()).get("url_search_id")
-    s = await database.get_search(int(search_id or 0))
-    if not s or s.get("user_id") != message.from_user.id:
-        await state.clear()
-        await message.answer("Радар не найден.", reply_markup=ui.kb([ui.btn("Мои радары", "radars", callback_data="list_searches")]))
-        return
-    error = search_url_error(raw_url)
-    if error is None:
-        try:
-            normalized_url = AvitoParser.normalize_url(raw_url)
-        except Exception as e:
-            error = f"{ui.e('warn')} Не получилось разобрать ссылку: {html.escape(str(e))}"
-    if error is not None:
-        await message.answer(error, parse_mode="HTML", reply_markup=ui.kb(
-            [ui.btn("Отмена", "cancel", callback_data=f"open_search:{search_id}")]))
-        return
-    if any(r["url"] == normalized_url and r["id"] != s["id"] for r in await database.get_user_searches(message.from_user.id)):
-        await message.answer(f"{ui.e('warn')} Эта ссылка уже есть в другом вашем радаре.", parse_mode="HTML")
-        return
-
-    await state.clear()
-    status_msg = await message.answer(f"{ui.e('wait')} <b>Запоминаю новую выдачу…</b>", parse_mode="HTML")
-    try:
-        snapshot = await SOURCE_SNAPSHOTS.load(normalized_url)
-    except Exception as e:
-        logger.warning("Ошибка калибровки при замене ссылки: %s", e)
-        snapshot = None
-    initial_items = [(item.item_id, item.raw_price) for item in snapshot.items] if snapshot is not None else None
-    if snapshot is None:
-        RESUMED_SOURCE_URLS.add(normalized_url)
-    await database.replace_search_url(
-        s["id"], message.from_user.id, normalized_url, 1 if "bt=1" in normalized_url else 0,
-        initial_items=initial_items,
-    )
-    log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Замена ссылки радара",
-                   f"Радар #{s['id']} -> {normalized_url[:80]}", status="OK")
-    s = await database.get_search(s["id"])
-    card_text, markup = build_radar_card(s)
-    note = (f"{ui.e('ok')} <b>Ссылка заменена.</b> Уже выложенные лоты новой выдачи не придут; "
-            "название и стоп-слова остались прежними.\n\n")
-    await status_msg.edit_text(note + card_text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
-
-
 @router.message(F.text.regexp(r"(?i)avito\.ru"))
 @router.message(SearchStates.waiting_for_url)
 async def process_avito_url(message: Message, state: FSMContext):
@@ -284,10 +222,24 @@ async def process_avito_url(message: Message, state: FSMContext):
             await bulk_add_radars(message, state, bulk_urls)
             return
 
-    url_error = search_url_error(raw_url)
-    if url_error is not None:
-        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка ссылки: «{raw_url[:80]}»", status="WARN")
-        await message.answer(url_error, reply_markup=_url_error_kb(), parse_mode="HTML")
+    if "avito.ru" not in raw_url.lower():
+        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка: ссылка не с avito.ru («{raw_url[:80]}»)", status="WARN")
+        await message.answer(
+            f"{ui.e('warn')} <b>Нужна ссылка с avito.ru</b>\n\n"
+            "Например: <code>https://www.avito.ru/moskva/telefony?q=iphone</code>",
+            reply_markup=_url_error_kb(),
+            parse_mode="HTML"
+        )
+        return
+
+    if "/item/" in raw_url or re.search(r"_\d{8,}", raw_url):
+        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", "Ошибка: ссылка на объявление (/item/), а не на поиск", status="WARN")
+        await message.answer(
+            f"{ui.e('warn')} <b>Это ссылка на одно объявление</b>\n\n"
+            "Радару нужна ссылка на <b>страницу поиска</b>: со списком объявлений и фильтрами.",
+            reply_markup=_url_error_kb(),
+            parse_mode="HTML"
+        )
         return
 
     current_count = await database.count_user_searches(user_id)
@@ -427,8 +379,6 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     markup = ui.kb(
         [toggle, ui.btn(f"Стоп-слова ({stops_count})", "shield", callback_data=f"manage_stops:{search_id}")],
         [_scope_button(search_id, title_only)],
-        [ui.btn("Переименовать", "write", callback_data=f"rename_search:{search_id}"),
-         ui.btn("Сменить ссылку", "refresh", callback_data=f"change_url:{search_id}")],
         [ui.btn("На Авито", "link", url=s["url"]),
          ui.btn("Удалить", "trash", callback_data=f"delete_search:{search_id}", style="danger")],
         [ui.btn("« Все радары", callback_data="list_searches"), ui.home_btn()],
@@ -441,12 +391,30 @@ async def _show_card(event, s: dict) -> None:
     await ui.show(event, card_text, markup, disable_web_page_preview=True)
 
 
+RADARS_PAGE = 10
+
+
+def _page_nav(page: int, pages: int, prefix: str) -> list:
+    """« 2/5 » row for a paged list; empty when everything fits on one page."""
+    if pages <= 1:
+        return []
+    return [
+        ui.btn("«", callback_data=f"{prefix}:{(page - 1) % pages}"),
+        ui.btn(f"{page + 1}/{pages}", callback_data=f"{prefix}:{page}"),
+        ui.btn("»", callback_data=f"{prefix}:{(page + 1) % pages}"),
+    ]
+
+
 @router.message(F.text.in_(ui.menu_texts("radars")))
 @router.callback_query(F.data == "list_searches")
-async def show_searches(event, state: Optional[FSMContext] = None):
+@router.callback_query(F.data.startswith("list_searches:"))
+async def show_searches(event, state: Optional[FSMContext] = None, page: int = 0):
     user_id = event.from_user.id
     if state:
         await state.clear()
+    data = getattr(event, "data", None) or ""
+    if data.startswith("list_searches:") and data.split(":")[1].isdigit():
+        page = int(data.split(":")[1])
     searches = await database.get_user_searches(user_id)
 
     if not searches:
@@ -463,12 +431,17 @@ async def show_searches(event, state: Optional[FSMContext] = None):
     from scheduler import get_last_scan_info
     max_radars = await database.get_user_max_radars(user_id)
     active_cnt = sum(1 for s in searches if s.get("is_active"))
+    pages = -(-len(searches) // RADARS_PAGE)
+    page = max(0, min(page, pages - 1))
+    first = page * RADARS_PAGE
+    page_searches = searches[first:first + RADARS_PAGE]
     lines = [
         f"{ui.e('radars')} <b>Мои радары</b> · {len(searches)} из {max_radars}",
-        f"Работают: {active_cnt} · последний скан {get_last_scan_info()}",
+        f"Работают: {active_cnt} · последний скан {get_last_scan_info()}"
+        + (f" · стр. {page + 1}/{pages}" if pages > 1 else ""),
         "",
     ]
-    for i, s in enumerate(searches, 1):
+    for i, s in enumerate(page_searches, first + 1):
         dot = ui.e("on") if s.get("is_active") else ui.e("pause")
         stops_cnt = len(s["stop_words"])
         stops_str = f" · {ui.e('shield')} {stops_cnt}" if stops_cnt else ""
@@ -477,12 +450,15 @@ async def show_searches(event, state: Optional[FSMContext] = None):
     lines.append("<i>Нажмите на радар, чтобы настроить его.</i>")
 
     rows = []
-    for i, s in enumerate(searches, 1):
+    for i, s in enumerate(page_searches, first + 1):
         raw_title = s["title"].strip()
         short_title = (raw_title[:27] + "…") if len(raw_title) > 28 else raw_title
         rows.append([ui.btn(f"{i}. {short_title}", "on" if s.get("is_active") else "pause",
                             callback_data=f"open_search:{s['id']}")])
-    add_row = [ui.btn("Обновить", "refresh", callback_data="list_searches")]
+    nav = _page_nav(page, pages, "list_searches")
+    if nav:
+        rows.append(nav)
+    add_row = [ui.btn("Обновить", "refresh", callback_data=f"list_searches:{page}")]
     if len(searches) < max_radars:
         add_row.insert(0, ui.btn("Добавить", "add", callback_data="add_search_prompt"))
     rows.append(add_row)
@@ -684,81 +660,31 @@ async def process_custom_age_input(message: Message, state: FSMContext):
     await show_searches(message, state)
 
 
-# ── Переименование и замена ссылки ─────────────────────────────────────
-
-@router.callback_query(F.data.startswith("rename_search:"))
-async def cb_rename_search(call: CallbackQuery, state: FSMContext):
-    search_id = int(call.data.split(":")[1])
-    s = await _own_search(call, search_id)
-    if not s:
-        return
-    await state.set_state(SearchStates.waiting_for_rename)
-    await state.update_data(rename_search_id=search_id)
-    await ui.show(call, (
-        f"{ui.e('write')} <b>Новое название радара</b>\n\n"
-        f"Сейчас: <b>{html.escape(s['title'])}</b>\nПришлите новое название, до 100 символов."
-    ), ui.kb([ui.btn("Отмена", "cancel", callback_data=f"open_search:{search_id}")]))
-
-
-@router.message(SearchStates.waiting_for_rename)
-async def process_rename(message: Message, state: FSMContext):
-    if await route_menu_text(message, state):
-        return
-    title = " ".join((message.text or "").split())
-    if not title:
-        await message.answer("Пришлите название текстом.")
-        return
-    search_id = int((await state.get_data()).get("rename_search_id") or 0)
-    await state.clear()
-    if not await database.rename_search(search_id, message.from_user.id, title):
-        await message.answer("Радар не найден.", reply_markup=ui.kb([ui.btn("Мои радары", "radars", callback_data="list_searches")]))
-        return
-    log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Переименование радара",
-                   f"Радар #{search_id} -> «{title[:100]}»", status="OK")
-    await _show_card(message, await database.get_search(search_id))
-
-
-@router.callback_query(F.data.startswith("change_url:"))
-async def cb_change_url(call: CallbackQuery, state: FSMContext):
-    search_id = int(call.data.split(":")[1])
-    s = await _own_search(call, search_id)
-    if not s:
-        return
-    await state.set_state(SearchStates.waiting_for_new_url)
-    await state.update_data(url_search_id=search_id)
-    await ui.show(call, (
-        f"{ui.e('refresh')} <b>Новая ссылка для «{html.escape(s['title'])}»</b>\n\n"
-        "Пришлите ссылку на поиск Авито. Название, стоп-слова и настройки останутся, "
-        "а уже выложенные лоты новой выдачи не придут."
-    ), ui.kb([ui.btn("Отмена", "cancel", callback_data=f"open_search:{search_id}")]))
-
-
 # ── Массовое удаление (только админы) ──────────────────────────────────
-
-BULK_PAGE = 20
-
 
 async def _bulk_screen(call: CallbackQuery, state: FSMContext, page: int) -> None:
     searches = await database.get_user_searches(call.from_user.id)
     selected = set((await state.get_data()).get("bulk_sel") or [])
     selected &= {s["id"] for s in searches}
     await state.update_data(bulk_sel=sorted(selected))
-    pages = max(1, -(-len(searches) // BULK_PAGE))
+    pages = max(1, -(-len(searches) // RADARS_PAGE))
     page = max(0, min(page, pages - 1))
+    first = page * RADARS_PAGE
+    page_ids = [s["id"] for s in searches[first:first + RADARS_PAGE]]
     rows = []
-    for i, s in enumerate(searches[page * BULK_PAGE:(page + 1) * BULK_PAGE], page * BULK_PAGE + 1):
+    for i, s in enumerate(searches[first:first + RADARS_PAGE], first + 1):
         mark = "☑" if s["id"] in selected else "☐"
         title = s["title"].strip()
-        rows.append([ui.btn(f"{mark} {i}. {title[:30]}", callback_data=f"bulk_tog:{s['id']}:{page}")])
-    nav = []
-    if page > 0:
-        nav.append(ui.btn("«", callback_data=f"bulk_del:{page - 1}"))
-    if page < pages - 1:
-        nav.append(ui.btn("»", callback_data=f"bulk_del:{page + 1}"))
+        short_title = (title[:27] + "…") if len(title) > 28 else title
+        rows.append([ui.btn(f"{mark} {i}. {short_title}", callback_data=f"bulk_tog:{s['id']}:{page}")])
+    nav = _page_nav(page, pages, "bulk_del")
     if nav:
         rows.append(nav)
-    rows.append([ui.btn("Выбрать все", callback_data=f"bulk_all:{page}"),
-                 ui.btn("Снять все", callback_data=f"bulk_none:{page}")])
+    page_all = bool(page_ids) and set(page_ids) <= selected
+    rows.append([
+        ui.btn("Снять на странице" if page_all else "Отметить страницу", callback_data=f"bulk_page:{page}"),
+        ui.btn("Снять все" if selected else "Выбрать все", callback_data=f"bulk_{'none' if selected else 'all'}:{page}"),
+    ])
     if selected:
         rows.append([ui.btn(f"Удалить выбранные ({len(selected)})", "trash", callback_data="bulk_go", style="danger")])
     rows.append([ui.btn("« Мои радары", callback_data="list_searches")])
@@ -770,7 +696,7 @@ async def _bulk_screen(call: CallbackQuery, state: FSMContext, page: int) -> Non
     await ui.show(call, text, ui.kb(*rows))
 
 
-@router.callback_query(F.data.startswith(("bulk_del:", "bulk_tog:", "bulk_all:", "bulk_none:")))
+@router.callback_query(F.data.startswith(("bulk_del:", "bulk_tog:", "bulk_all:", "bulk_none:", "bulk_page:")))
 async def cb_bulk_select(call: CallbackQuery, state: FSMContext):
     if not config.is_admin(call.from_user.id):
         await call.answer("Доступно только администраторам", show_alert=True)
@@ -786,6 +712,10 @@ async def cb_bulk_select(call: CallbackQuery, state: FSMContext):
         selected = {s["id"] for s in await database.get_user_searches(call.from_user.id)}
     elif action == "bulk_none":
         selected = set()
+    elif action == "bulk_page" and args[0].isdigit():
+        first = int(args[0]) * RADARS_PAGE
+        page_ids = {s["id"] for s in (await database.get_user_searches(call.from_user.id))[first:first + RADARS_PAGE]}
+        selected = selected - page_ids if page_ids <= selected else selected | page_ids
     await state.update_data(bulk_sel=sorted(selected))
     await _bulk_screen(call, state, int(args[0]) if args and args[0].isdigit() else 0)
 

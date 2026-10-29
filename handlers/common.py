@@ -263,66 +263,8 @@ async def cmd_profile(event):
         ui.btn(f"Радары ({searches_count})", "radars", callback_data="list_searches"),
         ui.btn(f"Чёрный список ({blocked_count})", "ban", callback_data="manage_blacklist"),
     ])
-    night_mode, night_from, night_to = await database.get_night_settings(user_id)
-    night = "выкл" if night_mode == database.NIGHT_OFF else f"{night_from:02d}–{night_to:02d}"
-    rows.append([ui.btn(f"Ночной режим: {night}", "pause", callback_data="night_mode")])
     rows.append([ui.btn("Обновить", "refresh", callback_data="refresh_profile"), ui.home_btn()])
     await ui.show(event, text, ui.kb(*rows), answer=False)
-
-
-# mode -> (short label, explanation)
-NIGHT_MODES = {
-    database.NIGHT_OFF: ("выкл", "лоты приходят круглосуточно со звуком"),
-    database.NIGHT_SILENT: ("без звука", "ночью лоты приходят без звука и вибрации"),
-    database.NIGHT_HOLD: ("не присылать", "ночью лоты не приходят совсем"),
-}
-
-
-@router.callback_query(F.data == "night_mode")
-@router.callback_query(F.data.startswith(("night_mode:", "night_from:", "night_to:")))
-async def cb_night_mode(call: CallbackQuery):
-    user_id = call.from_user.id
-    if ":" in call.data:
-        field, value = call.data.split(":", 1)
-        value = int(value) if value.isdigit() else -1
-        if field == "night_mode" and value in NIGHT_MODES:
-            await database.set_night_settings(user_id, mode=value)
-            log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Ночной режим", NIGHT_MODES[value][0], status="OK")
-            await call.answer(f"Ночной режим: {NIGHT_MODES[value][0]}")
-        elif field in ("night_from", "night_to") and 0 <= value < 24:
-            await database.set_night_settings(user_id, **{"from_hour" if field == "night_from" else "to_hour": value})
-            await call.answer("Время сохранено")
-    mode, from_hour, to_hour = await database.get_night_settings(user_id)
-    status = (
-        "Выключен: лоты приходят круглосуточно со звуком." if mode == database.NIGHT_OFF
-        else f"С <b>{from_hour:02d}:00</b> до <b>{to_hour:02d}:00</b> (МСК) {NIGHT_MODES[mode][1].split('ночью ')[-1]}."
-    )
-    text = (
-        f"{ui.e('pause')} <b>Ночной режим</b>\n\n{status}\n\n"
-        + "\n".join(f"{'●' if m == mode else '○'} <b>{label.capitalize()}</b> — {hint}"
-                    for m, (label, hint) in NIGHT_MODES.items())
-    )
-    rows = [[ui.btn(("✓ " if m == mode else "") + label.capitalize(), callback_data=f"night_mode:{m}")
-             for m, (label, _hint) in NIGHT_MODES.items()]]
-    if mode != database.NIGHT_OFF:
-        rows.append([ui.btn(f"Начало: {from_hour:02d}:00", "time", callback_data="night_pick:from"),
-                     ui.btn(f"Конец: {to_hour:02d}:00", "time", callback_data="night_pick:to")])
-    rows.append([ui.btn("« Профиль", callback_data="refresh_profile"), ui.home_btn()])
-    await ui.show(call, text, ui.kb(*rows))
-
-
-@router.callback_query(F.data.startswith("night_pick:"))
-async def cb_night_pick(call: CallbackQuery):
-    which = "from" if call.data.endswith(":from") else "to"
-    _mode, from_hour, to_hour = await database.get_night_settings(call.from_user.id)
-    current = from_hour if which == "from" else to_hour
-    rows = []
-    for start in range(0, 24, 6):
-        rows.append([ui.btn(("✓" if h == current else "") + f"{h:02d}", callback_data=f"night_{which}:{h}")
-                     for h in range(start, start + 6)])
-    rows.append([ui.btn("« Назад", callback_data="night_mode")])
-    title = "С какого часа" if which == "from" else "До какого часа"
-    await ui.show(call, f"{ui.e('time')} <b>{title} включать ночной режим?</b>\nВремя московское.", ui.kb(*rows))
 
 
 @router.callback_query(F.data == "activate_trial_btn")

@@ -565,7 +565,6 @@ async def send_ad_to_user(
     possible_duplicate_after_crash: bool = False,
     allow_uncached_photo: bool = False,
     preverified_delivery: bool = False,
-    silent: bool = False,
 ) -> bool:
     """Deliver notification to Telegram user with tariff-aware photo pipeline."""
     caption = build_notification_text(
@@ -607,7 +606,6 @@ async def send_ad_to_user(
                 photo=cached_fid,
                 caption=caption,
                 reply_markup=keyboard,
-                disable_notification=silent,
                 parse_mode="HTML",
             )
             logger.info(
@@ -629,7 +627,6 @@ async def send_ad_to_user(
                 photo=it.image_url,
                 caption=caption,
                 reply_markup=keyboard,
-                disable_notification=silent,
                 parse_mode="HTML",
             )
             fid = _extract_photo_file_id(msg)
@@ -655,7 +652,6 @@ async def send_ad_to_user(
                             photo=fid_after_lock,
                             caption=caption,
                             reply_markup=keyboard,
-                            disable_notification=silent,
                             parse_mode="HTML",
                         )
                         return True
@@ -675,7 +671,6 @@ async def send_ad_to_user(
                                 photo=input_file,
                                 caption=caption,
                                 reply_markup=keyboard,
-                                disable_notification=silent,
                                 parse_mode="HTML",
                             )
                             fid = _extract_photo_file_id(msg)
@@ -699,7 +694,6 @@ async def send_ad_to_user(
                 chat_id=user_id,
                 text=caption,
                 reply_markup=keyboard,
-                disable_notification=silent,
                 parse_mode="HTML",
                 disable_web_page_preview=False,
             )
@@ -1180,15 +1174,6 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
         await database.discard_notification(notification_id, token)
         return None
 
-    silent = False
-    night_mode, night_from, night_to = await database.get_night_settings(user_id)
-    if night_mode != database.NIGHT_OFF and config.is_quiet_hour_msk(night_from, night_to, now):
-        if night_mode == database.NIGHT_HOLD:
-            # The user asked for no lots at night: by morning they are stale, so drop and remember them.
-            await database.mark_event_expired(notification_id, token, mark_seen=True)
-            return None
-        silent = night_mode == database.NIGHT_SILENT
-
     return {
         "id": notification_id,
         "token": token,
@@ -1202,7 +1187,6 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
         "tariff": str(row.get("tariff") or payload.get("tariff") or "base").lower(),
         "is_catchup": bool(row.get("is_catchup") or payload.get("is_catchup")),
         "possible_dup": bool(row.get("possible_duplicate_after_crash")),
-        "silent": silent,
     }
 
 
@@ -1270,7 +1254,6 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
             possible_duplicate_after_crash=ctx["possible_dup"],
             allow_uncached_photo=(ctx["tariff"] in ("pro", "standart")),
             preverified_delivery=bool(row.get("_fast_claimed")),
-            silent=ctx["silent"],
         )
         if delivered:
             return await _acknowledge_delivery(row, ctx)
@@ -1352,7 +1335,6 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
             text=build_digest_text([ctx for _, ctx in ready]),
             parse_mode="HTML",
             disable_web_page_preview=True,
-            disable_notification=all(ctx.get("silent") for _, ctx in ready),
         )
     except asyncio.CancelledError:
         for row, ctx in ready:

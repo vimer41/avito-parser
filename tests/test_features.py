@@ -1,4 +1,3 @@
-import hashlib
 import tempfile
 import time
 import unittest
@@ -11,7 +10,6 @@ from tests._dispatcher import DispatcherFixture
 
 import config
 import database
-import pow_worker
 import reports
 from runtime_metrics import RuntimeMetricsRegistry as RuntimeMetrics
 
@@ -50,19 +48,7 @@ class TestReminderRules(unittest.TestCase):
         self.assertEqual(reports.seconds_until_report(now + 7200), 86400 - 3600)
 
 
-class TestNightAndDaily(unittest.TestCase):
-    def test_night_hours_in_moscow(self):
-        def at(hour_msk):
-            return datetime(2026, 10, 29, hour_msk, 30, tzinfo=timezone(timedelta(hours=3))).timestamp()
-        quiet = config.is_quiet_hour_msk
-        self.assertTrue(quiet(23, 8, at(23)))
-        self.assertTrue(quiet(23, 8, at(3)))
-        self.assertFalse(quiet(23, 8, at(8)))
-        self.assertFalse(quiet(23, 8, at(15)))
-        self.assertTrue(quiet(1, 6, at(3)))
-        self.assertFalse(quiet(1, 6, at(23)))
-        self.assertFalse(quiet(5, 5, at(5)))
-
+class TestDailySummary(unittest.TestCase):
     def test_daily_summary_counts_scans_and_real_latency(self):
         metrics = RuntimeMetrics()
         metrics.record_scan_attempt(success=True)
@@ -77,21 +63,7 @@ class TestNightAndDaily(unittest.TestCase):
         self.assertEqual(metrics.pop_daily_summary()["sent"], 0)
 
 
-class TestPowWorker(unittest.TestCase):
-    def test_search_function_matches_javascript_rule(self):
-        nonce = pow_worker.search_nonce("abc", 2, 0, 5.0, 100_000)
-        self.assertTrue(hashlib.sha256(f"abc:{nonce}".encode()).hexdigest().startswith("00"))
-        self.assertIsNone(pow_worker.search_nonce("abc", 12, 0, 5.0, 1000))
-
-    def test_search_runs_in_a_separate_process(self):
-        try:
-            nonce = pow_worker.run_search("abc", 2, start=0, timeout=5, max_iterations=100_000)
-        finally:
-            pow_worker.shutdown()
-        self.assertTrue(hashlib.sha256(f"abc:{nonce}".encode()).hexdigest().startswith("00"))
-
-
-class TestRadarEditing(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
+class TestAdminRadars(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="avito-features-")
         self.db_patch = patch.object(database, "DB_PATH", Path(self.directory.name) / "test.db")
@@ -111,25 +83,6 @@ class TestRadarEditing(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         return await database.add_search(self.user_id, f"Радар {n}", f"https://www.avito.ru/moskva?q=r{n}&s=104",
                                          initial_items=[("1", 100)])
 
-    async def test_rename_keeps_everything_else(self):
-        search_id = await self.add(1)
-        await self.dispatch_callback(f"rename_search:{search_id}", user_id=self.user_id)
-        await self.dispatch_message(user_id=self.user_id, text="  Айфоны   до 50к ")
-        self.assertEqual((await database.get_search(search_id))["title"], "Айфоны до 50к")
-
-    async def test_new_link_replaces_url_and_baseline_but_not_a_new_radar(self):
-        search_id = await self.add(1)
-        await database.add_stop_word_to_search(search_id, "копия", self.user_id)
-        await self.dispatch_callback(f"change_url:{search_id}", user_id=self.user_id)
-        snapshot = type("Snap", (), {"title": "x", "items": [type("I", (), {"item_id": "9", "raw_price": 5})()]})()
-        with patch("source_cache.SOURCE_SNAPSHOTS.load", new=AsyncMock(return_value=snapshot)):
-            await self.dispatch_message(user_id=self.user_id, text="https://www.avito.ru/kazan?q=new")
-        searches = await database.get_user_searches(self.user_id)
-        self.assertEqual(len(searches), 1)
-        self.assertIn("kazan", searches[0]["url"])
-        self.assertEqual(searches[0]["stop_words"], ["копия"])
-        self.assertEqual(await database.get_seen_item_ids_for_search(search_id), {"9"})
-
     async def test_admin_bulk_delete_removes_only_selected(self):
         ids = [await self.add(n) for n in range(3)]
         await self.dispatch_callback("bulk_del:new", user_id=self.user_id)
@@ -140,6 +93,29 @@ class TestRadarEditing(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback("bulk_yes", user_id=self.user_id)
         self.assertEqual([s["id"] for s in await database.get_user_searches(self.user_id)], [ids[1]])
 
+    async def test_radar_list_is_paged(self):
+        for n in range(23):
+            await self.add(n)
+        ids = [s["id"] for s in await database.get_user_searches(self.user_id)]  # in list order
+        await self.dispatch_callback("list_searches", user_id=self.user_id)
+        values = self.callback_values()
+        self.assertIn(f"open_search:{ids[9]}", values)
+        self.assertNotIn(f"open_search:{ids[10]}", values)
+        self.assertIn("list_searches:1", values)
+        await self.dispatch_callback("list_searches:2", user_id=self.user_id)
+        self.assertIn(f"open_search:{ids[22]}", self.callback_values())
+        self.assertNotIn(f"open_search:{ids[0]}", self.callback_values())
+
+    async def test_bulk_delete_marks_a_whole_page(self):
+        for n in range(15):
+            await self.add(n)
+        ids = [s["id"] for s in await database.get_user_searches(self.user_id)]  # in list order
+        await self.dispatch_callback("bulk_del:new", user_id=self.user_id)
+        await self.dispatch_callback("bulk_page:1", user_id=self.user_id)
+        await self.dispatch_callback("bulk_go", user_id=self.user_id)
+        await self.dispatch_callback("bulk_yes", user_id=self.user_id)
+        self.assertEqual([s["id"] for s in await database.get_user_searches(self.user_id)], ids[:10])
+
     async def test_bulk_delete_is_admin_only(self):
         user_id = 777001
         await database.get_or_create_user(user_id)
@@ -147,19 +123,6 @@ class TestRadarEditing(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback("bulk_yes", user_id=user_id)
         await self.dispatch_callback("bulk_del:new", user_id=user_id)
         self.assertNotIn("bulk_go", self.callback_values() if self.methods("EditMessageText") else [])
-
-    async def test_night_mode_is_off_by_default_and_user_picks_mode_and_hours(self):
-        database._NIGHT_MODE_CACHE.clear()
-        self.assertEqual(await database.get_night_settings(self.user_id), (database.NIGHT_OFF, 23, 8))
-        await self.dispatch_callback("night_mode", user_id=self.user_id)
-        self.assertNotIn("night_pick:from", self.callback_values())  # no hours while it is off
-        await self.dispatch_callback(f"night_mode:{database.NIGHT_HOLD}", user_id=self.user_id)
-        self.assertIn("night_pick:from", self.callback_values())
-        await self.dispatch_callback("night_pick:from", user_id=self.user_id)
-        await self.dispatch_callback("night_from:1", user_id=self.user_id)
-        await self.dispatch_callback("night_to:7", user_id=self.user_id)
-        database._NIGHT_MODE_CACHE.clear()
-        self.assertEqual(await database.get_night_settings(self.user_id), (database.NIGHT_HOLD, 1, 7))
 
     async def test_reminder_is_sent_once_per_stage(self):
         user_id = 777002

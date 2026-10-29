@@ -17,10 +17,6 @@ DEPRECATED_ENV_VARS = (
     "AVITO_MAX_IN_FLIGHT",
     "SCAN_MAX_INTERVAL",
     "PARSE_WORKERS",
-    "TARIFF_DELAY_PRO",
-    "TARIFF_DELAY_STANDART",
-    "TARIFF_DELAY_LITE",
-    "TARIFF_DELAY_BASE",
 )
 
 
@@ -129,8 +125,17 @@ AVITO_MAX_REQUESTS_PER_SCAN = positive_int_setting("AVITO_MAX_REQUESTS_PER_SCAN"
 AVITO_MAX_PAGES_PER_SCAN = min(5, positive_int_setting("AVITO_MAX_PAGES_PER_SCAN", "2"))
 
 # --- Доставка и outbox ---
-# Tariffs differ only by scan interval (TARIFF_SCAN_INTERVAL): a found lot goes out at once, with no
-# per-tariff delivery delay (the old TARIFF_DELAY_* settings are gone).
+# Tariffs differ by scan interval (TARIFF_SCAN_INTERVAL), so found lots go out without an artificial delay.
+TARIFF_DELAY_PRO = non_negative_float_setting("TARIFF_DELAY_PRO", "0.0")
+TARIFF_DELAY_STANDART = non_negative_float_setting("TARIFF_DELAY_STANDART", "0.0")
+TARIFF_DELAY_LITE = non_negative_float_setting("TARIFF_DELAY_LITE", "0.0")
+TARIFF_DELAY_BASE = non_negative_float_setting("TARIFF_DELAY_BASE", "0.0")
+TARIFF_DELIVERY_DELAY: dict[str, float] = {
+    "pro": TARIFF_DELAY_PRO,
+    "standart": TARIFF_DELAY_STANDART,
+    "lite": TARIFF_DELAY_LITE,
+    "base": TARIFF_DELAY_BASE,
+}
 
 # --- Тарифы ---
 # Internal keys stay as stored in the DB and old orders: lite = «Базовый», standart = «Средний», pro = «Полный».
@@ -155,19 +160,6 @@ NOTIFICATION_DIGEST_MIN = positive_int_setting("NOTIFICATION_DIGEST_MIN", "4")
 # Daily admin report time (MSK) and renewal reminders.
 DAILY_REPORT_HOUR = 9
 REMINDER_CHECK_INTERVAL = 600
-
-
-def is_quiet_hour_msk(start_hour: int, end_hour: int, now_epoch: float | None = None) -> bool:
-    """Whether the MSK hour falls in a user's night window [start, end); the window may cross midnight."""
-    import time as _time
-    hour = _time.gmtime((now_epoch if now_epoch is not None else _time.time()) + 3 * 3600).tm_hour
-    if start_hour == end_hour:
-        return False
-    if start_hour < end_hour:
-        return start_hour <= hour < end_hour
-    return hour >= start_hour or hour < end_hour
-
-
 NOTIFICATION_DIGEST_MAX = positive_int_setting("NOTIFICATION_DIGEST_MAX", "10")
 NOTIFICATION_MAX_AGE = positive_int_setting("NOTIFICATION_MAX_AGE", "1800")
 NOTIFICATION_LEASE_SECONDS = positive_int_setting("NOTIFICATION_LEASE_SECONDS", "60")
@@ -233,6 +225,7 @@ def validate_runtime_config(
     proxy_rate_limit: float | None = None,
     proxy_rate_recommendation_max: float | None = None,
     proxy_capacity_reserve: float | None = None,
+    tariff_delivery_delay: Mapping[str, float] | None = None,
     avito_connect_timeout: float | None = None,
     avito_read_timeout: float | None = None,
     avito_collection_deadline: float | None = None,
@@ -247,6 +240,7 @@ def validate_runtime_config(
         else float(proxy_rate_recommendation_max)
     )
     reserve = PROXY_CAPACITY_RESERVE if proxy_capacity_reserve is None else float(proxy_capacity_reserve)
+    delays = TARIFF_DELIVERY_DELAY if tariff_delivery_delay is None else tariff_delivery_delay
     conn_to = AVITO_CONNECT_TIMEOUT if avito_connect_timeout is None else float(avito_connect_timeout)
     read_to = AVITO_READ_TIMEOUT if avito_read_timeout is None else float(avito_read_timeout)
     deadline = AVITO_COLLECTION_DEADLINE if avito_collection_deadline is None else float(avito_collection_deadline)
@@ -263,6 +257,10 @@ def validate_runtime_config(
 
     if not math.isfinite(reserve) or not (0.0 <= reserve < 1.0):
         raise ValueError("Некорректная конфигурация резерва: требуется 0 <= PROXY_CAPACITY_RESERVE < 1")
+
+    for plan_name, delay_val in delays.items():
+        if not math.isfinite(float(delay_val)) or float(delay_val) < 0:
+            raise ValueError(f"Некорректная тарифная задержка доставки для '{plan_name}': требуется >= 0")
 
     if conn_to <= 0 or read_to <= 0 or deadline <= 0:
         raise ValueError("Таймауты AVITO_CONNECT_TIMEOUT, AVITO_READ_TIMEOUT и AVITO_COLLECTION_DEADLINE должны быть > 0")
@@ -379,8 +377,7 @@ def is_admin(user_id: int) -> bool:
 
 
 def tariff_delivery_delay(tariff_key: str) -> float:
-    """Kept for old outbox rows and callers: delivery is never delayed by tariff."""
-    return 0.0
+    return float(TARIFF_DELIVERY_DELAY.get((tariff_key or "base").lower(), TARIFF_DELIVERY_DELAY["base"]))
 
 
 # Database path
