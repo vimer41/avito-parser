@@ -367,7 +367,7 @@ async def cmd_subscription_menu(event):
     is_allowed = bool(user.get("is_allowed"))
 
     if is_adm:
-        status_line = f"<b>Текущий статус:</b> Администратор (лимит: {config.MAX_SEARCHES_PER_USER} радаров)"
+        status_line = f"<b>Текущий статус:</b> Администратор (лимит: {await database.get_user_max_radars(user_id)} радаров)"
     elif sub_until and trial_used and not is_allowed:
         formatted_until = database.format_subscription_date(sub_until)
         status_line = f"<b>Текущий статус:</b> Пробный доступ (до {formatted_until})"

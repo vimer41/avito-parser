@@ -405,9 +405,10 @@ def build_notification_text(
     if item.seller:
         detail_lines.append(f"👤 <b>Продавец:</b> {html.escape(item.seller)}")
 
-    # Время
-    if item.date:
-        detail_lines.append(f"🕒 <b>Опубликовано:</b> {html.escape(item.date)}")
+    # Время: возраст считается на момент отправки, а не на момент скана
+    item_age = format_item_age(item.date, item.timestamp) if item.timestamp else item.date
+    if item_age:
+        detail_lines.append(f"🕒 <b>Опубликовано:</b> {html.escape(item_age)}")
 
     footer_lines = [
         "────────────────────",

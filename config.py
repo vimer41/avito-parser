@@ -68,7 +68,9 @@ def positive_int_setting(name: str, default: str, environ: Mapping[str, str] | N
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MAX_SEARCHES_PER_USER = positive_int_setting("MAX_SEARCHES_PER_USER", "20")
+MAX_SEARCHES_PER_USER = positive_int_setting("MAX_SEARCHES_PER_USER", "50")
+# Admins may paste up to this many search links in one message.
+BULK_RADAR_MAX = positive_int_setting("BULK_RADAR_MAX", "50")
 
 # --- Планировщик и интервалы ---
 SCAN_INTERVAL_MIN = positive_float_setting("SCAN_INTERVAL_MIN", "5.0")
@@ -76,10 +78,10 @@ SCAN_INTERVAL_MAX = positive_float_setting("SCAN_INTERVAL_MAX", "10.0")
 SCAN_CAPACITY_MODE_WINDOWS = positive_int_setting("SCAN_CAPACITY_MODE_WINDOWS", "2")
 PROXY_INITIAL_HTTP_COST_PER_SCAN = positive_float_setting("PROXY_INITIAL_HTTP_COST_PER_SCAN", "1.3")
 HTTP_COST_MIN_SAMPLES = positive_int_setting("HTTP_COST_MIN_SAMPLES", "30")
-SOURCE_BACKOFF_BASE = positive_float_setting("SOURCE_BACKOFF_BASE", "30.0")
-SOURCE_BACKOFF_MAX = positive_float_setting("SOURCE_BACKOFF_MAX", "300.0")
-SOURCE_RECOVERY_SUCCESSES = positive_int_setting("SOURCE_RECOVERY_SUCCESSES", "3")
-SCAN_PROXY_ATTEMPTS = positive_int_setting("SCAN_PROXY_ATTEMPTS", "2")
+SOURCE_BACKOFF_BASE = positive_float_setting("SOURCE_BACKOFF_BASE", "5.0")
+SOURCE_BACKOFF_MAX = positive_float_setting("SOURCE_BACKOFF_MAX", "20.0")
+SOURCE_RECOVERY_SUCCESSES = positive_int_setting("SOURCE_RECOVERY_SUCCESSES", "1")
+SCAN_PROXY_ATTEMPTS = positive_int_setting("SCAN_PROXY_ATTEMPTS", "3")
 
 # --- Прокси и HTTP ---
 PROXY_POOL_FILE = (os.getenv("PROXY_POOL_FILE") or "").strip()
@@ -104,7 +106,7 @@ PROXY_RECOVERY_FACTOR = positive_float_setting("PROXY_RECOVERY_FACTOR", "1.25")
 PROXY_QUARANTINE_BASE = positive_float_setting("PROXY_QUARANTINE_BASE", "2")
 PROXY_QUARANTINE_MAX = positive_float_setting("PROXY_QUARANTINE_MAX", "15")
 PROXY_TRANSPORT_BACKOFF_BASE = positive_float_setting("PROXY_TRANSPORT_BACKOFF_BASE", "2")
-PROXY_TRANSPORT_BACKOFF_MAX = positive_float_setting("PROXY_TRANSPORT_BACKOFF_MAX", "10")
+PROXY_TRANSPORT_BACKOFF_MAX = positive_float_setting("PROXY_TRANSPORT_BACKOFF_MAX", "2")
 # Token bucket per proxy client: sustained PROXY_RATE_LIMIT req/s with bursts up to PROXY_RATE_BURST requests.
 PROXY_RATE_BURST = positive_float_setting("PROXY_RATE_BURST", "3")
 # Avito answers ~10-15% of requests from any IP with 403/439 as background noise. A proxy's rate is cut only
@@ -146,6 +148,8 @@ NOTIFICATION_GENERIC_ATTEMPTS = positive_int_setting("NOTIFICATION_GENERIC_ATTEM
 NOTIFICATION_TERMINAL_RETENTION_HOURS = positive_int_setting("NOTIFICATION_TERMINAL_RETENTION_HOURS", "24")
 OUTBOX_MAX_PENDING = positive_int_setting("OUTBOX_MAX_PENDING", "3000")
 OUTBOX_ALERT_DEPTH = positive_int_setting("OUTBOX_ALERT_DEPTH", "200")
+# Telegram sends ~1 message/s per chat, so a burst of lots always waits a few seconds; alert only on real stalls.
+DELIVERY_SLA_ALERT_SECONDS = positive_float_setting("DELIVERY_SLA_ALERT_SECONDS", "30.0")
 
 # --- БД, fanout, catch-up и метрики ---
 DB_READ_POOL_SIZE = positive_int_setting("DB_READ_POOL_SIZE", "2")

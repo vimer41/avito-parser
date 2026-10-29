@@ -213,6 +213,8 @@ async def render_user_card_data(target_id: int, page: int = 0):
     user_radars = await database.get_user_searches(target_id)
     active_radars = sum(1 for r in user_radars if r.get("is_active", 1))
     max_radars = await database.get_user_max_radars(target_id)
+    extra_radars = int(user.get("extra_radars") or 0)
+    extra_label = f", из них +{extra_radars} от админа" if extra_radars else ""
     blocked_count = len(await database.get_user_blocked_sellers_list(target_id))
 
     if has_access and not is_allowed and trial_used:
@@ -234,7 +236,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
         f"• Username: <b>{uname}</b>\n"
         f"• Telegram ID: <code>{target_id}</code>\n"
         f"• Статус: {status_line}\n"
-        f"• Тариф: <b>{plan_name}</b> (лимит: до {max_radars} радаров)\n"
+        f"• Тариф: <b>{plan_name}</b> (лимит: до {max_radars} радаров{extra_label})\n"
         f"• Срок подписки: <i>{until}</i>\n"
         f"• Радары: <b>{active_radars}</b> акт. / <b>{len(user_radars)}</b> всего\n"
         f"• Чёрный список: <b>{blocked_count}</b> продавцов\n"
@@ -248,6 +250,9 @@ async def render_user_card_data(target_id: int, page: int = 0):
         [InlineKeyboardButton(text="🎁 Выдать / обновить триал (5 ч)", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
         [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}"),
          InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
+        [InlineKeyboardButton(text="➖5 радаров", callback_data=f"admin_radar_limit:{target_id}:-5:{page}"),
+         InlineKeyboardButton(text="➕5 радаров", callback_data=f"admin_radar_limit:{target_id}:5:{page}"),
+         InlineKeyboardButton(text="➕20 радаров", callback_data=f"admin_radar_limit:{target_id}:20:{page}")],
     ]
     if has_access:
         buttons.append([InlineKeyboardButton(text="🚫 Отозвать доступ", callback_data=f"admin_revoke_prompt:{target_id}:{page}")])
@@ -260,6 +265,33 @@ async def render_user_card_data(target_id: int, page: int = 0):
         InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{page}")
     ])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data.startswith("admin_radar_limit:"))
+async def cb_admin_radar_limit(call: CallbackQuery):
+    """admin_radar_limit:<user_id|self>:<delta>:<page> — меняет бонус к лимиту радаров."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        _, target_raw, delta_raw, page_raw = call.data.split(":")
+        target_id = call.from_user.id if target_raw == "self" else int(target_raw)
+        delta, page = int(delta_raw), max(0, int(page_raw))
+    except ValueError:
+        await call.answer("Некорректная команда", show_alert=True)
+        return
+    extra = await database.change_user_extra_radars(target_id, delta)
+    max_radars = await database.get_user_max_radars(target_id)
+    logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} изменил лимит радаров ID:{target_id} на {delta:+d} (бонус {extra}, лимит {max_radars})")
+    await call.answer(f"Лимит радаров: {max_radars} (бонус +{extra})")
+    if target_raw == "self":
+        return
+    text, kb = await render_user_card_data(target_id, page)
+    if text:
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith(("admin_user:", "admin_sub_menu:", "admin_sub_days:")))

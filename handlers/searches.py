@@ -45,6 +45,95 @@ class SearchStates(StatesGroup):
 
 # ── Добавление радара ──────────────────────────────────────────────────
 
+_AVITO_URL_RE = re.compile(r"(?:https?://)?(?:[\w-]+\.)*avito\.ru/[^\s<>\"']+", re.IGNORECASE)
+
+
+def extract_avito_urls(text: str) -> List[str]:
+    """Все ссылки на Авито из текста, в порядке появления, без повторов."""
+    seen: set[str] = set()
+    urls = []
+    for match in _AVITO_URL_RE.findall(text or ""):
+        url = match if match.lower().startswith("http") else f"https://{match}"
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+async def bulk_add_radars(message: Message, state: FSMContext, urls: List[str]) -> None:
+    """Админ присылает много ссылок одним сообщением: каждая становится радаром.
+    Калибровка откладывается до первого скана, чтобы не делать десятки запросов к Авито разом."""
+    user_id = message.from_user.id
+    await state.clear()
+    limit = int(config.BULK_RADAR_MAX)
+    extra_urls = max(0, len(urls) - limit)
+    urls = urls[:limit]
+
+    existing = {s["url"] for s in await database.get_user_searches(user_id)}
+    max_radars = await database.get_user_max_radars(user_id)
+    current_count = await database.count_user_searches(user_id)
+
+    added, duplicates, invalid, over_limit = [], 0, 0, 0
+    for raw in urls:
+        if "/item/" in raw or re.search(r"_\d{8,}", raw):
+            invalid += 1
+            continue
+        try:
+            normalized_url = AvitoParser.normalize_url(raw)
+        except Exception:
+            invalid += 1
+            continue
+        if normalized_url in existing:
+            duplicates += 1
+            continue
+        if current_count >= max_radars:
+            over_limit += 1
+            continue
+        title = AvitoParser.extract_search_title("", normalized_url)
+        try:
+            search_id = await database.add_search(
+                user_id, title, normalized_url,
+                search_in_title_only=1 if "bt=1" in normalized_url else 0,
+                initial_items=None,
+            )
+        except database.RadarLimitError:
+            over_limit += 1
+            continue
+        RESUMED_SOURCE_URLS.add(normalized_url)
+        existing.add(normalized_url)
+        current_count += 1
+        added.append((search_id, title))
+
+    log_user_event(
+        user_id, message.from_user.username, message.from_user.first_name, "Массовое добавление радаров",
+        f"добавлено={len(added)} повторы={duplicates} ошибки={invalid} сверх лимита={over_limit + extra_urls}",
+        status="OK" if added else "WARN",
+    )
+    lines = [
+        "📦 <b>МАССОВОЕ ДОБАВЛЕНИЕ РАДАРОВ</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"✅ Добавлено: <b>{len(added)}</b>",
+    ]
+    if duplicates:
+        lines.append(f"♻️ Уже были: <b>{duplicates}</b>")
+    if invalid:
+        lines.append(f"⚠️ Не ссылки на поиск: <b>{invalid}</b>")
+    if over_limit:
+        lines.append(f"🚫 Не влезли в лимит ({max_radars}): <b>{over_limit}</b>")
+    if extra_urls:
+        lines.append(f"✂️ Сверх {limit} ссылок за раз: <b>{extra_urls}</b> (пришлите отдельным сообщением)")
+    for _sid, title in added[:15]:
+        lines.append(f"• {html.escape(title)}")
+    if len(added) > 15:
+        lines.append(f"• … и ещё {len(added) - 15}")
+    lines.append("")
+    lines.append("<i>Калибровка пройдёт при первом скане: уже выложенные лоты не придут.</i>")
+
+    kb_rows = [[InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")]]
+    if over_limit:
+        kb_rows.insert(0, [InlineKeyboardButton(text="➕ +10 к моему лимиту", callback_data="admin_radar_limit:self:10:0")])
+    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
+
 @router.message(F.text.in_({"🎯 Добавить радар", "➕ Добавить радар", "➕ Добавить поиск"}))
 @router.callback_query(F.data == "add_search_prompt")
 async def btn_add_search(event, state: FSMContext):
@@ -66,6 +155,11 @@ async def btn_add_search(event, state: FSMContext):
         "<i>Пример корректной ссылки:\n"
         "<code>https://www.avito.ru/moskva/tovary_dlya_kompyutera/...</code></i>"
     )
+    if config.is_admin(event.from_user.id):
+        text += (
+            f"\n\n👑 <b>Админ:</b> можно прислать сразу до {int(config.BULK_RADAR_MAX)} ссылок, "
+            "по одной на строку — каждая станет отдельным радаром."
+        )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm"),
@@ -136,6 +230,12 @@ async def process_avito_url(message: Message, state: FSMContext):
             return await cmd_docs_hub(message)
         return
 
+    if config.is_admin(user_id):
+        bulk_urls = extract_avito_urls(raw_url)
+        if len(bulk_urls) > 1:
+            await bulk_add_radars(message, state, bulk_urls)
+            return
+
     if "avito.ru" not in raw_url.lower():
         log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка: ссылка не с avito.ru («{raw_url[:80]}»)", status="WARN")
         await message.answer(
@@ -164,11 +264,16 @@ async def process_avito_url(message: Message, state: FSMContext):
     max_radars = await database.get_user_max_radars(user_id)
     if current_count >= max_radars:
         log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара", f"Ошибка: лимит {max_radars} исчерпан", status="WARN")
+        limit_button = (
+            InlineKeyboardButton(text="➕ +10 к моему лимиту", callback_data="admin_radar_limit:self:10:0")
+            if config.is_admin(user_id)
+            else InlineKeyboardButton(text="💳 Расширить лимит (Тарифы)", callback_data="open_subscription_menu")
+        )
         await message.answer(
             f"⚠️ <b>Достигнут лимит активных радаров ({max_radars})!</b>\n\n"
             "Вы можете освободить место в меню <b>📁 Мои радары</b> или расширить лимит до 4 или 9 радаров в меню <b>💳 Тарифы</b>.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💳 Расширить лимит (Тарифы)", callback_data="open_subscription_menu")],
+                [limit_button],
                 [InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")]
             ]),
             parse_mode="HTML"

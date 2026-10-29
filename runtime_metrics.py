@@ -1001,14 +1001,15 @@ class RuntimeMetricsRegistry:
         # 1. Delivery SLA (current 1-minute bucket)
         cur_deliv = summarize_histograms([current_bucket.deliver_at_to_sent_all], SUBSECOND_LATENCY_BOUNDS)
         has_deliv_data = cur_deliv["sample_count"] > 0
-        deliv_bad = bool(has_deliv_data and cur_deliv["p95"] is not None and cur_deliv["p95"] > 2.0)
+        sla_limit = float(config.DELIVERY_SLA_ALERT_SECONDS)
+        deliv_bad = bool(has_deliv_data and cur_deliv["p95"] is not None and cur_deliv["p95"] > sla_limit)
         _process_rule(
             "delivery_sla",
             deliv_bad,
             5,
             has_deliv_data,
-            f"⚠️ Алерт SLA доставки: p95(deliver_at -> sent) = {cur_deliv['p95']} с (> 2.0 с) 5 минут подряд.",
-            "✅ Восстановлено SLA доставки: p95(deliver_at -> sent) вернулся в норму (<= 2.0 с).",
+            f"⚠️ Алерт SLA доставки: p95(deliver_at -> sent) = {cur_deliv['p95']} с (> {sla_limit:g} с) 5 минут подряд.",
+            f"✅ Восстановлено SLA доставки: p95(deliver_at -> sent) вернулся в норму (<= {sla_limit:g} с).",
         )
 
         # 2. Outbox depth

@@ -575,6 +575,7 @@ async def init_db():
             "trial_used": "INTEGER DEFAULT 0",
             "tariff_plan": "TEXT DEFAULT 'standart'",
             "subscription_revision": "INTEGER NOT NULL DEFAULT 0",
+            "extra_radars": "INTEGER NOT NULL DEFAULT 0",
         })
 
         await db.execute("""
@@ -942,22 +943,38 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
             return dict(row)
 
 
+def _plan_max_radars(plan: str, is_allowed: bool, trial_used: bool) -> int:
+    if is_allowed or plan == "pro":
+        return 9 if plan == "pro" else 4
+    if trial_used and not is_allowed:
+        return 1
+    return 4 if plan == "standart" else 1
+
+
 async def get_user_max_radars(user_id: int) -> int:
+    """Tariff limit plus the extra radars an admin granted (admins start from MAX_SEARCHES_PER_USER)."""
     if user_id in ADMIN_IDS:
-        return MAX_SEARCHES_PER_USER
+        user = await get_user(user_id)
+        return MAX_SEARCHES_PER_USER + int((user or {}).get("extra_radars") or 0)
 
     user = await get_or_create_user(user_id)
     plan = (user.get("tariff_plan") or "standart").lower()
-    is_allowed = bool(user.get("is_allowed"))
-    trial_used = bool(user.get("trial_used"))
+    base = _plan_max_radars(plan, bool(user.get("is_allowed")), bool(user.get("trial_used")))
+    return base + int(user.get("extra_radars") or 0)
 
-    if is_allowed or plan == "pro":
-        return 9 if plan == "pro" else 4
 
-    if trial_used and not is_allowed:
-        return 1
-
-    return 4 if plan == "standart" else 1
+async def change_user_extra_radars(user_id: int, delta: int) -> int:
+    """Adds delta (may be negative) to the admin-granted radar bonus; never below zero. Returns the new bonus."""
+    await get_or_create_user(user_id)
+    async with writer_connection() as db:
+        await db.execute(
+            "UPDATE users SET extra_radars = MAX(0, COALESCE(extra_radars, 0) + ?) WHERE user_id = ?",
+            (int(delta), user_id),
+        )
+        await db.commit()
+        async with db.execute("SELECT extra_radars FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0] or 0) if row else 0
 
 
 async def is_user_allowed(user_id: int) -> bool:
@@ -1083,7 +1100,10 @@ async def add_search(user_id: int, title: str, url: str, search_in_title_only: i
                 if user is None:
                     raise PermissionError("Доступ к мониторингу истёк или отозван")
                 plan = (user["tariff_plan"] or "standart").lower()
-                max_radars = 9 if plan == "pro" else 4 if user["is_allowed"] else 1 if user["trial_used"] else 4
+                max_radars = (
+                    (9 if plan == "pro" else 4 if user["is_allowed"] else 1 if user["trial_used"] else 4)
+                    + int(user["extra_radars"] or 0)
+                )
         async with db.execute("SELECT COUNT(*) FROM searches WHERE user_id = ?", (user_id,)) as cursor:
             if (await cursor.fetchone())[0] >= max_radars:
                 raise RadarLimitError(f"Достигнут лимит радаров ({max_radars})")

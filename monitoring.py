@@ -259,7 +259,8 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     await notify_health(False)
                 continue
 
-            # Production multi-proxy collection with up to SCAN_PROXY_ATTEMPTS (2) distinct proxies
+            # Production multi-proxy collection: up to SCAN_PROXY_ATTEMPTS distinct channels (at least
+            # every channel of a small pool, so one dead proxy never fails a scan on its own).
             tried_proxy_ids: set[str] = set()
             scan_client = None
             collection = None
@@ -279,7 +280,8 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 organic = [item.item_id for item in page_items if not item.is_promotion]
                 return await seen_store.none_known(_task.key, _task.group_revision, organic)
 
-            for _attempt in range(max(1, int(config.SCAN_PROXY_ATTEMPTS))):
+            scan_attempts = max(1, int(config.SCAN_PROXY_ATTEMPTS), min(3, len(pool.clients)))
+            for _attempt in range(scan_attempts):
                 lease = pool.acquire_client(exclude_ids=tried_proxy_ids)
                 if lease is None and len(pool.clients) == 1:
                     only_client = pool.clients[0]

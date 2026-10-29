@@ -600,7 +600,7 @@ class TestFastSkipCatchupAndHysteresis(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(collection.pages, 1)
         self.assertEqual(parser.fetch_page_async.await_count, 1)
 
-    def test_two_proxy_attempts_and_three_success_hysteresis(self):
+    def test_source_backoff_is_short_and_clears_after_one_success(self):
         planner = DeadlineScheduler(use_source_backoff=True)
         planner.sync({"u": [{"id": 1}]}, None, 0.0)
         task = planner.take_due(0.0)
@@ -609,17 +609,20 @@ class TestFastSkipCatchupAndHysteresis(unittest.IsolatedAsyncioTestCase):
         planner.complete(task, 1.0, False, exhausted_proxies=False)
         self.assertEqual(planner.sources["u"].source_failure_streak, 0)
 
-        # Both proxy attempts failed (exhausted_proxies=True) -> source_failure_streak = 2 -> 60s backoff
+        # Every channel failed (exhausted_proxies=True) twice -> streak 2 -> 10s backoff, capped at 20s
         t2 = planner.take_due(10.0)
         planner.complete(t2, 11.0, False, exhausted_proxies=True)
         t3 = planner.take_due(50.0)
         planner.complete(t3, 51.0, False, exhausted_proxies=True)
         self.assertEqual(planner.sources["u"].source_failure_streak, 2)
-        self.assertGreaterEqual(planner.sources["u"].due_at - 51.0, 59.0)
+        self.assertAlmostEqual(planner.sources["u"].due_at - 51.0, 10.0, delta=0.01)
+        for at in (100.0, 200.0, 300.0, 400.0):
+            tk = planner.take_due(at)
+            planner.complete(tk, at + 1.0, False, exhausted_proxies=True)
+        self.assertLessEqual(planner.sources["u"].due_at - 401.0, 20.0)
 
-        # Requires 3 consecutive successes to step down source_failure_streak by 1
-        for step in range(3):
-            due = planner.sources["u"].due_at
-            tk = planner.take_due(due + 0.1)
-            planner.complete(tk, due + 0.2, True)
-        self.assertEqual(planner.sources["u"].source_failure_streak, 1)
+        # One healthy scan clears the streak
+        due = planner.sources["u"].due_at
+        tk = planner.take_due(due + 0.1)
+        planner.complete(tk, due + 0.2, True)
+        self.assertEqual(planner.sources["u"].source_failure_streak, 0)

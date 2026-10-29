@@ -401,7 +401,8 @@ class DeadlineScheduler:
         if state.source_failure_streak > 0:
             state.source_recovery_streak += 1
             if state.source_recovery_streak >= config.SOURCE_RECOVERY_SUCCESSES:
-                state.source_failure_streak = max(0, state.source_failure_streak - 1)
+                # A healthy scan clears the whole streak: a source must not stay slow after one bad minute.
+                state.source_failure_streak = 0
                 state.source_recovery_streak = 0
         else:
             state.source_recovery_streak = 0
