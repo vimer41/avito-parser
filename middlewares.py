@@ -112,7 +112,7 @@ class AccessControlMiddleware(BaseMiddleware):
         # Публичные меню доступны и после истечения подписки.
         if isinstance(event, CallbackQuery) and event.data:
             allowed_callbacks = (
-                "buy_tariff:", "pay_request:", "demo_tariff:", "stars_buy:",
+                "buy_tariff:", "pay_request:", "demo_tariff:", "stars_buy:", "pay_method:",
             )
             allowed_exact = {
                 "open_subscription_menu", "activate_trial_btn", "support_start_ticket", "support_cancel",

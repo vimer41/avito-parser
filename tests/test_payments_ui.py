@@ -56,9 +56,8 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         with patch.object(config, "STARS_PAYMENTS_ENABLED", False):
             await self.dispatch_message(text="/tariffs")
             text = self.methods("SendMessage")[-1].text
-            self.assertIn("449 ⭐", text)
-            self.assertIn("899 ⭐", text)
-            self.assertNotIn("₽", text)
+            self.assertIn("449 ₽", text)
+            self.assertIn("899 ₽", text)
             await self.dispatch_callback("buy_tariff:pro")
             self.assertFalse(any(v and v.startswith("stars_buy:") for v in self.callback_values()))
             await self.dispatch_callback("stars_buy:pro:899")
@@ -101,8 +100,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
             await self.dispatch_callback(value)
             self.assertIn("stars_buy:", " ".join(v or "" for v in self.callback_values()))
             text = self.methods("EditMessageText")[-1].text
-            for stale in ("СБП", "реквизиты", "₽", "крипта"):
-                self.assertNotIn(stale, text)
+            self.assertNotIn("реквизиты", text)
         self.assertEqual(self.methods("SendInvoice"), [])
         self.assertEqual(self.methods("SendMessage"), [])
 
@@ -113,12 +111,25 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"buy_tariff:{plan}", values)
         self.assertNotIn("other_payment_methods", values)
         text = self.methods("EditMessageText")[-1].text
-        for title in ("Базовый", "Средний", "Полный", "199 ⭐", "449 ⭐", "899 ⭐"):
+        for title in ("Базовый", "Средний", "Полный", "199 ₽", "449 ₽", "899 ₽"):
             self.assertIn(title, text)
         await self.dispatch_callback("buy_tariff:standart")
         self.assertNotIn("other_payment_methods", self.callback_values())
         await self.dispatch_callback("other_payment_methods")
         self.assertIn("buy_tariff:pro", self.callback_values())
+
+    async def test_tariff_card_offers_sbp_stars_and_crypto_but_only_stars_charges(self):
+        await self.dispatch_callback("buy_tariff:lite")
+        values = self.callback_values()
+        for value in ("pay_method:sbp:lite", "stars_buy:lite:199", "pay_method:crypto:lite"):
+            self.assertIn(value, values)
+        self.assertIn("199 ₽", self.methods("EditMessageText")[-1].text)
+        for method in ("sbp", "crypto"):
+            await self.dispatch_callback(f"pay_method:{method}:lite")
+            answer = self.methods("AnswerCallbackQuery")[-1]
+            self.assertTrue(answer.show_alert)
+            self.assertIn("скоро", answer.text)
+        self.assertEqual(self.methods("SendInvoice"), [])
 
     async def test_precheckout_can_reject_invalid_amount_then_approve_without_access(self):
         order = await billing.create_order(self.user_id, "standart")

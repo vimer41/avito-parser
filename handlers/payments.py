@@ -25,8 +25,8 @@ async def payment_terms(event):
         "<i>Редакция от 29.10.2026 г. · Код верификации: mekbuda</i>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         + "".join(
-            f"• <b>{config.plan_title(plan)}:</b> {config.stars_price(plan)} ⭐ / 30 дней, радаров — до {config.plan_radars(plan)}, "
-            f"проверка раз в {config.plan_interval(plan)} с.\n"
+            f"• <b>{config.plan_title(plan)}:</b> {config.rub_price(plan)} ₽ или {config.stars_price(plan)} ⭐ / 30 дней, "
+            f"радаров — до {config.plan_radars(plan)}, проверка раз в {config.plan_interval(plan)} с.\n"
             for plan in config.PAID_PLANS
         ) + "\n"
         "<b>Правила предоставления услуги:</b>\n"
@@ -38,7 +38,7 @@ async def payment_terms(event):
         "<b>Возврат средств и поддержка:</b>\n"
         "• Заявления на возврат средств рассматриваются в течение <b>24 часов</b>.\n"
         "• Для оформления запроса используйте команду <b>/paysupport</b> или email: <b>bernardgofov@gmail.com</b>.\n"
-        "• При подтверждении возврата доступ деактивируется, средства возвращаются через систему Telegram Stars.\n\n"
+        "• При подтверждении возврата доступ деактивируется, средства возвращаются тем же способом, которым была совершена оплата.\n\n"
         "Совершая оплату, вы подтверждаете согласие с настоящими Условиями и Пользовательским соглашением."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[

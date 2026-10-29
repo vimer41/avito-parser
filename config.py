@@ -295,6 +295,18 @@ def stars_price(plan: str) -> int:
     raise ValueError("Unknown tariff plan")
 
 
+# The ruble price is the main one shown to users; СБП and crypto checkouts are not connected yet.
+PRICE_RUB: dict[str, int] = {
+    "lite": positive_int_setting("PRICE_RUB_BASIC", "199"),
+    "standart": positive_int_setting("PRICE_RUB_MEDIUM", "449"),
+    "pro": positive_int_setting("PRICE_RUB_FULL", "899"),
+}
+
+
+def rub_price(plan: str) -> int:
+    return PRICE_RUB[plan]
+
+
 def plan_title(plan: str | None) -> str:
     return PLAN_TITLES.get((plan or "standart").lower(), PLAN_TITLES["standart"])
 

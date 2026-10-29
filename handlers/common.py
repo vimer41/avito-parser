@@ -126,9 +126,9 @@ def radars_word(count: int) -> str:
 
 
 def plan_summary(plan: str) -> str:
-    """«🔵 Средний — 449 ⭐ / 30 дней» plus its limits, for tariff lists."""
+    """«🔵 Средний — 449 ₽ / 30 дней» plus its limits, for tariff lists."""
     return (
-        f"{PLAN_ICONS[plan]} <b>{config.plan_title(plan)}</b> — {config.stars_price(plan)} ⭐ / 30 дней\n"
+        f"{PLAN_ICONS[plan]} <b>{config.plan_title(plan)}</b> — {config.rub_price(plan)} ₽ / 30 дней\n"
         f"    {radars_word(config.plan_radars(plan))}, проверка раз в {config.plan_interval(plan)} с"
     )
 
@@ -362,11 +362,9 @@ async def cmd_subscription_menu(event):
         f"{plan_summary('pro')}\n"
         "    + догон свежих лотов после технических пауз\n\n"
         "Чем чаще проверка, тем раньше вы увидите лот и успеете позвонить первым.\n"
-        "Оплата — Telegram Stars, разово на 30 дней, без автосписаний. "
+        "Оплата разовая на 30 дней, без автосписаний: СБП, Telegram Stars или криптовалюта. "
         "Оплаченные дни суммируются с текущим сроком."
     )
-    if not config.STARS_PAYMENTS_ENABLED:
-        text += "\n\n⏸ Приём оплаты временно выключен."
 
     buttons = []
     if not is_adm and not user.get("subscription_until") and not user.get("trial_used"):
@@ -374,7 +372,7 @@ async def cmd_subscription_menu(event):
     for plan in config.PAID_PLANS:
         mark = " · ваш" if plan == current else ""
         buttons.append([InlineKeyboardButton(
-            text=f"{PLAN_ICONS[plan]} {config.plan_title(plan)} — {config.stars_price(plan)} ⭐{mark}",
+            text=f"{PLAN_ICONS[plan]} {config.plan_title(plan)} — {config.rub_price(plan)} ₽{mark}",
             callback_data=f"buy_tariff:{plan}",
         )])
     buttons.append([
@@ -410,29 +408,37 @@ async def cb_select_tariff(call: CallbackQuery):
         await cmd_subscription_menu(call)
         return
     title = config.plan_title(tariff_key)
-    price = config.stars_price(tariff_key)
-    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Выбор тарифа", f"Тариф {title} ({price} ⭐)", status="INFO")
+    stars = config.stars_price(tariff_key)
+    is_test = tariff_key == "test"
+    price_label = f"{stars} ⭐" if is_test else f"{config.rub_price(tariff_key)} ₽"
+    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Выбор тарифа", f"Тариф {title} ({price_label})", status="INFO")
 
     # "test" is a hidden 1-day plan for checking Stars checkout end to end; it grants the Средний tariff.
-    plan = "standart" if tariff_key == "test" else tariff_key
+    plan = "standart" if is_test else tariff_key
     text = (
         f"{PLAN_ICONS[plan]} <b>Тариф «{title}»</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"• Радаров: <b>до {config.plan_radars(plan)}</b>\n"
         f"• Проверка каждого радара: <b>раз в {config.plan_interval(plan)} с</b>\n"
         "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n"
-        f"• Цена: <b>{price} ⭐</b> за {'1 день' if tariff_key == 'test' else '30 дней'}\n\n"
+        f"• Цена: <b>{price_label}</b> за {'1 день' if is_test else '30 дней'}\n\n"
         f"{PLAN_PERKS[plan]}\n\n"
         "Разовая оплата без автосписаний, доступ включается сразу после оплаты. "
-        "Нажимая «Оплатить», вы соглашаетесь с /terms."
+        "Оплачивая, вы соглашаетесь с /terms.\n\n"
+        "<b>Выберите способ оплаты:</b>"
     )
 
     buttons = []
+    if not is_test:
+        buttons.append([InlineKeyboardButton(text=f"💳 СБП — {config.rub_price(tariff_key)} ₽",
+                                             callback_data=f"pay_method:sbp:{tariff_key}")])
     if config.STARS_PAYMENTS_ENABLED:
-        buttons.append([InlineKeyboardButton(text=f"⭐ Оплатить {price} Stars",
-                                             callback_data=f"stars_buy:{tariff_key}:{price}")])
+        buttons.append([InlineKeyboardButton(text=f"⭐ Telegram Stars — {stars} ⭐",
+                                             callback_data=f"stars_buy:{tariff_key}:{stars}")])
     else:
-        text += "\n\n⏸ Приём оплаты временно выключен. Напишите в поддержку, если нужен доступ."
+        text += "\n\n⏸ Оплата Telegram Stars временно выключена."
+    if not is_test:
+        buttons.append([InlineKeyboardButton(text="🪙 Криптовалюта", callback_data=f"pay_method:crypto:{tariff_key}")])
     buttons.append([
         InlineKeyboardButton(text="« Все тарифы", callback_data="open_subscription_menu"),
         InlineKeyboardButton(text="💬 Вопрос по оплате", callback_data="payment_support")
@@ -444,6 +450,18 @@ async def cb_select_tariff(call: CallbackQuery):
     except Exception:
         await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
+
+
+PAY_METHOD_TITLES = {"sbp": "СБП", "crypto": "криптовалютой"}
+
+
+@router.callback_query(F.data.startswith("pay_method:"))
+async def cb_pay_method(call: CallbackQuery):
+    # СБП and crypto checkouts are not connected yet: the buttons only explain that and point to Stars.
+    method = call.data.split(":")[1] if call.data.count(":") >= 1 else ""
+    title = PAY_METHOD_TITLES.get(method, "этим способом")
+    stars_hint = " Сейчас можно оплатить через Telegram Stars." if config.STARS_PAYMENTS_ENABLED else ""
+    await call.answer(f"Оплата {title} скоро появится.{stars_hint}", show_alert=True)
 
 
 @router.callback_query(F.data == "other_payment_methods")
