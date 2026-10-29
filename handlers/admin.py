@@ -658,8 +658,9 @@ async def cmd_admin_home(event):
          ui.btn("Найти", "scope", callback_data="admin_search_user_prompt")],
         [ui.btn("База", "db", callback_data="admin_backup"),
          ui.btn("Логи", "logs", callback_data="admin_logs_menu")],
-        [ui.btn("Премиум-эмодзи", "palette", callback_data="admin_emoji"),
-         ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
+        [ui.btn("Отчёт за сутки", "note", callback_data="admin_daily_report"),
+         ui.btn("Премиум-эмодзи", "palette", callback_data="admin_emoji")],
+        [ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
     )
     await _show(event, text, kb)
 
@@ -1701,6 +1702,17 @@ async def cmd_admin_proxy(message: Message):
         await status.edit_text(await _probe_all_channels(), reply_markup=NET_BACK_KB, parse_mode="HTML")
     else:
         await _add_proxies(message, arg)
+
+
+@router.callback_query(F.data == "admin_daily_report")
+async def cb_admin_daily_report(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        return
+    await call.answer()
+    from reports import build_daily_report
+    text = await build_daily_report(reset=False)
+    text += f"\n\n<i>Предпросмотр: сам отчёт приходит каждый день в {config.DAILY_REPORT_HOUR:02d}:00 МСК.</i>"
+    await _show(call, text, ui.kb([ui.btn("« Админ-панель", callback_data="admin_refresh")]))
 
 
 # ── Премиум-эмодзи интерфейса ──────────────────────────────────────────
