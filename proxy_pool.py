@@ -342,11 +342,14 @@ class ProxyClient:
         while self._history_10m and self._history_10m[0][0] < cutoff:
             self._history_10m.popleft()
 
-    def _count_recent_403_429(self, now: float) -> tuple[int, int]:
-        self._prune_10m_history(now)
-        total = len(self._history_10m)
-        bad = sum(1 for _, code, _ in self._history_10m if code in (403, 429))
-        return total, bad
+    def _recent_block_ratio(self) -> tuple[int, float]:
+        """(responses, share of 403/429/439) over the last PROXY_RATE_WINDOW HTTP responses."""
+        window = max(1, int(config.PROXY_RATE_WINDOW))
+        statuses = [status for _, status, transport in list(self._history_10m)[-window:] if not transport and status is not None]
+        if not statuses:
+            return 0, 0.0
+        bad = sum(1 for status in statuses if status in (403, 429, 439))
+        return len(statuses), bad / len(statuses)
 
     def record_raw_http_response(
         self,
@@ -382,10 +385,10 @@ class ProxyClient:
         if 200 <= status_code < 400:
             self.transport_failure_streak = 0
             self.recovery_success_streak += 1
-            total_10m, bad_10m = self._count_recent_403_429(now)
+            _, block_ratio = self._recent_block_ratio()
             if (
                 self.recovery_success_streak >= config.PROXY_RECOVERY_SUCCESS_STREAK
-                and bad_10m == 0
+                and block_ratio <= float(config.PROXY_RATE_CUT_RATIO)
                 and self.effective_rate < self.configured_rate
             ):
                 self.effective_rate = min(
@@ -401,7 +404,7 @@ class ProxyClient:
             return
 
         if status_code in (403, 429):
-            self.recovery_success_streak = 0
+            # A single block is Avito's background noise: the window ratio decides, not the streak.
             self._sync_metrics_state()
 
     def record_final_block(
@@ -420,11 +423,13 @@ class ProxyClient:
             self._sync_metrics_state()
             return 0.0
         self.block_streak += 1
-        self.recovery_success_streak = 0
-        self.effective_rate = max(
-            config.PROXY_MIN_RATE,
-            round(self.effective_rate * 0.5, 4),
-        )
+        responses, block_ratio = self._recent_block_ratio()
+        if responses >= max(5, int(config.PROXY_RATE_WINDOW) // 2) and block_ratio > float(config.PROXY_RATE_CUT_RATIO):
+            self.recovery_success_streak = 0
+            self.effective_rate = max(
+                config.PROXY_MIN_RATE,
+                round(self.effective_rate * 0.5, 4),
+            )
         duration = min(
             float(config.PROXY_QUARANTINE_MAX),
             float(config.PROXY_QUARANTINE_BASE) * (2 ** min(self.block_streak - 1, 8)),
@@ -591,8 +596,12 @@ class ProxyPool:
         proxies: list[str | None] = []
         if pool_file and (proxy_pool_file is not None or Path(pool_file).expanduser().is_file()):
             proxies = list(load_proxy_urls_from_file(pool_file))
-        elif single_proxy and str(single_proxy).strip():
-            proxies = [parse_and_validate_proxy_line(str(single_proxy).strip(), line_number=1)]
+        else:
+            raw = list(config.PROXY_URLS) + ([str(single_proxy).strip()] if single_proxy and str(single_proxy).strip() else [])
+            for line_number, url in enumerate(raw, start=1):
+                normalized = parse_and_validate_proxy_line(url, line_number=line_number)
+                if normalized not in proxies:
+                    proxies.append(normalized)
 
         if mode == "both":
             return proxies + [None]
@@ -685,11 +694,15 @@ class ProxyPool:
         config.ALLOW_DIRECT_AVITO = bool(enabled)
         return await self.reload_async(allow_direct=bool(enabled))
 
-    async def set_single_proxy_async(self, proxy_url: str | None) -> dict[str, Any]:
-        """Switch to one proxy (or back to direct/env when None) without restarting the bot."""
-        normalized = parse_and_validate_proxy_line(proxy_url) if proxy_url else None
-        config.PROXY_URL = normalized
-        return await self.reload_async(fallback_proxy_url=normalized or "")
+    async def set_proxy_list_async(self, proxy_urls: list[str]) -> dict[str, Any]:
+        """Replace the bot-managed proxy list (any size) and hot-swap the pool without restarting."""
+        normalized: list[str] = []
+        for line_number, url in enumerate(proxy_urls, start=1):
+            value = parse_and_validate_proxy_line(url, line_number=line_number)
+            if value not in normalized:
+                normalized.append(value)
+        config.PROXY_URLS = normalized
+        return await self.reload_async()
 
     async def set_net_mode_async(self, mode: str) -> dict[str, Any]:
         if mode not in config.NET_MODES:
@@ -699,7 +712,7 @@ class ProxyPool:
 
     @staticmethod
     def has_configured_proxy() -> bool:
-        return bool(config.PROXY_URL) or ProxyPool.pool_file_overrides_single_proxy()
+        return bool(config.PROXY_URLS) or bool(config.PROXY_URL) or ProxyPool.pool_file_overrides_single_proxy()
 
     @staticmethod
     def pool_file_overrides_single_proxy() -> bool:
@@ -752,15 +765,16 @@ class ProxyPool:
                 if not client.is_available_for_scan(now):
                     continue
                 with client._pacing_lock:
-                    busy_rank = 1 if client.in_flight >= client.max_in_flight else 0
-                    ready_at = max(now, client._next_request_at)
-                candidates.append((busy_rank, ready_at, offset, client))
+                    # A busy fast channel usually frees up sooner than a throttled idle one becomes ready.
+                    queued = max(0, client.in_flight - client.max_in_flight + 1)
+                    starts_at = max(now, client._next_request_at) + queued * float(config.PROXY_BUSY_PENALTY)
+                candidates.append((starts_at, offset, client))
 
             if not candidates:
                 return None
 
-            candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-            _, _, chosen_offset, chosen = candidates[0]
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            _, chosen_offset, chosen = candidates[0]
             self._rr_cursor = (self._rr_cursor + chosen_offset + 1) % n
 
             with chosen._pacing_lock:

@@ -8,6 +8,7 @@ import config
 import database
 
 from logger_setup import log_user_event
+from runtime_metrics import sanitize_proxy_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +40,16 @@ class ActionLoggingMiddleware(BaseMiddleware):
                 pass
 
         if isinstance(event, Message) and event.text:
+            if current_state and current_state.endswith("waiting_for_proxy"):
+                logged_text = "[прокси скрыты]"
+            else:
+                # Mask before truncating: a cut URL would no longer match the credential pattern.
+                logged_text = sanitize_proxy_credentials(event.text)[:100]
             log_user_event(
                 user_id=user.id,
                 username=user.username,
                 first_name=user.first_name,
-                action=f"Сообщение: «{event.text[:100]}»",
+                action=f"Сообщение: «{logged_text}»",
                 status="MSG",
                 fsm_state=current_state
             )

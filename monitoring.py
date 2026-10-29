@@ -21,6 +21,7 @@ from seen_cache import InMemorySeenStore
 
 logger = logging.getLogger(__name__)
 MONITORING_STATS: dict = {}
+MAX_SCAN_WORKERS = 256
 
 
 def group_sources(searches: list[dict]) -> dict[str, list[dict]]:
@@ -80,6 +81,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
 
     changed = asyncio.Event()
     seen_store = InMemorySeenStore()
+    extra_workers: list[asyncio.Task] = []
     fanout_queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, int(config.FANOUT_QUEUE_SIZE)))
     state_updates_lock = asyncio.Lock()
     pending_state_updates: dict[str, tuple[str, float, list[str], int]] = {}
@@ -460,6 +462,11 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     except Exception:
                         pass
             healthy_proxies = sum(1 for p in proxy_snaps if p.get("state") in ("healthy", "degraded", "half_open"))
+            # Proxies added at runtime get their own scan workers, so capacity grows without a restart.
+            missing_workers = min(MAX_SCAN_WORKERS, len(pool.clients)) - len(parsers) - len(extra_workers)
+            for _ in range(max(0, missing_workers)):
+                index = len(parsers) + len(extra_workers) + 1
+                extra_workers.append(asyncio.create_task(worker(index, parsers[0]), name=f"scan-worker-{index}"))
             effective_rps = (
                 sum(float(p.get("current_rps") or 0.0) for p in proxy_snaps if p.get("state") in ("healthy", "degraded", "half_open"))
                 if proxy_snaps
@@ -581,9 +588,9 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
     try:
         await asyncio.gather(*tasks)
     finally:
-        for task in tasks:
+        for task in (*tasks, *extra_workers):
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, *extra_workers, return_exceptions=True)
         await flush_state_updates()
         for entry in owned_parsers:
             entry.close()

@@ -19,7 +19,7 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.db_patch = patch.object(database, "DB_PATH", Path(self.directory.name) / "test.db")
         self.db_patch.start()
         # Network-mode buttons mutate process-wide config; keep it from leaking into other tests.
-        self.net_patches = [patch.object(config, "NET_MODE", "auto"), patch.object(config, "PROXY_URL", None)]
+        self.net_patches = [patch.object(config, "NET_MODE", "auto"), patch.object(config, "PROXY_URL", None), patch.object(config, "PROXY_URLS", [])]
         for net_patch in self.net_patches:
             net_patch.start()
         await database.init_db()

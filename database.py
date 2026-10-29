@@ -841,11 +841,28 @@ async def init_db():
             s_row = await cur.fetchone()
             if s_row is not None:
                 config.ALLOW_DIRECT_AVITO = str(s_row[0]) == "1"
-        # A proxy set from the bot (/proxy) overrides PROXY_URL from .env.
-        async with db.execute("SELECT value FROM bot_settings WHERE key = 'proxy_url'") as cur:
-            p_row = await cur.fetchone()
-            if p_row is not None and str(p_row[0]).strip():
-                config.PROXY_URL = str(p_row[0]).strip()
+        # Proxies added from the bot live in bot_settings.proxy_urls (JSON list); the old single
+        # proxy_url setting is folded into that list once and then cleared.
+        async with db.execute("SELECT key, value FROM bot_settings WHERE key IN ('proxy_urls', 'proxy_url')") as cur:
+            proxy_rows = {str(row[0]): str(row[1]) for row in await cur.fetchall()}
+        try:
+            proxy_urls = [str(u) for u in json.loads(proxy_rows.get("proxy_urls") or "[]") if str(u).strip()]
+        except (TypeError, ValueError):
+            proxy_urls = []
+        legacy_proxy = (proxy_rows.get("proxy_url") or "").strip()
+        if legacy_proxy:
+            if legacy_proxy not in proxy_urls:
+                proxy_urls.append(legacy_proxy)
+            await db.execute(
+                """
+                INSERT INTO bot_settings (key, value, updated_at) VALUES ('proxy_urls', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+                """,
+                (json.dumps(proxy_urls),),
+            )
+            await db.execute("UPDATE bot_settings SET value = '' WHERE key = 'proxy_url'")
+            await db.commit()
+        config.PROXY_URLS = proxy_urls
         async with db.execute("SELECT value FROM bot_settings WHERE key = 'net_mode'") as cur:
             m_row = await cur.fetchone()
             if m_row is not None and str(m_row[0]) in config.NET_MODES:
@@ -861,6 +878,17 @@ async def get_bot_setting(key: str, default: Optional[str] = None) -> Optional[s
                 return str(row[0]) if row is not None else default
     except sqlite3.OperationalError:
         return default
+
+
+async def get_proxy_urls() -> list[str]:
+    try:
+        return [str(u) for u in json.loads(await get_bot_setting("proxy_urls", "[]") or "[]") if str(u).strip()]
+    except (TypeError, ValueError):
+        return []
+
+
+async def save_proxy_urls(proxy_urls: list[str]) -> None:
+    await set_bot_setting("proxy_urls", json.dumps(list(proxy_urls)))
 
 
 async def set_bot_setting(key: str, value: str) -> None:

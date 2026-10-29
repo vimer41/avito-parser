@@ -1,4 +1,4 @@
-"""/proxy: connect one proxy from the bot, probe it, persist it, switch the pool without restart."""
+"""Proxy management from the bot: add any number of proxies, drop same-IP duplicates, probe, persist, hot-swap."""
 
 import tempfile
 import time
@@ -19,6 +19,8 @@ from proxy_check import ProbeAttempt, ProbeResult
 
 PROXY_RAW = "10.1.2.3:8080:user:secret"
 PROXY_URL = "http://user:secret@10.1.2.3:8080"
+PROXY_B = "http://user:secret@10.9.9.9:3000"
+PROXY_B_OTHER_PORT = "socks5://user:secret@10.9.9.9:3001"
 
 
 def make_message(text: str):
@@ -29,90 +31,25 @@ def make_message(text: str):
     return message, status
 
 
-class TestProxyCommand(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+def probe(*oks):
+    attempts = [ProbeAttempt(True, 400, items=50) if ok else ProbeAttempt(False, 3000, failure="forbidden", status=403) for ok in oks]
+    return ProbeResult(proxy_id="p", masked_url="http://***@x:1", target_url="https://www.avito.ru/x", attempts=attempts)
+
+
+def exit_ips(mapping):
+    """Fake exit-IP lookup: proxy URL -> public IP; the server (None) exits from 203.0.113.1."""
+    async def lookup(urls, concurrency=5):
+        return {url: ("203.0.113.1" if url is None else mapping.get(url)) for url in urls}
+    return lookup
+
+
+class ProxyEnvMixin:
+    async def setup_env(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.patches = [
             patch.object(database, "DB_PATH", Path(self.temp_dir.name) / "proxy.db"),
             patch.object(config, "PROXY_URL", None),
-            patch.object(config, "PROXY_POOL_FILE", ""),
-            patch.object(config, "ALLOW_DIRECT_AVITO", True),
-        ]
-        for p in self.patches:
-            p.start()
-        await database.init_db()
-        self.pool = proxy_pool.ProxyPool(proxy_pool_file="", fallback_proxy_url="", allow_direct=True)
-        self.pool_patch = patch.object(proxy_pool, "get_proxy_pool", return_value=self.pool)
-        self.pool_patch.start()
-
-    async def asyncTearDown(self):
-        self.pool_patch.stop()
-        for client in self.pool.clients:
-            await client.close()
-        for p in reversed(self.patches):
-            p.stop()
-        self.temp_dir.cleanup()
-
-    def probe(self, *oks):
-        attempts = [ProbeAttempt(True, 400, items=50) if ok else ProbeAttempt(False, 3000, failure="forbidden", status=403) for ok in oks]
-        return ProbeResult(proxy_id="p-test", masked_url="http://***@10.1.2.3:8080", target_url="https://www.avito.ru/x", attempts=attempts)
-
-    async def test_successful_probe_connects_persists_and_hides_password(self):
-        message, status = make_message(f"/proxy {PROXY_RAW}")
-        with patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=self.probe(True, True, False))) as probe:
-            await admin.cmd_admin_proxy(message)
-        probe.assert_awaited_once()
-        self.assertEqual(probe.await_args.args[0], PROXY_URL)
-        message.delete.assert_awaited_once()
-        self.assertEqual(await database.get_bot_setting("proxy_url"), PROXY_URL)
-        self.assertEqual([c.proxy_url for c in self.pool.clients], [PROXY_URL])
-        report = status.edit_text.await_args.args[0]
-        self.assertIn("Прокси подключён", report)
-        self.assertIn("2/3", report)
-        self.assertNotIn("secret", report)
-
-    async def test_failed_probe_keeps_current_channel(self):
-        message, status = make_message(f"/proxy {PROXY_RAW}")
-        with patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=self.probe(False, False, False))):
-            await admin.cmd_admin_proxy(message)
-        self.assertIn("не подключён", status.edit_text.await_args.args[0])
-        self.assertIsNone(await database.get_bot_setting("proxy_url"))
-        self.assertEqual([c.proxy_url for c in self.pool.clients], [None])
-
-    async def test_invalid_proxy_is_rejected_without_probe(self):
-        message, _ = make_message("/proxy ftp://10.1.2.3:21")
-        with patch.object(proxy_check, "probe_channel", new=AsyncMock()) as probe:
-            await admin.cmd_admin_proxy(message)
-        probe.assert_not_awaited()
-        self.assertIn("неподдерживаемая схема", message.answer.await_args.args[0])
-
-    async def test_off_returns_to_direct_and_startup_restores_saved_proxy(self):
-        await database.set_bot_setting("proxy_url", PROXY_URL)
-        await database.init_db()
-        self.assertEqual(config.PROXY_URL, PROXY_URL)
-        await self.pool.reload_async()
-        self.assertEqual([c.proxy_url for c in self.pool.clients], [PROXY_URL])
-
-        message, _ = make_message("/proxy off")
-        await admin.cmd_admin_proxy(message)
-        self.assertEqual(await database.get_bot_setting("proxy_url"), "")
-        self.assertIsNone(config.PROXY_URL)
-        self.assertEqual([c.proxy_url for c in self.pool.clients], [None])
-
-    async def test_non_admin_is_refused(self):
-        message, _ = make_message(f"/proxy {PROXY_RAW}")
-        message.from_user.id = 1
-        with patch.object(proxy_check, "probe_channel", new=AsyncMock()) as probe:
-            await admin.cmd_admin_proxy(message)
-        probe.assert_not_awaited()
-
-
-class TestNetworkScreen(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.patches = [
-            patch.object(database, "DB_PATH", Path(self.temp_dir.name) / "net.db"),
-            patch.object(config, "PROXY_URL", None),
+            patch.object(config, "PROXY_URLS", []),
             patch.object(config, "PROXY_POOL_FILE", ""),
             patch.object(config, "ALLOW_DIRECT_AVITO", True),
             patch.object(config, "NET_MODE", "auto"),
@@ -123,10 +60,8 @@ class TestNetworkScreen(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.pool = proxy_pool.ProxyPool(proxy_pool_file="", fallback_proxy_url="", allow_direct=True)
         self.pool_patch = patch.object(proxy_pool, "get_proxy_pool", return_value=self.pool)
         self.pool_patch.start()
-        self.setup_dispatcher(names=("admin",))
 
-    async def asyncTearDown(self):
-        await self.close_dispatcher()
+    async def teardown_env(self):
         self.pool_patch.stop()
         for client in self.pool.clients:
             await client.close()
@@ -137,6 +72,98 @@ class TestNetworkScreen(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     def channels(self):
         return sorted((c.proxy_url or "direct") for c in self.pool.clients)
 
+
+class TestProxyCommand(ProxyEnvMixin, unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        await self.setup_env()
+
+    async def asyncTearDown(self):
+        await self.teardown_env()
+
+    async def test_successful_probe_adds_persists_keeps_server_and_hides_password(self):
+        message, status = make_message(f"/proxy {PROXY_RAW}")
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "10.1.2.3"})), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True, True, False))) as probe_mock:
+            await admin.cmd_admin_proxy(message)
+        self.assertEqual(probe_mock.await_args.args[0], PROXY_URL)
+        message.delete.assert_awaited_once()
+        self.assertEqual(await database.get_proxy_urls(), [PROXY_URL])
+        # Adding a proxy must add capacity, not switch the server IP off.
+        self.assertEqual(config.NET_MODE, "both")
+        self.assertEqual(self.channels(), ["direct", PROXY_URL])
+        report = status.edit_text.await_args.args[0]
+        self.assertIn("Добавлено: 1", report)
+        self.assertIn("2/3", report)
+        self.assertNotIn("secret", report)
+
+    async def test_failed_probe_is_not_added(self):
+        message, status = make_message(f"/proxy {PROXY_RAW}")
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "10.1.2.3"})), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(False, False, False))):
+            await admin.cmd_admin_proxy(message)
+        self.assertIn("не добавлен", status.edit_text.await_args.args[0])
+        self.assertEqual(await database.get_proxy_urls(), [])
+        self.assertEqual(self.channels(), ["direct"])
+
+    async def test_bulk_add_rejects_same_exit_ip_and_already_listed(self):
+        message, status = make_message(f"/proxy {PROXY_RAW}\n{PROXY_B}\n{PROXY_B_OTHER_PORT}\n\n{PROXY_RAW}")
+        ips = {PROXY_URL: "10.1.2.3", PROXY_B: "10.9.9.9", PROXY_B_OTHER_PORT: "10.9.9.9"}
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips(ips)), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True, True))) as probe_mock:
+            await admin.cmd_admin_proxy(message)
+        self.assertEqual(probe_mock.await_count, 2, "the same-IP duplicate must not even be probed")
+        self.assertEqual(await database.get_proxy_urls(), [PROXY_URL, PROXY_B])
+        report = status.edit_text.await_args.args[0]
+        self.assertIn("тот же IP 10.9.9.9", report)
+        self.assertIn("уже в списке", report)
+
+    async def test_proxy_exiting_from_the_server_ip_is_rejected(self):
+        message, status = make_message(f"/proxy {PROXY_RAW}")
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "203.0.113.1"})), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True))) as probe_mock:
+            await admin.cmd_admin_proxy(message)
+        probe_mock.assert_not_awaited()
+        self.assertIn("IP сервера", status.edit_text.await_args.args[0])
+        self.assertEqual(await database.get_proxy_urls(), [])
+
+    async def test_invalid_proxy_is_rejected_without_probe(self):
+        message, _ = make_message("/proxy ftp://10.1.2.3:21")
+        with patch.object(proxy_check, "probe_channel", new=AsyncMock()) as probe_mock:
+            await admin.cmd_admin_proxy(message)
+        probe_mock.assert_not_awaited()
+        self.assertIn("неподдерживаемая схема", message.answer.await_args.args[0])
+
+    async def test_off_removes_all_and_legacy_single_proxy_migrates_into_list(self):
+        await database.set_bot_setting("proxy_url", PROXY_URL)
+        await database.init_db()
+        self.assertEqual(config.PROXY_URLS, [PROXY_URL])
+        self.assertEqual(await database.get_proxy_urls(), [PROXY_URL])
+        self.assertEqual(await database.get_bot_setting("proxy_url"), "")
+        await self.pool.reload_async()
+        self.assertEqual(self.channels(), [PROXY_URL])
+
+        message, _ = make_message("/proxy off")
+        await admin.cmd_admin_proxy(message)
+        self.assertEqual(await database.get_proxy_urls(), [])
+        self.assertEqual(self.channels(), ["direct"])
+
+    async def test_non_admin_is_refused(self):
+        message, _ = make_message(f"/proxy {PROXY_RAW}")
+        message.from_user.id = 1
+        with patch.object(proxy_check, "probe_channel", new=AsyncMock()) as probe_mock:
+            await admin.cmd_admin_proxy(message)
+        probe_mock.assert_not_awaited()
+
+
+class TestNetworkScreen(ProxyEnvMixin, DispatcherFixture, unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        await self.setup_env()
+        self.setup_dispatcher(names=("admin",))
+
+    async def asyncTearDown(self):
+        await self.close_dispatcher()
+        await self.teardown_env()
+
     async def test_screen_lists_modes_and_refuses_proxy_mode_without_proxy(self):
         await self.dispatch_callback("admin_net", config.ADMIN_ID)
         self.assertTrue({"admin_net_mode:direct", "admin_net_mode:proxy", "admin_net_mode:both",
@@ -146,26 +173,28 @@ class TestNetworkScreen(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.NET_MODE, "auto")
         self.assertEqual(self.channels(), ["direct"])
 
-    async def test_button_flow_connects_proxy_then_both_mode_uses_two_channels(self):
+    async def test_button_flow_adds_many_proxies_then_lists_and_deletes_them(self):
         await self.dispatch_callback("admin_net_add", config.ADMIN_ID)
-        probe = ProbeResult(proxy_id="p", masked_url="http://***@10.1.2.3:8080", target_url="u",
-                            attempts=[ProbeAttempt(True, 300, items=50)])
-        with patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe)):
-            await self.dispatch_message(text=PROXY_RAW, user_id=config.ADMIN_ID)
-        self.assertTrue(self.methods("DeleteMessage"), "the message with the password must be deleted")
-        self.assertEqual(self.channels(), [PROXY_URL])
-        self.assertIn("admin_net_proxy_off", self.callback_values())
-
-        await self.dispatch_callback("admin_net_mode:both", config.ADMIN_ID)
-        self.assertEqual(config.NET_MODE, "both")
-        self.assertEqual(await database.get_bot_setting("net_mode"), "both")
-        self.assertEqual(self.channels(), ["direct", PROXY_URL])
+        ips = {PROXY_URL: "10.1.2.3", PROXY_B: "10.9.9.9"}
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips(ips)), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True, True))):
+            await self.dispatch_message(text=f"{PROXY_RAW}\n{PROXY_B}", user_id=config.ADMIN_ID)
+        self.assertTrue(self.methods("DeleteMessage"), "the message with the passwords must be deleted")
+        self.assertEqual(self.channels(), ["direct", PROXY_URL, PROXY_B])
+        self.assertIn("admin_net_list:0", self.callback_values())
 
         await self.dispatch_callback("admin_net_mode:proxy", config.ADMIN_ID)
-        self.assertEqual(self.channels(), [PROXY_URL])
+        self.assertEqual(self.channels(), [PROXY_URL, PROXY_B])
 
-        # Removing the only proxy in proxy-only mode must not silently stop scanning.
-        await self.dispatch_callback("admin_net_proxy_off", config.ADMIN_ID)
+        await self.dispatch_callback("admin_net_list:0", config.ADMIN_ID)
+        delete_buttons = [v for v in self.callback_values() if v.startswith("admin_net_del:")]
+        self.assertEqual(len(delete_buttons), 2)
+        await self.dispatch_callback(delete_buttons[0], config.ADMIN_ID)
+        self.assertEqual(len(await database.get_proxy_urls()), 1)
+
+        # Removing the last proxy in proxy-only mode must not silently stop scanning.
+        await self.dispatch_callback("admin_net_delall", config.ADMIN_ID)
+        await self.dispatch_callback("admin_net_delall_yes", config.ADMIN_ID)
         self.assertEqual(config.NET_MODE, "direct")
         self.assertEqual(self.channels(), ["direct"])
 
@@ -177,6 +206,47 @@ class TestNetworkScreen(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     async def test_non_admin_cannot_switch_modes(self):
         await self.dispatch_callback("admin_net_mode:direct", 123456)
         self.assertEqual(config.NET_MODE, "auto")
+
+
+class TestChannelSelectionAndLimiter(unittest.TestCase):
+    def setUp(self):
+        self.patches = [patch.object(config, "PROXY_URLS", []), patch.object(config, "NET_MODE", "both"),
+                        patch.object(config, "PROXY_URL", None), patch.object(config, "PROXY_POOL_FILE", "")]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+
+    def test_background_403s_do_not_throttle_a_proxy(self):
+        client = proxy_pool.ProxyClient(PROXY_URL)
+        for index in range(40):  # ~12% blocks, like Avito's background rate for any IP
+            client.record_raw_http_response(403 if index % 8 == 0 else 200, 0.5)
+            if index % 8 == 0:
+                client.record_final_block("forbidden")
+        self.assertEqual(client.effective_rate, client.configured_rate)
+
+    def test_heavy_blocking_cuts_rate_but_not_below_floor_and_recovers(self):
+        client = proxy_pool.ProxyClient(PROXY_URL)
+        for _ in range(20):
+            client.record_raw_http_response(403, 0.5)
+            client.record_final_block("forbidden")
+        self.assertEqual(client.effective_rate, config.PROXY_MIN_RATE)
+        for _ in range(40):
+            client.record_raw_http_response(200, 0.5)
+        self.assertGreater(client.effective_rate, config.PROXY_MIN_RATE)
+
+    def test_busy_fast_channel_beats_idle_throttled_one(self):
+        with patch.object(config, "PROXY_URLS", [PROXY_URL]):
+            pool = proxy_pool.ProxyPool(proxy_pool_file="", fallback_proxy_url="", allow_direct=True)
+        server = next(c for c in pool.clients if c.is_direct)
+        slow = next(c for c in pool.clients if not c.is_direct)
+        server.in_flight = 1  # the server is mid-request
+        slow._next_request_at = time.monotonic() + 10  # throttled proxy is free but 10 s from its next slot
+        lease = pool.acquire_client()
+        self.assertIs(lease.client, server)
+        lease.release()
 
 
 class TestProbeChannel(unittest.IsolatedAsyncioTestCase):

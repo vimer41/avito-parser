@@ -535,7 +535,11 @@ class TestProxyPoolLifecycle(unittest.IsolatedAsyncioTestCase):
                 c1.record_transport_error()
             self.assertEqual(c1.state, "quarantined")
             self.assertEqual(pool.healthy_count(), 1)
+            # The rate is cut only when blocks dominate the recent window, not on Avito's background 403s.
+            for _ in range(10):
+                c1.record_raw_http_response(403, 0.2)
             c1.record_final_block("test_403")
+            self.assertLess(c1.effective_rate, c1.configured_rate)
 
             # Half-open recovery after quarantine expires
             c1.quarantined_until = time.monotonic() - 0.01
@@ -549,7 +553,7 @@ class TestProxyPoolLifecycle(unittest.IsolatedAsyncioTestCase):
             lease.release()
             self.assertEqual(c1.state, "healthy")
 
-            # 50 consecutive successes restore effective_rate by *1.25 up to configured_rate
+            # Successes push the block share back under the cut ratio and restore effective_rate by *1.25
             start_rps = c1.effective_rate
             for _ in range(50):
                 c1.record_raw_http_response(200, 0.2)

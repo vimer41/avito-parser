@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 from aiogram import Router, F, Bot
@@ -1235,7 +1236,8 @@ NET_MODE_BUTTONS = (("direct", "🖥 Сервер"), ("proxy", "🛰 Прокс�
 
 PROXY_FORMAT_HELP = (
     "Формат: <code>http://логин:пароль@IP:порт</code>\n"
-    "или <code>IP:порт:логин:пароль</code>, поддерживается <code>socks5://</code>."
+    "или <code>IP:порт:логин:пароль</code>, поддерживается <code>socks5://</code>.\n"
+    "Несколько прокси — каждый с новой строки."
 )
 
 FAILURE_LABELS = {
@@ -1253,22 +1255,29 @@ NET_BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 
-def _format_probe(result) -> str:
-    name = "IP сервера" if result.masked_url.startswith("direct://") else result.masked_url
-    lines = [f"🧪 <b>{html.escape(name)}</b>"]
-    for index, attempt in enumerate(result.attempts, 1):
-        if attempt.ok:
-            lines.append(f"{index}) ✅ {attempt.elapsed_ms} мс · лотов: {attempt.items}")
-        else:
-            label = FAILURE_LABELS.get(attempt.failure, attempt.failure)
-            status = f" (HTTP {attempt.status})" if attempt.status else ""
-            lines.append(f"{index}) ❌ {attempt.elapsed_ms} мс · {html.escape(label)}{status}")
-    median = result.median_ok_ms
-    lines.append(
-        f"Итог: <b>{result.successes}/{len(result.attempts)}</b> успешно"
-        + (f", медиана <b>{median} мс</b>" if median is not None else "")
-    )
-    return "\n".join(lines)
+NET_CHANNELS_SHOWN = 12
+PROXIES_PER_PAGE = 8
+PROBE_CONCURRENCY = 4
+
+
+def _proxy_host(url: str | None) -> str:
+    """'IP:порт' without credentials, for compact lists."""
+    if not url:
+        return "IP сервера"
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    return f"{parts.hostname}:{parts.port}" if parts.hostname else "прокси"
+
+
+def _probe_summary(result) -> str:
+    """'2/3 · 640 мс' or '0/3 · Авито заблокировал IP (403)'."""
+    score = f"{result.successes}/{len(result.attempts)}"
+    if result.median_ok_ms is not None:
+        return f"{score} · {result.median_ok_ms} мс"
+    last = result.attempts[-1] if result.attempts else None
+    reason = FAILURE_LABELS.get(last.failure, last.failure) if last else "нет ответа"
+    status = f" (HTTP {last.status})" if last and last.status else ""
+    return f"{score} · {html.escape(reason)}{status}"
 
 
 async def _probe_target_url() -> str | None:
@@ -1280,46 +1289,61 @@ async def _probe_target_url() -> str | None:
     return searches[0]["url"] if searches else None
 
 
+async def _probe_many(urls: list, attempts: int) -> dict:
+    from proxy_check import probe_channel
+
+    target = await _probe_target_url()
+    gate = asyncio.Semaphore(PROBE_CONCURRENCY)
+
+    async def one(url):
+        async with gate:
+            return await probe_channel(url, target, attempts=attempts)
+
+    results = await asyncio.gather(*(one(url) for url in urls))
+    return dict(zip(urls, results))
+
+
 async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
     from proxy_pool import get_proxy_pool
 
     pool = get_proxy_pool()
     mode = config.NET_MODE
+    snaps = pool.snapshots()
+    working = [s for s in snaps if s.get("state") in ("healthy", "degraded", "half_open")]
     lines = [
         "🌐 <b>Сеть и прокси</b>",
         "",
         f"Режим: <b>{NET_MODE_TITLES.get(mode, mode)}</b>",
         f"<i>{NET_MODE_HINTS.get(mode, '')}</i>",
         "",
-        "<b>Каналы сканирования:</b>",
+        f"<b>Каналы сканирования</b> · работают {len(working)} из {len(snaps)}, "
+        f"суммарно <code>{sum(float(s.get('effective_rate') or 0) for s in working):.2f}</code> req/s:",
     ]
-    snaps = pool.snapshots()
-    lines += [_channel_label(snap) for snap in snaps] or ["⏸ нет активных каналов — сканирование стоит"]
+    lines += [_channel_label(snap) for snap in snaps[:NET_CHANNELS_SHOWN]] or ["⏸ нет активных каналов — сканирование стоит"]
+    if len(snaps) > NET_CHANNELS_SHOWN:
+        lines.append(f"… и ещё {len(snaps) - NET_CHANNELS_SHOWN} — полный список в «🗂 Мои прокси»")
     if mode in ("proxy", "both") and not pool.has_configured_proxy():
-        lines += ["", "⚠️ Прокси не подключён — нажмите «➕ Подключить прокси»."]
+        lines += ["", "⚠️ Прокси не подключены — нажмите «➕ Добавить прокси»."]
     if pool.pool_file_overrides_single_proxy():
-        lines += ["", "📄 Прокси берутся из файла PROXY_POOL_FILE на сервере."]
+        lines += ["", "📄 Прокси берутся из файла PROXY_POOL_FILE на сервере, добавленные в боте не используются."]
     if note:
         lines += ["", note]
 
+    add_row = [InlineKeyboardButton(text="➕ Добавить прокси", callback_data="admin_net_add")]
+    if config.PROXY_URLS:
+        add_row.append(InlineKeyboardButton(text=f"🗂 Мои прокси ({len(config.PROXY_URLS)})", callback_data="admin_net_list:0"))
     buttons = [
         [
             InlineKeyboardButton(text=("✅ " if key == mode else "") + title, callback_data=f"admin_net_mode:{key}")
             for key, title in NET_MODE_BUTTONS
         ],
         [InlineKeyboardButton(text="🧪 Проверить каналы", callback_data="admin_net_probe")],
+        add_row,
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_net"),
+            InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh"),
+        ],
     ]
-    if config.PROXY_URL:
-        buttons.append([
-            InlineKeyboardButton(text="🔁 Заменить прокси", callback_data="admin_net_add"),
-            InlineKeyboardButton(text="🗑 Убрать прокси", callback_data="admin_net_proxy_off"),
-        ])
-    else:
-        buttons.append([InlineKeyboardButton(text="➕ Подключить прокси", callback_data="admin_net_add")])
-    buttons.append([
-        InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_net"),
-        InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh"),
-    ])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1330,22 +1354,37 @@ async def _set_net_mode(mode: str) -> None:
     await get_proxy_pool().set_net_mode_async(mode)
 
 
-async def _probe_all_channels() -> str:
-    from proxy_check import DEFAULT_PROBE_URL, probe_channel
+async def _save_proxy_list(urls: list[str]) -> None:
     from proxy_pool import get_proxy_pool
 
-    clients = list(get_proxy_pool().clients)
-    if not clients:
+    await get_proxy_pool().set_proxy_list_async(urls)
+    await database.save_proxy_urls(config.PROXY_URLS)
+
+
+async def _probe_all_channels() -> str:
+    from proxy_check import DEFAULT_PROBE_URL
+    from proxy_pool import get_proxy_pool
+
+    urls = [client.proxy_url for client in get_proxy_pool().clients]
+    if not urls:
         return "⏸ Нет активных каналов — проверять нечего."
-    target = await _probe_target_url()
-    reports = [_format_probe(await probe_channel(client.proxy_url, target)) for client in clients]
-    shown = (target or DEFAULT_PROBE_URL)[:80]
-    return f"🧪 <b>Проверка каналов</b> · 3 запроса подряд\nПоиск: <code>{html.escape(shown)}</code>\n\n" + "\n\n".join(reports)
+    attempts = 3 if len(urls) <= 3 else 2
+    results = await _probe_many(urls, attempts)
+    target = (await _probe_target_url() or DEFAULT_PROBE_URL)[:80]
+    lines = [f"🧪 <b>Проверка каналов</b> · по {attempts} запроса подряд", f"Поиск: <code>{html.escape(target)}</code>", ""]
+    for url in urls:
+        result = results[url]
+        icon = "🟢" if result.successes == len(result.attempts) else ("🟡" if result.successes else "🔴")
+        lines.append(f"{icon} {html.escape(_proxy_host(url))} — {_probe_summary(result)}")
+    return "\n".join(lines[:60])
 
 
-async def _connect_proxy(message: Message, raw: str) -> None:
-    """Validate, live-probe and switch to a proxy; the message with the password is deleted."""
-    from proxy_check import probe_channel
+async def _add_proxies(message: Message, raw: str) -> None:
+    """
+    Add any number of proxies (one per line): validate, drop duplicates by exit IP, live-probe the rest
+    and keep only the ones Avito answers through. The message with the passwords is deleted.
+    """
+    from proxy_check import exit_ips_for
     from proxy_pool import get_proxy_pool, parse_and_validate_proxy_line
     from runtime_metrics import sanitize_proxy_credentials
 
@@ -1353,48 +1392,115 @@ async def _connect_proxy(message: Message, raw: str) -> None:
         await message.delete()
     except Exception:
         pass
-    try:
-        normalized = parse_and_validate_proxy_line(raw)
-    except ValueError as exc:
-        await message.answer(
-            f"❌ {html.escape(sanitize_proxy_credentials(str(exc)))}\n\n{PROXY_FORMAT_HELP}",
-            reply_markup=NET_BACK_KB, parse_mode="HTML",
-        )
+
+    report: list[str] = []
+    candidates: list[str] = []
+    entries = [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
+    for line_number, line in enumerate(entries, start=1):
+        try:
+            normalized = parse_and_validate_proxy_line(line, line_number=line_number)
+        except ValueError as exc:
+            report.append(f"❌ {html.escape(sanitize_proxy_credentials(str(exc)))}")
+            continue
+        if normalized in config.PROXY_URLS or normalized in candidates:
+            report.append(f"↩️ {html.escape(_proxy_host(normalized))} — уже в списке")
+            continue
+        candidates.append(normalized)
+
+    if not candidates:
+        text, kb = await _render_net("\n".join(report) or f"Не найдено ни одного прокси.\n\n{PROXY_FORMAT_HELP}")
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
 
-    status = await message.answer("⏳ Проверяю прокси: 3 запроса к Авито подряд…")
-    result = await probe_channel(normalized, await _probe_target_url())
-    report = _format_probe(result)
-    if result.successes == 0:
-        await status.edit_text(
-            report + "\n\n🚫 <b>Прокси не подключён</b>: ни один запрос не прошёл. Текущие настройки не изменены.",
-            reply_markup=NET_BACK_KB, parse_mode="HTML",
-        )
-        return
-
-    await database.set_bot_setting("proxy_url", normalized)
-    await get_proxy_pool().set_single_proxy_async(normalized)
-    note = "✅ <b>Прокси подключён</b> — применено сразу, без перезапуска."
-    if config.NET_MODE == "direct":
-        # In server-only mode the new proxy would sit idle.
-        await _set_net_mode("proxy")
-        note += "\nРежим переключён на «🛰 Только прокси» — выберите «🔀 Оба», чтобы работали и сервер, и прокси."
-    text, kb = await _render_net(report + "\n\n" + note)
-    await status.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    logger.info("Admin %s connected proxy %s", message.from_user.id, result.proxy_id)
-
-
-async def _disconnect_proxy() -> str:
-    from proxy_pool import get_proxy_pool
-
+    status = await message.answer(f"⏳ Проверяю прокси: {len(candidates)} шт. Это займёт до минуты…")
     pool = get_proxy_pool()
-    await database.set_bot_setting("proxy_url", "")
-    await pool.set_single_proxy_async(config.parse_proxy(config.RAW_PROXY))
-    note = "🗑 Прокси отключён."
-    if config.NET_MODE == "proxy" and not pool.has_configured_proxy():
+    existing = [client.proxy_url for client in pool.clients if client.proxy_url]
+    exit_ips = await exit_ips_for([None, *existing, *candidates])
+
+    # One public IP is one IP for Avito, whatever the port or protocol.
+    taken = {ip: _proxy_host(url) for url, ip in exit_ips.items() if ip and (url is None or url in existing)}
+    unique: list[str] = []
+    for url in candidates:
+        ip = exit_ips.get(url)
+        if ip and ip in taken:
+            report.append(f"⚠️ {html.escape(_proxy_host(url))} — тот же IP {ip}, что у {html.escape(taken[ip])}: для Авито это один адрес, пропущен")
+            continue
+        if ip:
+            taken[ip] = _proxy_host(url)
+        unique.append(url)
+
+    results = await _probe_many(unique, attempts=3 if len(unique) == 1 else 2) if unique else {}
+    accepted = []
+    for url in unique:
+        result = results[url]
+        ip = exit_ips.get(url)
+        ip_note = f" · IP {ip}" if ip else ""
+        if result.successes:
+            accepted.append(url)
+            report.append(f"✅ {html.escape(_proxy_host(url))}{ip_note} — {_probe_summary(result)}")
+        else:
+            report.append(f"🚫 {html.escape(_proxy_host(url))}{ip_note} — {_probe_summary(result)}, не добавлен")
+
+    if accepted:
+        await _save_proxy_list([*config.PROXY_URLS, *accepted])
+        report.append(f"\n<b>Добавлено: {len(accepted)}</b>, всего прокси: {len(config.PROXY_URLS)}. Применено сразу.")
+        if config.NET_MODE in ("direct", "auto"):
+            # Keep the server IP scanning too: a fresh proxy must add capacity, not replace it.
+            await _set_net_mode("both")
+            report.append("Режим переключён на «🔀 Оба»: сервер и прокси делят нагрузку.")
+        logger.info("Admin %s added %s proxies", message.from_user.id, len(accepted))
+    text, kb = await _render_net("\n".join(report))
+    await status.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+async def _remove_proxies(proxy_ids: set[str] | None) -> str:
+    """Remove the given bot-managed proxies (None = all) without stalling scanning."""
+    from proxy_pool import compute_proxy_id, get_proxy_pool
+
+    before = len(config.PROXY_URLS)
+    keep = [] if proxy_ids is None else [u for u in config.PROXY_URLS if compute_proxy_id(u) not in proxy_ids]
+    await _save_proxy_list(keep)
+    note = f"🗑 Удалено прокси: {before - len(keep)}, осталось: {len(keep)}."
+    if config.NET_MODE == "proxy" and not get_proxy_pool().has_configured_proxy():
         await _set_net_mode("direct")
         note += " Режим переключён на «🖥 Только сервер», чтобы сканирование не встало."
     return note
+
+
+async def _render_proxy_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    from proxy_check import EXIT_IPS
+    from proxy_pool import compute_proxy_id, get_proxy_pool
+
+    states = {snap["proxy_id"]: snap for snap in get_proxy_pool().snapshots()}
+    urls = list(config.PROXY_URLS)
+    pages = max(1, (len(urls) + PROXIES_PER_PAGE - 1) // PROXIES_PER_PAGE)
+    page = min(max(0, page), pages - 1)
+    start = page * PROXIES_PER_PAGE
+    lines = [f"🗂 <b>Мои прокси</b> ({len(urls)})" + (f" · стр. {page + 1}/{pages}" if pages > 1 else ""), ""]
+    buttons = []
+    for index, url in enumerate(urls[start:start + PROXIES_PER_PAGE], start=start + 1):
+        pid = compute_proxy_id(url)
+        snap = states.get(pid, {})
+        icon = CHANNEL_STATE_ICONS.get(str(snap.get("state")), "⚪")
+        ip = EXIT_IPS.get(pid)
+        rate = float(snap.get("effective_rate") or 0)
+        lines.append(f"{index}. {icon} {html.escape(_proxy_host(url))}" + (f" · IP {ip}" if ip else "") + f" · <code>{rate:.2f}</code> req/s")
+        buttons.append([InlineKeyboardButton(text=f"🗑 {index}. {_proxy_host(url)}", callback_data=f"admin_net_del:{pid}:{page}")])
+    if not urls:
+        lines.append("Список пуст.")
+    if pages > 1:
+        buttons.append([
+            InlineKeyboardButton(text="◀️", callback_data=f"admin_net_list:{page - 1}" if page > 0 else "admin_noop"),
+            InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="admin_noop"),
+            InlineKeyboardButton(text="▶️", callback_data=f"admin_net_list:{page + 1}" if page < pages - 1 else "admin_noop"),
+        ])
+    if urls:
+        buttons.append([InlineKeyboardButton(text="🗑 Удалить все", callback_data="admin_net_delall")])
+    buttons.append([
+        InlineKeyboardButton(text="➕ Добавить", callback_data="admin_net_add"),
+        InlineKeyboardButton(text="🌐 К сети", callback_data="admin_net"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 @router.callback_query(F.data == "admin_net")
@@ -1420,7 +1526,7 @@ async def cb_admin_net_mode(call: CallbackQuery):
         await call.answer("Неизвестный режим", show_alert=True)
         return
     if mode in ("proxy", "both") and not get_proxy_pool().has_configured_proxy():
-        await call.answer("Сначала подключите прокси: кнопка «➕ Подключить прокси».", show_alert=True)
+        await call.answer("Сначала добавьте прокси: кнопка «➕ Добавить прокси».", show_alert=True)
         return
     await _set_net_mode(mode)
     await call.answer(f"Режим: {NET_MODE_TITLES[mode]}")
@@ -1435,7 +1541,7 @@ async def cb_admin_net_probe(call: CallbackQuery):
         return
     await call.answer("Проверяю, это займёт до минуты…")
     try:
-        await call.message.edit_text("⏳ Проверяю каналы: по 3 запроса к Авито подряд…")
+        await call.message.edit_text("⏳ Проверяю каналы…")
     except Exception:
         pass
     report = await _probe_all_channels()
@@ -1451,9 +1557,9 @@ async def cb_admin_net_add(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await _show(
         call,
-        "➕ <b>Подключение прокси</b>\n\n"
-        "Пришлите прокси одним сообщением. Бот сразу удалит его из чата, сделает 3 запроса к Авито "
-        "и подключит прокси, только если он работает.\n\n" + PROXY_FORMAT_HELP,
+        "➕ <b>Добавление прокси</b>\n\n"
+        "Пришлите один или сколько угодно прокси — каждый с новой строки. Бот удалит сообщение из чата, "
+        "отсеет прокси с одинаковым IP, проверит каждый на Авито и добавит только рабочие.\n\n" + PROXY_FORMAT_HELP,
         InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="admin_net")]]),
     )
 
@@ -1463,23 +1569,67 @@ async def msg_admin_proxy_input(message: Message, state: FSMContext):
     if not config.is_admin(message.from_user.id):
         return
     await state.clear()
-    await _connect_proxy(message, message.text.strip())
+    await _add_proxies(message, message.text)
 
 
-@router.callback_query(F.data == "admin_net_proxy_off")
-async def cb_admin_net_proxy_off(call: CallbackQuery):
+@router.callback_query(F.data.startswith("admin_net_list:"))
+async def cb_admin_net_list(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
-    note = await _disconnect_proxy()
-    await call.answer("Прокси отключён")
+    try:
+        page = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        page = 0
+    await call.answer()
+    text, kb = await _render_proxy_list(page)
+    await _show(call, text, kb)
+
+
+@router.callback_query(F.data.startswith("admin_net_del:"))
+async def cb_admin_net_del(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    parts = call.data.split(":")
+    proxy_id = parts[1] if len(parts) > 1 else ""
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    note = await _remove_proxies({proxy_id})
+    await call.answer(note[:190])
+    text, kb = await _render_proxy_list(page)
+    await _show(call, text, kb)
+
+
+@router.callback_query(F.data == "admin_net_delall")
+async def cb_admin_net_delall(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await call.answer()
+    await _show(
+        call,
+        f"🗑 Удалить все прокси ({len(config.PROXY_URLS)} шт.)?",
+        InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Да, удалить все", callback_data="admin_net_delall_yes"),
+            InlineKeyboardButton(text="Отмена", callback_data="admin_net_list:0"),
+        ]]),
+    )
+
+
+@router.callback_query(F.data == "admin_net_delall_yes")
+async def cb_admin_net_delall_yes(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    note = await _remove_proxies(None)
+    await call.answer("Прокси удалены")
     text, kb = await _render_net(note)
     await _show(call, text, kb)
 
 
 @router.message(Command("proxy"))
 async def cmd_admin_proxy(message: Message):
-    """/proxy — экран сети; /proxy <url> — подключить; /proxy test — проверить каналы; /proxy off — убрать."""
+    """/proxy — экран сети; /proxy <прокси, можно списком> — добавить; /proxy test — проверить; /proxy off — удалить все."""
     if not config.is_admin(message.from_user.id):
         await message.answer("⛔ У вас нет прав администратора.")
         return
@@ -1490,10 +1640,10 @@ async def cmd_admin_proxy(message: Message):
         text, kb = await _render_net()
         await message.answer(text, reply_markup=kb, parse_mode="HTML")
     elif arg.lower() in ("off", "выкл", "0"):
-        text, kb = await _render_net(await _disconnect_proxy())
+        text, kb = await _render_net(await _remove_proxies(None))
         await message.answer(text, reply_markup=kb, parse_mode="HTML")
     elif arg.lower() in ("test", "тест", "check"):
-        status = await message.answer("⏳ Проверяю каналы: по 3 запроса к Авито подряд…")
+        status = await message.answer("⏳ Проверяю каналы…")
         await status.edit_text(await _probe_all_channels(), reply_markup=NET_BACK_KB, parse_mode="HTML")
     else:
-        await _connect_proxy(message, arg)
+        await _add_proxies(message, arg)

@@ -8,16 +8,24 @@ how radars will behave on that channel.
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from curl_cffi import requests as curl_requests
+
 from collector import collect_source
 from parser import AvitoParser
-from proxy_pool import ProxyClient
+from proxy_pool import ProxyClient, compute_proxy_id
 
 DEFAULT_PROBE_URL = "https://www.avito.ru/moskva?q=iphone&s=104"
+EXIT_IP_URL = "https://api.ipify.org"
+
+# proxy_id -> public IP the channel exits from. Two "proxies" with one exit IP are one IP for Avito.
+EXIT_IPS: dict[str, str] = {}
 
 
 @dataclass
@@ -44,6 +52,35 @@ class ProbeResult:
     def median_ok_ms(self) -> Optional[int]:
         times = [attempt.elapsed_ms for attempt in self.attempts if attempt.ok]
         return int(statistics.median(times)) if times else None
+
+
+async def detect_exit_ip(proxy_url: Optional[str], timeout: float = 8.0) -> Optional[str]:
+    """Public IP seen by websites through this channel (None if it cannot be determined)."""
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    try:
+        async with curl_requests.AsyncSession(proxies=proxies, timeout=timeout) as session:
+            response = await session.get(EXIT_IP_URL)
+        value = (response.text or "").strip()
+        ipaddress.ip_address(value)
+    except Exception:
+        return None
+    EXIT_IPS[compute_proxy_id(proxy_url)] = value
+    return value
+
+
+async def exit_ips_for(proxy_urls: list[Optional[str]], concurrency: int = 5) -> dict[Optional[str], Optional[str]]:
+    """Exit IPs for many channels at once, reusing values already learned in this process."""
+    gate = asyncio.Semaphore(concurrency)
+
+    async def one(url: Optional[str]) -> Optional[str]:
+        cached = EXIT_IPS.get(compute_proxy_id(url))
+        if cached:
+            return cached
+        async with gate:
+            return await detect_exit_ip(url)
+
+    values = await asyncio.gather(*(one(url) for url in proxy_urls))
+    return dict(zip(proxy_urls, values))
 
 
 async def probe_channel(proxy_url: Optional[str], target_url: Optional[str] = None, attempts: int = 3) -> ProbeResult:

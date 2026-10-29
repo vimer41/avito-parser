@@ -93,13 +93,13 @@ if NET_MODE not in NET_MODES:
 PROXY_RATE_LIMIT = positive_float_setting("PROXY_RATE_LIMIT", "1.5")
 PROXY_RATE_RECOMMENDATION_MAX = positive_float_setting("PROXY_RATE_RECOMMENDATION_MAX", "2.0")
 PROXY_CAPACITY_RESERVE = non_negative_float_setting("PROXY_CAPACITY_RESERVE", "0.20")
-PROXY_MIN_RATE = positive_float_setting("PROXY_MIN_RATE", "0.1")
+PROXY_MIN_RATE = positive_float_setting("PROXY_MIN_RATE", "0.5")
 PROXY_MAX_IN_FLIGHT = positive_int_setting("PROXY_MAX_IN_FLIGHT", "1")
 PROXY_FAILURE_THRESHOLD = positive_int_setting("PROXY_FAILURE_THRESHOLD", "3")
 PROXY_BLOCK_WINDOW_SECONDS = positive_int_setting("PROXY_BLOCK_WINDOW_SECONDS", "600")
 PROXY_BLOCK_RATIO_THRESHOLD = positive_float_setting("PROXY_BLOCK_RATIO_THRESHOLD", "0.05")
 PROXY_BLOCK_RATIO_MIN_REQUESTS = positive_int_setting("PROXY_BLOCK_RATIO_MIN_REQUESTS", "20")
-PROXY_RECOVERY_SUCCESS_STREAK = positive_int_setting("PROXY_RECOVERY_SUCCESS_STREAK", "50")
+PROXY_RECOVERY_SUCCESS_STREAK = positive_int_setting("PROXY_RECOVERY_SUCCESS_STREAK", "10")
 PROXY_RECOVERY_FACTOR = positive_float_setting("PROXY_RECOVERY_FACTOR", "1.25")
 PROXY_QUARANTINE_BASE = positive_float_setting("PROXY_QUARANTINE_BASE", "2")
 PROXY_QUARANTINE_MAX = positive_float_setting("PROXY_QUARANTINE_MAX", "15")
@@ -107,6 +107,12 @@ PROXY_TRANSPORT_BACKOFF_BASE = positive_float_setting("PROXY_TRANSPORT_BACKOFF_B
 PROXY_TRANSPORT_BACKOFF_MAX = positive_float_setting("PROXY_TRANSPORT_BACKOFF_MAX", "10")
 # Token bucket per proxy client: sustained PROXY_RATE_LIMIT req/s with bursts up to PROXY_RATE_BURST requests.
 PROXY_RATE_BURST = positive_float_setting("PROXY_RATE_BURST", "3")
+# Avito answers ~10-15% of requests from any IP with 403/439 as background noise. A proxy's rate is cut only
+# when its share of blocks among the last PROXY_RATE_WINDOW responses exceeds PROXY_RATE_CUT_RATIO.
+PROXY_RATE_WINDOW = positive_int_setting("PROXY_RATE_WINDOW", "20")
+PROXY_RATE_CUT_RATIO = positive_float_setting("PROXY_RATE_CUT_RATIO", "0.25")
+# Channel choice: an extra in-flight request on a busy channel is assumed to cost this many seconds of waiting.
+PROXY_BUSY_PENALTY = positive_float_setting("PROXY_BUSY_PENALTY", "1.0")
 CHALLENGE_WORKERS = positive_int_setting("CHALLENGE_WORKERS", "1")
 COOKIE_SAVE_INTERVAL = non_negative_float_setting("COOKIE_SAVE_INTERVAL", "30")
 
@@ -292,6 +298,8 @@ def parse_proxy(raw_proxy: str | None) -> str | None:
 
 RAW_PROXY = os.getenv("PROXY_URL", "").strip() or None
 PROXY_URL = parse_proxy(RAW_PROXY)
+# Proxies added from the bot (/admin -> network); persisted in bot_settings.proxy_urls and merged with PROXY_URL.
+PROXY_URLS: list[str] = []
 
 # Значение ADMIN_IDS имеет приоритет; ADMIN_ID поддерживается для совместимости.
 raw_admin_ids = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "986832959,455386428"
