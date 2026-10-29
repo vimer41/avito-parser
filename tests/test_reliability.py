@@ -606,12 +606,6 @@ class TestReliability(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.wait_for(all_done.wait(), timeout=4.0)
             elapsed = time.monotonic() - t_start
-            # The last sends are acknowledged in the outbox right after Telegram returns: let them land
-            # before cancelling the workers, or a cancelled ack leaves a row behind.
-            for _ in range(40):
-                if await self.outbox_count() == 0:
-                    break
-                await asyncio.sleep(0.05)
         finally:
             for w in workers:
                 w.cancel()

@@ -391,30 +391,12 @@ async def _show_card(event, s: dict) -> None:
     await ui.show(event, card_text, markup, disable_web_page_preview=True)
 
 
-RADARS_PAGE = 10
-
-
-def _page_nav(page: int, pages: int, prefix: str) -> list:
-    """« 2/5 » row for a paged list; empty when everything fits on one page."""
-    if pages <= 1:
-        return []
-    return [
-        ui.btn("«", callback_data=f"{prefix}:{(page - 1) % pages}"),
-        ui.btn(f"{page + 1}/{pages}", callback_data=f"{prefix}:{page}"),
-        ui.btn("»", callback_data=f"{prefix}:{(page + 1) % pages}"),
-    ]
-
-
 @router.message(F.text.in_(ui.menu_texts("radars")))
 @router.callback_query(F.data == "list_searches")
-@router.callback_query(F.data.startswith("list_searches:"))
-async def show_searches(event, state: Optional[FSMContext] = None, page: int = 0):
+async def show_searches(event, state: Optional[FSMContext] = None):
     user_id = event.from_user.id
     if state:
         await state.clear()
-    data = getattr(event, "data", None) or ""
-    if data.startswith("list_searches:") and data.split(":")[1].isdigit():
-        page = int(data.split(":")[1])
     searches = await database.get_user_searches(user_id)
 
     if not searches:
@@ -431,17 +413,12 @@ async def show_searches(event, state: Optional[FSMContext] = None, page: int = 0
     from scheduler import get_last_scan_info
     max_radars = await database.get_user_max_radars(user_id)
     active_cnt = sum(1 for s in searches if s.get("is_active"))
-    pages = -(-len(searches) // RADARS_PAGE)
-    page = max(0, min(page, pages - 1))
-    first = page * RADARS_PAGE
-    page_searches = searches[first:first + RADARS_PAGE]
     lines = [
         f"{ui.e('radars')} <b>Мои радары</b> · {len(searches)} из {max_radars}",
-        f"Работают: {active_cnt} · последний скан {get_last_scan_info()}"
-        + (f" · стр. {page + 1}/{pages}" if pages > 1 else ""),
+        f"Работают: {active_cnt} · последний скан {get_last_scan_info()}",
         "",
     ]
-    for i, s in enumerate(page_searches, first + 1):
+    for i, s in enumerate(searches, 1):
         dot = ui.e("on") if s.get("is_active") else ui.e("pause")
         stops_cnt = len(s["stop_words"])
         stops_str = f" · {ui.e('shield')} {stops_cnt}" if stops_cnt else ""
@@ -450,20 +427,15 @@ async def show_searches(event, state: Optional[FSMContext] = None, page: int = 0
     lines.append("<i>Нажмите на радар, чтобы настроить его.</i>")
 
     rows = []
-    for i, s in enumerate(page_searches, first + 1):
+    for i, s in enumerate(searches, 1):
         raw_title = s["title"].strip()
         short_title = (raw_title[:27] + "…") if len(raw_title) > 28 else raw_title
         rows.append([ui.btn(f"{i}. {short_title}", "on" if s.get("is_active") else "pause",
                             callback_data=f"open_search:{s['id']}")])
-    nav = _page_nav(page, pages, "list_searches")
-    if nav:
-        rows.append(nav)
-    add_row = [ui.btn("Обновить", "refresh", callback_data=f"list_searches:{page}")]
+    add_row = [ui.btn("Обновить", "refresh", callback_data="list_searches")]
     if len(searches) < max_radars:
         add_row.insert(0, ui.btn("Добавить", "add", callback_data="add_search_prompt"))
     rows.append(add_row)
-    if config.is_admin(user_id) and len(searches) > 1:
-        rows.append([ui.btn("Удалить несколько", "trash", callback_data="bulk_del:new")])
     rows.append([ui.home_btn()])
     await ui.show(event, "\n".join(lines), ui.kb(*rows))
 
@@ -658,95 +630,6 @@ async def process_custom_age_input(message: Message, state: FSMContext):
             return
 
     await show_searches(message, state)
-
-
-# ── Массовое удаление (только админы) ──────────────────────────────────
-
-async def _bulk_screen(call: CallbackQuery, state: FSMContext, page: int) -> None:
-    searches = await database.get_user_searches(call.from_user.id)
-    selected = set((await state.get_data()).get("bulk_sel") or [])
-    selected &= {s["id"] for s in searches}
-    await state.update_data(bulk_sel=sorted(selected))
-    pages = max(1, -(-len(searches) // RADARS_PAGE))
-    page = max(0, min(page, pages - 1))
-    first = page * RADARS_PAGE
-    page_ids = [s["id"] for s in searches[first:first + RADARS_PAGE]]
-    rows = []
-    for i, s in enumerate(searches[first:first + RADARS_PAGE], first + 1):
-        mark = "☑" if s["id"] in selected else "☐"
-        title = s["title"].strip()
-        short_title = (title[:27] + "…") if len(title) > 28 else title
-        rows.append([ui.btn(f"{mark} {i}. {short_title}", callback_data=f"bulk_tog:{s['id']}:{page}")])
-    nav = _page_nav(page, pages, "bulk_del")
-    if nav:
-        rows.append(nav)
-    page_all = bool(page_ids) and set(page_ids) <= selected
-    rows.append([
-        ui.btn("Снять на странице" if page_all else "Отметить страницу", callback_data=f"bulk_page:{page}"),
-        ui.btn("Снять все" if selected else "Выбрать все", callback_data=f"bulk_{'none' if selected else 'all'}:{page}"),
-    ])
-    if selected:
-        rows.append([ui.btn(f"Удалить выбранные ({len(selected)})", "trash", callback_data="bulk_go", style="danger")])
-    rows.append([ui.btn("« Мои радары", callback_data="list_searches")])
-    text = (
-        f"{ui.e('trash')} <b>Удалить несколько радаров</b>\n"
-        f"Выбрано: <b>{len(selected)}</b> из {len(searches)}" + (f" · стр. {page + 1}/{pages}" if pages > 1 else "")
-        + "\n\nНажимайте на радары, чтобы отметить их."
-    )
-    await ui.show(call, text, ui.kb(*rows))
-
-
-@router.callback_query(F.data.startswith(("bulk_del:", "bulk_tog:", "bulk_all:", "bulk_none:", "bulk_page:")))
-async def cb_bulk_select(call: CallbackQuery, state: FSMContext):
-    if not config.is_admin(call.from_user.id):
-        await call.answer("Доступно только администраторам", show_alert=True)
-        return
-    action, *args = call.data.split(":")
-    selected = set((await state.get_data()).get("bulk_sel") or [])
-    if action == "bulk_del" and args[0] == "new":
-        selected, args = set(), ["0"]
-    elif action == "bulk_tog":
-        selected ^= {int(args[0])}
-        args = args[1:]
-    elif action == "bulk_all":
-        selected = {s["id"] for s in await database.get_user_searches(call.from_user.id)}
-    elif action == "bulk_none":
-        selected = set()
-    elif action == "bulk_page" and args[0].isdigit():
-        first = int(args[0]) * RADARS_PAGE
-        page_ids = {s["id"] for s in (await database.get_user_searches(call.from_user.id))[first:first + RADARS_PAGE]}
-        selected = selected - page_ids if page_ids <= selected else selected | page_ids
-    await state.update_data(bulk_sel=sorted(selected))
-    await _bulk_screen(call, state, int(args[0]) if args and args[0].isdigit() else 0)
-
-
-@router.callback_query(F.data == "bulk_go")
-async def cb_bulk_confirm(call: CallbackQuery, state: FSMContext):
-    if not config.is_admin(call.from_user.id):
-        return
-    selected = (await state.get_data()).get("bulk_sel") or []
-    if not selected:
-        await call.answer("Ничего не выбрано", show_alert=True)
-        return
-    await ui.show(call, (
-        f"{ui.e('trash')} <b>Удалить {len(selected)} радаров?</b>\n\nИх стоп-слова тоже удалятся. Отменить это нельзя."
-    ), ui.kb([ui.btn("Да, удалить", "trash", callback_data="bulk_yes", style="danger"),
-              ui.btn("Отмена", callback_data="bulk_del:0")]))
-
-
-@router.callback_query(F.data == "bulk_yes")
-async def cb_bulk_delete(call: CallbackQuery, state: FSMContext):
-    if not config.is_admin(call.from_user.id):
-        return
-    selected = (await state.get_data()).get("bulk_sel") or []
-    await state.update_data(bulk_sel=[])
-    deleted = 0
-    for search_id in selected:
-        deleted += int(await database.delete_search(int(search_id), call.from_user.id))
-    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Массовое удаление радаров",
-                   f"Удалено {deleted} из {len(selected)}", status="OK")
-    await call.answer(f"Удалено радаров: {deleted}")
-    await show_searches(call)
 
 
 # ── Удаление поиска ────────────────────────────────────────────────────

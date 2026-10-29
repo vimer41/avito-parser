@@ -468,29 +468,6 @@ class RuntimeMetricsRegistry:
             "full_coverage_age_seconds": None,
             "capacity_mode": "normal",
         }
-        self._reset_daily()
-
-    # ── Daily totals for the morning admin report (the minute buckets keep only an hour) ──
-
-    def _reset_daily(self) -> None:
-        self._daily_started = self._wall_clock()
-        self._daily_scans_ok = 0
-        self._daily_scans_failed = 0
-        self._daily_sent = 0
-        self._daily_pub_to_sent = HistogramSlice(PUB_DELAY_BOUNDS)
-
-    def pop_daily_summary(self, reset: bool = True) -> dict[str, Any]:
-        """Totals since the previous reset (or start); the morning report resets them, a preview does not."""
-        summary = {
-            "hours": max(0.0, (self._wall_clock() - self._daily_started) / 3600.0),
-            "scans_ok": self._daily_scans_ok,
-            "scans_failed": self._daily_scans_failed,
-            "sent": self._daily_sent,
-            "pub_to_sent": summarize_histograms([self._daily_pub_to_sent], PUB_DELAY_BOUNDS),
-        }
-        if reset:
-            self._reset_daily()
-        return summary
 
     def _current_minute_id(self) -> int:
         return int(self._monotonic() // 60.0)
@@ -673,10 +650,6 @@ class RuntimeMetricsRegistry:
         q_sec = float(queued_to_sent_seconds or 0.0)
         d_sec = float(deliver_at_to_sent_seconds or 0.0)
 
-        self._daily_sent += 1
-        if t_sent is not None and t_pub is not None and t_pub_reliable and not is_catchup:
-            self._daily_pub_to_sent.observe(max(0.0, float(t_sent) - float(t_pub)))
-
         b = self._bucket()
         b.bot_api_sent_total += 1
         b.bot_api_service_time.observe(float(bot_api_service_seconds or 0.0))
@@ -727,10 +700,6 @@ class RuntimeMetricsRegistry:
     ) -> None:
         if revisit_seconds is not None and revisit_seconds > 0:
             self.record_source_interval(revisit_seconds)
-        if success:
-            self._daily_scans_ok += 1
-        else:
-            self._daily_scans_failed += 1
         self.record_collection(
             proxy_id,
             masked_url,

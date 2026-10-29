@@ -157,9 +157,6 @@ TELEGRAM_CHAT_INTERVAL = positive_float_setting("TELEGRAM_CHAT_INTERVAL", "1.0")
 # Telegram allows ~1 message/s per chat. When a chat has at least DIGEST_MIN ready notifications,
 # up to DIGEST_MAX of them go out as one list message instead of a minute-long queue.
 NOTIFICATION_DIGEST_MIN = positive_int_setting("NOTIFICATION_DIGEST_MIN", "4")
-# Daily admin report time (MSK) and renewal reminders.
-DAILY_REPORT_HOUR = 9
-REMINDER_CHECK_INTERVAL = 600
 NOTIFICATION_DIGEST_MAX = positive_int_setting("NOTIFICATION_DIGEST_MAX", "10")
 NOTIFICATION_MAX_AGE = positive_int_setting("NOTIFICATION_MAX_AGE", "1800")
 NOTIFICATION_LEASE_SECONDS = positive_int_setting("NOTIFICATION_LEASE_SECONDS", "60")

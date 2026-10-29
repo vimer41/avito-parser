@@ -1447,5 +1447,4 @@ def start_background_services(bot: Bot) -> List[asyncio.Task]:
         for i in range(num_notif_workers)
     ]
     monitor_task = asyncio.create_task(supervised_monitoring_worker(bot, None), name="monitoring-supervisor")
-    from reports import start_report_services
-    return [*notif_tasks, monitor_task, *start_report_services(bot)]
+    return [*notif_tasks, monitor_task]

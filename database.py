@@ -579,7 +579,6 @@ async def init_db():
             "tariff_plan": "TEXT DEFAULT 'standart'",
             "subscription_revision": "INTEGER NOT NULL DEFAULT 0",
             "extra_radars": "INTEGER NOT NULL DEFAULT 0",
-            "reminded_key": "TEXT NOT NULL DEFAULT ''",
         })
 
         await db.execute("""
@@ -1176,40 +1175,6 @@ async def update_search_title_scope(search_id: int, user_id: int, search_in_titl
         )
         await db.commit()
         return cursor.rowcount > 0
-
-
-async def get_users_with_subscription() -> List[Dict[str, Any]]:
-    """Users whose access ends at some point: candidates for renewal reminders."""
-    async with reader_connection() as db:
-        async with db.execute(
-            "SELECT * FROM users WHERE subscription_until IS NOT NULL AND subscription_until > datetime('now', '-1 day')"
-        ) as cursor:
-            return [dict(r) for r in await cursor.fetchall()]
-
-
-async def set_reminded_key(user_id: int, key: str) -> None:
-    async with writer_connection() as db:
-        await db.execute("UPDATE users SET reminded_key = ? WHERE user_id = ?", (key, user_id))
-        await db.commit()
-
-
-async def get_daily_report_stats(hours: int = 24) -> Dict[str, Any]:
-    since = f"-{int(hours)} hours"
-    async with reader_connection() as db:
-        async with db.execute("SELECT COUNT(*) FROM users WHERE created_at > datetime('now', ?)", (since,)) as cur:
-            new_users = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT tariff_plan, COUNT(*), COALESCE(SUM(total_amount), 0) FROM stars_orders "
-            "WHERE paid_at > datetime('now', ?) AND status IN ('paid', 'refunding') GROUP BY tariff_plan",
-            (since,),
-        ) as cur:
-            payments = [(r[0], int(r[1]), int(r[2])) for r in await cur.fetchall()]
-        async with db.execute(
-            "SELECT COUNT(*) FROM users WHERE subscription_until > datetime('now') "
-            "AND subscription_until < datetime('now', '+3 days') AND is_allowed = 1"
-        ) as cur:
-            expiring = (await cur.fetchone())[0]
-    return {"new_users": new_users, "payments": payments, "expiring_3d": expiring}
 
 
 async def get_search(search_id: int) -> Optional[Dict[str, Any]]:
