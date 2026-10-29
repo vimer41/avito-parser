@@ -160,6 +160,8 @@ async def main():
         await asyncio.gather(*background_tasks, return_exceptions=True)
         await close_image_session()
         await close_proxy_pool()
+        import pow_worker
+        pow_worker.shutdown()
         await database.close_db()
         if bot is not None:
             await bot.session.close()

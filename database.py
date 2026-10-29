@@ -579,6 +579,10 @@ async def init_db():
             "tariff_plan": "TEXT DEFAULT 'standart'",
             "subscription_revision": "INTEGER NOT NULL DEFAULT 0",
             "extra_radars": "INTEGER NOT NULL DEFAULT 0",
+            "night_mode": "INTEGER NOT NULL DEFAULT 0",
+            "night_from": "INTEGER NOT NULL DEFAULT 23",
+            "night_to": "INTEGER NOT NULL DEFAULT 8",
+            "reminded_key": "TEXT NOT NULL DEFAULT ''",
         })
 
         await db.execute("""
@@ -1175,6 +1179,113 @@ async def update_search_title_scope(search_id: int, user_id: int, search_in_titl
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def rename_search(search_id: int, user_id: int, title: str) -> bool:
+    async with writer_connection() as db:
+        cursor = await db.execute(
+            "UPDATE searches SET title = ? WHERE id = ? AND user_id = ?",
+            (title.strip()[:100], search_id, user_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def replace_search_url(search_id: int, user_id: int, url: str, search_in_title_only: int,
+                             *, title: Optional[str] = None, initial_items=None) -> bool:
+    """New search link for an existing radar: settings and stop words stay, the old baseline is dropped.
+    initial_items=None defers calibration to the first scan, like add_search."""
+    async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            "UPDATE searches SET url = ?, search_in_title_only = ?, title = COALESCE(?, title) WHERE id = ? AND user_id = ?",
+            (url, search_in_title_only, title, search_id, user_id),
+        )
+        if cursor.rowcount == 0:
+            await db.commit()
+            return False
+        await db.execute("DELETE FROM seen_items WHERE search_id = ?", (search_id,))
+        await db.execute("DELETE FROM notification_outbox WHERE search_id = ?", (search_id,))
+        if initial_items is not None:
+            await db.executemany(
+                "INSERT OR IGNORE INTO seen_items (search_id, item_id, last_price) VALUES (?, ?, ?)",
+                [(search_id, str(item_id), price) for item_id, price in initial_items],
+            )
+            await db.execute("UPDATE searches SET initialized_at = datetime('now') WHERE id = ?", (search_id,))
+        else:
+            await db.execute("UPDATE searches SET initialized_at = NULL WHERE id = ?", (search_id,))
+        await db.commit()
+        return True
+
+
+NIGHT_OFF, NIGHT_SILENT, NIGHT_HOLD = 0, 1, 2
+# user_id -> (mode, from_hour, to_hour), hours in MSK. Off by default; the user turns it on in the profile.
+_NIGHT_MODE_CACHE: dict[int, tuple[int, int, int]] = {}
+
+
+async def set_night_settings(user_id: int, *, mode: Optional[int] = None,
+                             from_hour: Optional[int] = None, to_hour: Optional[int] = None) -> tuple[int, int, int]:
+    current = await get_night_settings(user_id)
+    new = (
+        current[0] if mode is None else int(mode),
+        current[1] if from_hour is None else int(from_hour) % 24,
+        current[2] if to_hour is None else int(to_hour) % 24,
+    )
+    async with writer_connection() as db:
+        await db.execute(
+            "UPDATE users SET night_mode = ?, night_from = ?, night_to = ? WHERE user_id = ?", (*new, user_id),
+        )
+        await db.commit()
+    _NIGHT_MODE_CACHE[int(user_id)] = new
+    return new
+
+
+async def get_night_settings(user_id: int) -> tuple[int, int, int]:
+    """Cached per user: it is read for every delivered lot and changes only from the profile."""
+    uid = int(user_id)
+    if uid not in _NIGHT_MODE_CACHE:
+        async with reader_connection() as db:
+            async with db.execute("SELECT night_mode, night_from, night_to FROM users WHERE user_id = ?", (uid,)) as cursor:
+                row = await cursor.fetchone()
+        _NIGHT_MODE_CACHE[uid] = (
+            (int(row[0] or 0), int(row[1] if row[1] is not None else 23), int(row[2] if row[2] is not None else 8))
+            if row else (NIGHT_OFF, 23, 8)
+        )
+    return _NIGHT_MODE_CACHE[uid]
+
+
+async def get_users_with_subscription() -> List[Dict[str, Any]]:
+    """Users whose access ends at some point: candidates for renewal reminders."""
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT * FROM users WHERE subscription_until IS NOT NULL AND subscription_until > datetime('now', '-1 day')"
+        ) as cursor:
+            return [dict(r) for r in await cursor.fetchall()]
+
+
+async def set_reminded_key(user_id: int, key: str) -> None:
+    async with writer_connection() as db:
+        await db.execute("UPDATE users SET reminded_key = ? WHERE user_id = ?", (key, user_id))
+        await db.commit()
+
+
+async def get_daily_report_stats(hours: int = 24) -> Dict[str, Any]:
+    since = f"-{int(hours)} hours"
+    async with reader_connection() as db:
+        async with db.execute("SELECT COUNT(*) FROM users WHERE created_at > datetime('now', ?)", (since,)) as cur:
+            new_users = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT tariff_plan, COUNT(*), COALESCE(SUM(total_amount), 0) FROM stars_orders "
+            "WHERE paid_at > datetime('now', ?) AND status IN ('paid', 'refunding') GROUP BY tariff_plan",
+            (since,),
+        ) as cur:
+            payments = [(r[0], int(r[1]), int(r[2])) for r in await cur.fetchall()]
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE subscription_until > datetime('now') "
+            "AND subscription_until < datetime('now', '+3 days') AND is_allowed = 1"
+        ) as cur:
+            expiring = (await cur.fetchone())[0]
+    return {"new_users": new_users, "payments": payments, "expiring_3d": expiring}
 
 
 async def get_search(search_id: int) -> Optional[Dict[str, Any]]:
