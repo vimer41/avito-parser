@@ -15,17 +15,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import logging
-import os
 from dataclasses import dataclass
 from threading import Event
 from typing import Any
 
-from anti_bot.pow_budget import (
-    DEFAULT_POW_MAX_ITERATIONS, DEFAULT_POW_TIMEOUT, PowSearchCancelled, PowSearchTimeout, SearchBudget,
-)
-
-logger = logging.getLogger(__name__)
+from anti_bot.pow_budget import DEFAULT_POW_MAX_ITERATIONS, DEFAULT_POW_TIMEOUT, SearchBudget
 
 
 @dataclass(frozen=True)
@@ -142,36 +136,8 @@ def build_verify_payload(
     derived locally from its decoded ``id`` and ``compl`` fields.
     """
     parameters = decode_challenge_jwt(challenge_jwt)
-    nonce = None
-    if POW_IN_PROCESS:
-        nonce = _find_nonce_in_process(parameters, timeout, max_iterations, cancel_event)
-    if nonce is None:
-        nonce = find_nonce(parameters, timeout=timeout, max_iterations=max_iterations, cancel_event=cancel_event)
+    nonce = find_nonce(parameters, timeout=timeout, max_iterations=max_iterations, cancel_event=cancel_event)
     return {"challenge": challenge_jwt, "nonce": nonce}
-
-
-# The search runs in a separate process (pow_worker) so it never competes with the bot's event loop
-# for the GIL; tests and the fallback use the in-thread find_nonce.
-POW_IN_PROCESS = os.getenv("POW_IN_PROCESS", "0" if os.getenv("AVITO_RADAR_TESTING") == "1" else "1").strip() == "1"
-
-
-def _find_nonce_in_process(parameters: PowParameters, timeout: float, max_iterations: int,
-                           cancel_event: Event | None) -> int | None:
-    """Nonce from the worker process; None means "search in this thread instead"."""
-    import pow_worker
-    try:
-        nonce = pow_worker.run_search(
-            parameters.challenge_id, parameters.complexity,
-            start=0, timeout=timeout, max_iterations=max_iterations, cancel_event=cancel_event,
-        )
-    except InterruptedError as exc:
-        raise PowSearchCancelled("operation cancelled") from exc
-    except pow_worker.PowProcessUnavailable as exc:
-        logger.warning("PoW-процесс недоступен (%s), считаю в потоке", exc)
-        return None
-    if nonce is None:
-        raise PowSearchTimeout("PoW deadline exceeded")
-    return nonce
 
 
 if __name__ == "__main__":

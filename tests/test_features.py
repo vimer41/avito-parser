@@ -1,4 +1,3 @@
-import hashlib
 import tempfile
 import time
 import unittest
@@ -11,7 +10,6 @@ from tests._dispatcher import DispatcherFixture
 
 import config
 import database
-import pow_worker
 import reports
 from runtime_metrics import RuntimeMetricsRegistry as RuntimeMetrics
 
@@ -75,20 +73,6 @@ class TestNightAndDaily(unittest.TestCase):
         self.assertEqual(peek["pub_to_sent"]["p50"], 45.0)
         metrics.pop_daily_summary()
         self.assertEqual(metrics.pop_daily_summary()["sent"], 0)
-
-
-class TestPowWorker(unittest.TestCase):
-    def test_search_function_matches_javascript_rule(self):
-        nonce = pow_worker.search_nonce("abc", 2, 0, 5.0, 100_000)
-        self.assertTrue(hashlib.sha256(f"abc:{nonce}".encode()).hexdigest().startswith("00"))
-        self.assertIsNone(pow_worker.search_nonce("abc", 12, 0, 5.0, 1000))
-
-    def test_search_runs_in_a_separate_process(self):
-        try:
-            nonce = pow_worker.run_search("abc", 2, start=0, timeout=5, max_iterations=100_000)
-        finally:
-            pow_worker.shutdown()
-        self.assertTrue(hashlib.sha256(f"abc:{nonce}".encode()).hexdigest().startswith("00"))
 
 
 class TestRadarEditing(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
