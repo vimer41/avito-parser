@@ -182,6 +182,8 @@ class ProxyClient:
         # Pacing & concurrency state (protected by threading.Lock so both event loop and challenge thread are safe)
         self._pacing_lock = threading.Lock()
         self._next_request_at: float = 0.0
+        self._tokens: float = max(1.0, float(config.PROXY_RATE_BURST))
+        self._tokens_at: float = self._monotonic()
         self.in_flight: int = 0
 
         # Sliding 10m window of (monotonic_ts, status_code, is_transport_error)
@@ -301,7 +303,18 @@ class ProxyClient:
         await self.reset_async_session()
 
     def _reserve_pacing_delay(self) -> float:
-        return 0.0
+        """
+        Token bucket: idle clients answer a burst of PROXY_RATE_BURST requests instantly,
+        the sustained rate never exceeds effective_rate. Returns how long this request must wait.
+        """
+        now = self._monotonic()
+        rate = max(config.PROXY_MIN_RATE, self.effective_rate)
+        burst = max(1.0, float(config.PROXY_RATE_BURST))
+        with self._pacing_lock:
+            tokens = min(burst, self._tokens + max(0.0, now - self._tokens_at) * rate) - 1.0
+            self._tokens, self._tokens_at = tokens, now
+            self._next_request_at = now + max(0.0, (1.0 - tokens) / rate) if tokens < 1.0 else now
+            return max(0.0, -tokens / rate)
 
     async def wait_for_rate_slot_async(self, deadline: float | None = None) -> None:
         delay = self._reserve_pacing_delay()

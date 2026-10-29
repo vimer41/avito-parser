@@ -779,11 +779,11 @@ async def process_collected_group_fanout(
 
     sorted_radars = sorted(radars_for_url, key=get_radar_priority)
     calibrated_radars: List[dict] = []
+    deliverable_radar_ids = await database.get_deliverable_search_ids([int(r["id"]) for r in sorted_radars])
 
     for radar in sorted_radars:
         radar_id = int(radar["id"])
-        user_id = int(radar["user_id"])
-        if not await database.is_search_active(radar_id) or not await database.is_user_allowed(user_id):
+        if radar_id not in deliverable_radar_ids:
             continue
         if radar.get("initialized_at") is None:
             if await database.initialize_search_snapshot(

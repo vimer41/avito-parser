@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from collections import defaultdict
@@ -10,12 +11,13 @@ from typing import Optional
 
 import config
 import database
-from collector import collect_source
+from collector import collect_source, settled_item_ids
 from parser import AvitoParser
 from proxy_pool import get_proxy_pool
 from request_budget import get_network_block_state
 from runtime_metrics import METRICS
 from scan_planner import DeadlineScheduler, calculate_interval_plan
+from seen_cache import InMemorySeenStore
 
 logger = logging.getLogger(__name__)
 MONITORING_STATS: dict = {}
@@ -31,6 +33,17 @@ def group_sources(searches: list[dict]) -> dict[str, list[dict]]:
             continue
         groups[key].append(radar)
     return dict(groups)
+
+
+async def nothing_new_for_fanout(seen_store, task, collection, has_pro_catchup: bool) -> bool:
+    """
+    Top-3 may reshuffle (promoted lots rotate) while the page brings nothing new. When every ID
+    already went through fanout for the same radar group, the DB fanout is a guaranteed no-op.
+    The planner's own fast-skip guards still apply: periodic full scans, resume, calibration.
+    """
+    if collection.fast_skipped or not task.can_fast_skip or has_pro_catchup:
+        return False
+    return await seen_store.all_known(task.key, task.group_revision, (it.item_id for it in collection.items))
 
 
 def source_interval(radars: list[dict]) -> float:
@@ -66,6 +79,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
     owned_parsers = [entry for entry in parsers if entry is not parser]
 
     changed = asyncio.Event()
+    seen_store = InMemorySeenStore()
     fanout_queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, int(config.FANOUT_QUEUE_SIZE)))
     state_updates_lock = asyncio.Lock()
     pending_state_updates: dict[str, tuple[str, float, list[str], int]] = {}
@@ -133,6 +147,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     worker_id=worker_id,
                     previous_processed_at=task.previous_processed_at,
                 )
+                await seen_store.remember(task.key, task.group_revision, settled_item_ids(collection))
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -297,6 +312,8 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
 
             elapsed_ms = (time.monotonic() - scan_t0) * 1000.0
             ok = collection is not None
+            if ok and await nothing_new_for_fanout(seen_store, task, collection, has_pro_catchup):
+                collection = dataclasses.replace(collection, fast_skipped=True)
             gap = bool(collection.coverage_gap) if collection is not None else False
             fast_skipped = bool(collection.fast_skipped) if collection is not None else False
             pages_fetched = collection.pages if collection is not None else 0
@@ -413,6 +430,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         while True:
             searches = await database.get_all_active_searches()
             groups = group_sources(searches)
+            seen_store.prune(groups)
             network = budget.snapshot()
             proxy_snaps = pool.snapshots()
             if proxy_snaps:

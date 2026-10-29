@@ -1,6 +1,6 @@
 aiogram==3.31.0
 curl_cffi==0.16.3
-beautifulsoup4==4.15.0
+orjson==3.10.15
 python-dotenv==1.2.4
 aiosqlite==0.22.1
 pydantic==2.13.5

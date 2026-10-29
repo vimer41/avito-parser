@@ -271,24 +271,21 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         norm2 = AvitoParser.normalize_url(url2)
         self.assertTrue(norm2.startswith("https://www.avito.ru/all/telefony/apple/iphone"))
 
-    def test_html_parser_extracts_raw_price(self):
-        """Проверка, что HTML фолбэк парсит числовое значение raw_price."""
+    def test_ssr_parser_extracts_raw_price(self):
+        """Проверка, что SSR JSON парсер отдаёт числовое значение raw_price."""
+        import json
         from parser import AvitoParser
-        sample_html = """
-        <div data-marker="catalog-serp">
-            <div data-marker="item" data-item-id="12345">
-                <a data-marker="item-title" href="/item/12345">Тестовый товар</a>
-                <span data-marker="item-price">15 500  ₽</span>
-            </div>
-            <div data-marker="item" data-item-id="67890">
-                <a data-marker="item-title" href="/item/67890">Бесплатный товар</a>
-                <span data-marker="item-price">Бесплатно</span>
-            </div>
-        </div>
-        """
+        catalog = {"loaderData": {"data": {"catalog": {"items": [
+            {"id": 12345, "title": "Тестовый товар", "urlPath": "/item/12345",
+             "priceDetailed": {"value": 15500, "fullString": "15 500 ₽"}},
+            {"id": 67890, "title": "Бесплатный товар", "urlPath": "/item/67890",
+             "priceDetailed": {"value": 0, "fullString": "Бесплатно"}},
+        ]}}}}
+        sample_html = '<html><script>' + json.dumps(catalog, ensure_ascii=False) + '</script></html>'
         items = AvitoParser.parse_items(sample_html)
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0].raw_price, 15500)
+        self.assertEqual(items[0].price, "15 500 ₽")
         self.assertEqual(items[1].raw_price, 0)
 
     async def test_batch_seen_items_query(self):

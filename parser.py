@@ -15,10 +15,9 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from http.cookiejar import Cookie
 from threading import Event, Lock, RLock
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
-from bs4 import BeautifulSoup
 from curl_cffi import requests
 import config
 from config import DATA_DIR
@@ -55,8 +54,18 @@ COOKIE_FILE = DATA_DIR / "avito_cookies.json"
 COOKIE_IO_LOCK = Lock()
 
 _CHALLENGE_EXECUTOR: Optional[ThreadPoolExecutor] = None
-_PARSE_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _EXECUTOR_LOCK = Lock()
+
+# Cheap regex scans replace a full DOM parse for the few HTML facts we still need.
+_ANCHOR_RE = re.compile(r"<a\b[^>]*>", re.I)
+_HREF_RE = re.compile(r"""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+_NEXT_MARKER_RE = re.compile(
+    r"""\bdata-marker\s*=\s*["']pagination-button/nextPage["']|\brel\s*=\s*["'][^"']*\bnext\b""", re.I
+)
+_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.I | re.S)
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_RE = re.compile(r"<script[^>]*>([\s\S]*?)</script>")
 
 
 def _get_challenge_executor() -> ThreadPoolExecutor:
@@ -69,18 +78,6 @@ def _get_challenge_executor() -> ThreadPoolExecutor:
                     thread_name_prefix="avito-challenge",
                 )
     return _CHALLENGE_EXECUTOR
-
-
-def _get_parse_executor() -> ThreadPoolExecutor:
-    global _PARSE_EXECUTOR
-    if _PARSE_EXECUTOR is None:
-        with _EXECUTOR_LOCK:
-            if _PARSE_EXECUTOR is None:
-                _PARSE_EXECUTOR = ThreadPoolExecutor(
-                    max_workers=max(1, int(config.PARSE_WORKERS)),
-                    thread_name_prefix="avito-bs4",
-                )
-    return _PARSE_EXECUTOR
 
 
 @dataclass
@@ -215,6 +212,7 @@ class AvitoParser:
         self.session = self._create_session()
         self._install_request_budget()
         self._last_saved_cookies: list = []
+        self._cookies_saved_at = 0.0
         self._load_cookies()
 
         # Кэш SSR-редиректов Авито: исходный URL -> канонический URL (экономит 1 запрос на радар)
@@ -386,6 +384,14 @@ class AvitoParser:
 
     def _save_cookies(self):
         self._save_cookies_from_jar(self.session.cookies.jar)
+
+    def _maybe_save_cookies_from_jar(self, cookie_jar):
+        """Hot-path save: an fsync per scan would stall the event loop, so persist at most once per interval."""
+        now = time.monotonic()
+        if now - self._cookies_saved_at < float(config.COOKIE_SAVE_INTERVAL):
+            return
+        self._cookies_saved_at = now
+        self._save_cookies_from_jar(cookie_jar)
 
     def _load_cookies_into_jar(self, cookies_obj):
         if not self.cookie_file.exists():
@@ -758,7 +764,12 @@ class AvitoParser:
                         if len(self._canonical_cache) >= 1000:
                             self._canonical_cache.pop(next(iter(self._canonical_cache)))
                         self._canonical_cache[url] = target
-                    self._save_cookies_from_jar(async_session.cookies.jar)
+                    if challenge_attempts:
+                        # Fresh clearance cookies are worth persisting immediately.
+                        self._cookies_saved_at = time.monotonic()
+                        self._save_cookies_from_jar(async_session.cookies.jar)
+                    else:
+                        self._maybe_save_cookies_from_jar(async_session.cookies.jar)
                     return page_html
                 except PowSearchCancelled:
                     raise
@@ -987,20 +998,14 @@ class AvitoParser:
     def extract_search_title(html: str, fallback_url: str) -> str:
         """Извлекает читаемое название поиска из HTML (например 'iPhone 15')."""
         try:
-            m_h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.I | re.S)
+            m_h1 = _H1_RE.search(html)
             if m_h1:
-                text = re.sub(r"<[^>]+>", "", m_h1.group(1)).replace("\xa0", " ").strip()
+                text = _TAG_RE.sub("", m_h1.group(1)).replace("\xa0", " ").replace("&nbsp;", " ").strip()
                 if text:
                     return text
-            soup = BeautifulSoup(html, "html.parser")
-            h1 = soup.find("h1")
-            if h1 and h1.text.strip():
-                title = h1.text.replace("\xa0", " ").strip()
-                return title
-
-            title_tag = soup.find("title")
-            if title_tag and title_tag.text.strip():
-                t = title_tag.text.replace("\xa0", " ").strip()
+            m_title = _TITLE_RE.search(html)
+            if m_title:
+                t = _TAG_RE.sub("", m_title.group(1)).replace("\xa0", " ").replace("&nbsp;", " ").strip()
                 t = t.split("—")[0].split("|")[0].split("купить")[-1].strip()
                 if t:
                     return t
@@ -1011,145 +1016,11 @@ class AvitoParser:
         parts = [p for p in parsed.path.split("/") if p and p != "all"]
         return parts[-1] if parts else "Поиск Авито"
 
-    @staticmethod
-    def _clean_seller_info(seller_elem) -> Tuple[Optional[str], Optional[str]]:
-        if not seller_elem:
-            return None, None
-        full_text = seller_elem.get_text(separator=" ", strip=True)
-
-        name = None
-        a_tag = seller_elem.find("a")
-        if a_tag and a_tag.text.strip():
-            name = a_tag.text.strip()
-        else:
-            p_tag = seller_elem.find("p")
-            if p_tag and p_tag.text.strip():
-                name = p_tag.text.strip()
-
-        if not name:
-            m = re.search(r"^[^\d]+", full_text)
-            name = m.group(0).strip() if m else "Продавец"
-
-        for bad in ["Самозанятый", "Компания", "Частное лицо", "Реквизиты проверены"]:
-            name = name.replace(bad, "").strip()
-
-        name = re.sub(r"\s+", " ", name).strip()
-        if not name or len(name) < 2:
-            name = "Продавец"
-
-        pure_name = name if name != "Продавец" else None
-
-        rating_match = re.search(r"([1-5][,\.]\d)", full_text)
-        rating = rating_match.group(1).replace(".", ",") if rating_match else None
-
-        reviews_match = re.search(r"(\d+[\s\d]*\s*отзыв(?:а|ов)?)", full_text)
-        reviews = reviews_match.group(1).strip() if reviews_match else None
-
-        full_str = name
-        if rating and reviews:
-            full_str = f"{name} · ⭐ {rating} ({reviews})"
-        elif rating:
-            full_str = f"{name} · ⭐ {rating}"
-
-        return full_str, pure_name
-
-    @staticmethod
-    def _clean_description(desc_elem, date_str: Optional[str] = None) -> Optional[str]:
-        if not desc_elem:
-            return None
-
-        # Удаляем вложенные теги даты
-        for d in desc_elem.find_all(attrs={"data-marker": lambda m: m and "date" in m}):
-            d.decompose()
-        for d in desc_elem.find_all(class_=lambda c: c and "date" in c):
-            d.decompose()
-
-        txt = desc_elem.get_text(separator=" ", strip=True)
-        if date_str and date_str in txt:
-            txt = txt.replace(date_str, "").strip()
-
-        # Отрезаем прилипшую дату с конца
-        txt = re.sub(r"[\.\,\s]*(\d+\s+(?:секунд|минут|час|дня|дней|недел|месяц)\w*\s+назад|только\s+что)[\.\s]*$", "", txt, flags=re.I).strip()
-        return txt if txt else None
-
-    @staticmethod
-    def _extract_delivery_and_condition(it) -> Tuple[Optional[str], Optional[str]]:
-        full_text = it.text
-
-        condition = None
-        for c in ["Новое", "Идеальное", "Отличное", "Хорошее", "Удовлетворительное"]:
-            if c.lower() in full_text.lower():
-                condition = c
-                break
-
-        delivery = None
-        m = re.search(r"(?:Авито\s+)?Доставка(?:\s+от\s+\d+\s+дн[яей]+)?", full_text, re.I)
-        if m:
-            deliv = m.group(0).strip()
-            if not deliv.lower().startswith("авито"):
-                deliv = f"Авито {deliv}"
-            delivery = deliv
-        elif "доставка" in full_text.lower():
-            delivery = "Авито Доставка"
-
-        return delivery, condition
-
-    @staticmethod
-    def _extract_image(it) -> Optional[str]:
-        """
-        Извлекает фото товара:
-        1. Из data-marker="slider-image/image-..." (Avito lazy load)
-        2. Из тегов <img> (src, data-src, srcset)
-        3. Из блока item-photo с ссылками на img.avito.st
-        """
-        raw_url = None
-        # 1. Слайдер изображений Авито
-        li_img = it.find(attrs={"data-marker": lambda m: m and "slider-image/image-" in m})
-        if li_img:
-            marker = li_img.get("data-marker", "")
-            url = marker.split("slider-image/image-")[-1].strip()
-            if url.startswith("http"):
-                raw_url = url
-
-        # 2. Обычные теги img и srcset
-        if not raw_url:
-            for img in it.find_all("img"):
-                src = img.get("src") or img.get("data-src")
-                if src and src.startswith("http"):
-                    raw_url = src
-                    break
-                srcset = img.get("srcset")
-                if srcset:
-                    parts = srcset.split(",")
-                    if parts:
-                        first = parts[0].strip().split(" ")[0]
-                        if first.startswith("http"):
-                            raw_url = first
-                            break
-
-        # 3. Блок item-photo
-        if not raw_url:
-            photo_div = it.find(attrs={"data-marker": "item-photo"})
-            if photo_div:
-                for tag in photo_div.find_all(True):
-                    for attr_name, attr_val in tag.attrs.items():
-                        if isinstance(attr_val, str) and "img.avito.st" in attr_val:
-                            m = re.search(r"(https?://[^\s\"\']+\.img\.avito\.st/[^\s\"\']+)", attr_val)
-                            if m:
-                                raw_url = m.group(1)
-                                break
-                    if raw_url:
-                        break
-
-        if raw_url:
-            return re.sub(r"https?://[^.]+\.img\.avito\.st/", "https://c80.img.avito.st/", raw_url)
-        return None
-
     @classmethod
     def _parse_items_from_ssr_json(cls, html: str) -> Optional[List[AvitoItem]]:
         """
         Извлекает структурированный каталог объявлений из встроенного в страницу SSR JSON (loaderData -> catalog -> items).
-        Работает в 100 раз быстрее BeautifulSoup и отдает точный timestamp публикации в миллисекундах.
+        Отдает точный timestamp публикации в миллисекундах.
         """
         try:
             catalog_items = None
@@ -1165,7 +1036,7 @@ class AvitoParser:
             # Запасной путь: перебор всех script-тегов
             if not candidates:
                 candidates = [
-                    s for s in re.findall(r'<script[^>]*>([\s\S]*?)</script>', html)
+                    s for s in _SCRIPT_RE.findall(html)
                     if '"catalog"' in s and '"items"' in s
                 ]
 
@@ -1407,21 +1278,40 @@ class AvitoParser:
             return None
 
     @classmethod
+    def parse_catalog(cls, html: str) -> Optional[List[AvitoItem]]:
+        """
+        Единственный источник истины по выдаче — встроенный SSR JSON каталога.
+        None — каталога на странице нет (логин, заглушка, смена вёрстки); [] — валидная пустая выдача.
+        """
+        return cls._parse_items_from_ssr_json(html)
+
+    @classmethod
     def has_catalog(cls, html: str) -> bool:
         """A login/error HTML page is not a successful empty search."""
-        if cls._parse_items_from_ssr_json(html) is not None:
-            return True
-        return bool(re.search(r'data-marker=["\'](?:item|catalog-serp|search-results|search-results/empty)["\']', html))
+        return cls.parse_catalog(html) is not None
+
+    @classmethod
+    def parse_items(cls, html: str) -> List[AvitoItem]:
+        """Органические объявления страницы выдачи (пустой список, если каталога нет)."""
+        return cls.parse_catalog(html) or []
+
+    @classmethod
+    async def parse_items_async(cls, html: str) -> List[AvitoItem]:
+        """orjson-разбор SSR JSON занимает единицы миллисекунд, поэтому выполняется прямо в event loop."""
+        return cls.parse_items(html)
 
     @classmethod
     def next_page_url(cls, html: str, current_url: str) -> Optional[str]:
         """Follow only an explicit next-page link for the exact same search."""
-        soup = BeautifulSoup(html, "html.parser")
-        for anchor in soup.find_all("a", href=True):
-            marker = anchor.get("data-marker", "")
-            if marker != "pagination-button/nextPage" and "next" not in anchor.get("rel", []):
+        for tag in _ANCHOR_RE.finditer(html):
+            anchor = tag.group(0)
+            if not _NEXT_MARKER_RE.search(anchor):
                 continue
-            candidate = urljoin(current_url, anchor["href"])
+            href_match = _HREF_RE.search(anchor)
+            if not href_match:
+                continue
+            href = (href_match.group(1) if href_match.group(1) is not None else href_match.group(2)).replace("&amp;", "&")
+            candidate = urljoin(current_url, href)
             try:
                 parsed = cls._validate_avito_url(candidate)
                 params = parse_qs(parsed.query)
@@ -1436,159 +1326,3 @@ class AvitoParser:
             params["p"] = [str(new_page)]
             return urlunparse(canonical._replace(query=urlencode(sorted(params.items()), doseq=True)))
         return None
-
-    @classmethod
-    def _parse_items_from_html_soup(cls, html: str) -> List[AvitoItem]:
-        soup = BeautifulSoup(html, "html.parser")
-
-        # 1. Ищем ТОЛЬКО контейнер органической поисковой выдачи
-        main_catalog = soup.find("div", {"data-marker": "catalog-serp"})
-
-        if not main_catalog:
-            # Фолбэк, если Авито отдало нестандартную разметку
-            items_raw = soup.find_all(attrs={"data-marker": "item"})
-        else:
-            # 2. Удаляем из каталога карусели VIP/рекламы и врезки других регионов
-            for junk in main_catalog.find_all(attrs={"data-marker": ["witcher/block", "items-vip"]}):
-                junk.decompose()
-            for junk in main_catalog.find_all(class_=lambda c: c and any(x in c for x in ["items-vip", "witcher"])):
-                junk.decompose()
-
-            # 3. Все карточки из очищенного контейнера, без скрытого лимита 25.
-            items_raw = main_catalog.find_all(attrs={"data-marker": "item"})
-
-        results: List[AvitoItem] = []
-
-        for it in items_raw:
-            try:
-                # 1. ID объявления
-                item_id = it.get("data-item-id") or it.get("id")
-                if not item_id:
-                    continue
-                item_id = str(item_id)
-
-                # 2. Название и ссылка
-                title_elem = it.find(attrs={"data-marker": "item-title"})
-                if not title_elem:
-                    continue
-                title = title_elem.text.replace("\xa0", " ").strip()
-                href = title_elem.get("href", "")
-                full_url = f"https://www.avito.ru{href}" if href.startswith("/") else href
-
-                # 3. Цена
-                price = "Цена не указана"
-                raw_price = None
-                price_meta = it.find(attrs={"itemprop": "price"})
-                if price_meta and price_meta.get("content"):
-                    price_val = price_meta.get("content")
-                    try:
-                        raw_price = int(price_val)
-                        price = f"{raw_price:,} ₽".replace(",", " ")
-                    except Exception:
-                        price = f"{price_val} ₽"
-                else:
-                    price_elem = it.find(attrs={"data-marker": "item-price"})
-                    if price_elem:
-                        price = price_elem.text.replace("\xa0", " ").strip()
-                        digits = re.sub(r"\D", "", price)
-                        if digits:
-                            try:
-                                raw_price = int(digits)
-                            except Exception:
-                                pass
-                        elif "бесплатно" in price.lower() or "даром" in price.lower():
-                            raw_price = 0
-
-                # 4. Фотография (100% извлечение через слайдер и lazy-load)
-                image_url = cls._extract_image(it)
-
-                # 5. Адрес / Город / Метро
-                address = None
-                geo_elem = it.find(attrs={"data-marker": "item-location"}) or it.find(attrs={"data-marker": "item-address"})
-                if not geo_elem:
-                    geo_elem = it.find(class_=lambda x: x and ("geo-root" in x or "item-location" in x or "geo-geo" in x))
-                if geo_elem:
-                    address = geo_elem.get_text(separator=" ", strip=True).replace("\xa0", " ")
-                    address = re.sub(r"\s+", " ", address)
-
-                # 6. Дата публикации
-                date = None
-                date_elem = it.find(attrs={"data-marker": "item-date"})
-                if not date_elem:
-                    date_elem = it.find(class_=lambda x: x and "date-root" in x)
-                if date_elem:
-                    date = date_elem.text.replace("\xa0", " ").strip()
-
-                # 7. Описание (аккуратно очищенное от даты)
-                desc_elem = (
-                    it.find(attrs={"data-marker": "item-description"}) or
-                    it.find(class_=lambda x: x and ("bottomBlock-" in x or "iva-item-description" in x))
-                )
-                description = cls._clean_description(desc_elem, date)
-
-                # 8. Продавец и рейтинг
-                seller_elem = (
-                    it.find(class_=lambda x: x and ("sellerInfo-" in x or "iva-item-sellerInfo" in x or "userInfoStep-" in x)) or
-                    it.find(attrs={"data-marker": "item-line/company"})
-                )
-                seller, seller_name = cls._clean_seller_info(seller_elem)
-
-                # 9. Доставка и состояние
-                delivery, condition = cls._extract_delivery_and_condition(it)
-
-                is_reserved = False
-                if it.find(string=re.compile(r"забронирован|в резерве", re.I)):
-                    is_reserved = True
-
-                is_promotion = False
-                if it.find(class_=lambda c: c and any(x in c for x in ["items-vip", "witcher", "vas", "promotion", "highlight"])):
-                    is_promotion = True
-
-                results.append(AvitoItem(
-                    item_id=item_id,
-                    title=title,
-                    price=price,
-                    url=full_url,
-                    image_url=image_url,
-                    address=address,
-                    date=date,
-                    description=description,
-                    seller=seller,
-                    seller_name=seller_name,
-                    delivery=delivery,
-                    condition=condition,
-                    is_reserved=is_reserved,
-                    is_promotion=is_promotion,
-                    raw_price=raw_price,
-                    t_pub_reliable=False,
-                ))
-
-            except Exception as e:
-                logger.debug(f"Ошибка при обработке элемента: {e}")
-                continue
-
-        return results
-
-    @classmethod
-    def parse_items(cls, html: str) -> List[AvitoItem]:
-        """
-        Парсит органические объявления на странице выдачи:
-        1. Сначала пробует мгновенный парсинг через встроенный SSR JSON (с точными timestamp).
-        2. При отсутствии JSON в разметке использует надежный BeautifulSoup-парсер (фолбэк).
-        """
-        # ⚡️ 1. Мгновенное извлечение через чистый встроенный SSR JSON
-        json_items = cls._parse_items_from_ssr_json(html)
-        if json_items is not None:
-            return json_items
-
-        # 2. Фолбэк на HTML-разметку (BeautifulSoup)
-        return cls._parse_items_from_html_soup(html)
-
-    @classmethod
-    async def parse_items_async(cls, html: str) -> List[AvitoItem]:
-        """Fast in-loop SSR JSON parse; bounded thread-pool fallback for BeautifulSoup."""
-        json_items = cls._parse_items_from_ssr_json(html)
-        if json_items is not None:
-            return json_items
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_get_parse_executor(), cls._parse_items_from_html_soup, html)

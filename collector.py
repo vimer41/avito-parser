@@ -37,6 +37,19 @@ def reached_old_boundary(items, max_age_minutes):
     )
 
 
+def settled_item_ids(collection: "SourceCollection") -> list[str]:
+    """
+    IDs whose fanout outcome is final. Items without a reliable publication age are
+    deliberately left out: fanout keeps re-evaluating them, so they must keep reaching it.
+    """
+    settled = []
+    for item in collection.items:
+        seen_at = collection.discovery_times.get(item.item_id, collection.captured_at)
+        if publication_age_seconds(item.date, item.timestamp, now=seen_at) is not None:
+            settled.append(item.item_id)
+    return settled
+
+
 def extract_top_ids(page_items: list[AvitoItem]) -> tuple[str, ...]:
     organic = [item.item_id for item in page_items if not getattr(item, "is_promotion", False)]
     if organic:
@@ -77,10 +90,16 @@ async def collect_source(
             gap = True
             break
         if is_real_parser:
-            page_items = await parser.parse_items_async(html)
+            # One orjson pass over the SSR catalog; None means the page carries no catalog at all.
+            catalog = parser.parse_catalog(html)
+            catalog_missing = catalog is None
+            page_items = catalog or []
         else:
             page_items = await asyncio.to_thread(parser.parse_items, html)
-        if not page_items and not await asyncio.to_thread(parser.has_catalog, html):
+            catalog_missing = not page_items and not await asyncio.to_thread(parser.has_catalog, html)
+        if catalog_missing:
+            if is_real_parser:
+                logger.warning("SSR-каталог не найден на странице %s (логин, заглушка или смена вёрстки)", page_url[:80])
             parser.last_failure = FetchFailure("catalog_missing")
             if pages == 0:
                 return None
@@ -88,7 +107,10 @@ async def collect_source(
             break
         pages += 1
         if not title:
-            extracted_title = await asyncio.to_thread(parser.extract_search_title, html, url)
+            if is_real_parser:
+                extracted_title = parser.extract_search_title(html, url)
+            else:
+                extracted_title = await asyncio.to_thread(parser.extract_search_title, html, url)
             title = extracted_title if isinstance(extracted_title, str) else "Поиск Авито"
         for item in page_items:
             discovery_times.setdefault(item.item_id, captured_at)
@@ -101,12 +123,15 @@ async def collect_source(
                 gap = False
                 break
 
-        next_url = await asyncio.to_thread(parser.next_page_url, html, page_url)
-        if next_url is not None and not isinstance(next_url, str):
-            next_url = None  # Non-network test doubles must not invent pagination.
         if reached_old_boundary(page_items, max_age_minutes):
             gap = False
             break
+        if is_real_parser:
+            next_url = parser.next_page_url(html, page_url)
+        else:
+            next_url = await asyncio.to_thread(parser.next_page_url, html, page_url)
+        if next_url is not None and not isinstance(next_url, str):
+            next_url = None  # Non-network test doubles must not invent pagination.
         if next_url in visited:
             gap = True
             break

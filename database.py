@@ -1192,6 +1192,24 @@ async def can_deliver_to_search(search_id: int, user_id: int) -> bool:
             return await cursor.fetchone() is not None
 
 
+async def get_deliverable_search_ids(search_ids: list[int]) -> set[int]:
+    """Batch form of can_deliver_to_search: active radars whose owner is allowed, in one query."""
+    ids = sorted({int(sid) for sid in search_ids})
+    if not ids:
+        return set()
+    id_marks = ",".join("?" for _ in ids)
+    admin_marks = ",".join("?" for _ in ADMIN_IDS) or "NULL"
+    async with reader_connection() as db:
+        async with db.execute(f"""
+            SELECT s.id FROM searches s LEFT JOIN users u ON u.user_id = s.user_id
+            WHERE s.id IN ({id_marks}) AND s.is_active = 1
+              AND (s.user_id IN ({admin_marks})
+                   OR (u.is_allowed = 1 AND u.subscription_until IS NULL)
+                   OR u.subscription_until > datetime('now'))
+        """, (*ids, *ADMIN_IDS)) as cursor:
+            return {int(row[0]) for row in await cursor.fetchall()}
+
+
 async def delete_search(search_id: int, user_id: int) -> bool:
     """
     Удаляет радар пользователя и связанные просмотренные лоты и записи дедупликации.

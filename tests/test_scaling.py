@@ -220,12 +220,15 @@ class TestSharedRequestBudget(unittest.IsolatedAsyncioTestCase):
 
 
 class TestCatalogCoverage(unittest.TestCase):
-    def test_ssr_and_html_are_not_truncated_at_25_cards(self):
+    def test_ssr_is_not_truncated_and_markup_without_ssr_is_not_a_catalog(self):
         cards = [{"id": str(index), "title": "Fixture", "urlPath": f"/fixture_{index}"} for index in range(60)]
         ssr = '<html><script>' + json.dumps({"loaderData": {"data": {"catalog": {"items": cards}}}}) + '</script></html>'
         self.assertEqual(len(AvitoParser.parse_items(ssr)), 60)
+        # The HTML-markup fallback is gone: cards without the SSR catalog mean a broken/foreign page.
         html = '<html>' + ''.join(f'<div data-marker="item" data-item-id="{index}"><a data-marker="item-title" href="/fixture_{index}">Fixture</a></div>' for index in range(60)) + '</html>'
-        self.assertEqual(len(AvitoParser.parse_items(html)), 60)
+        self.assertIsNone(AvitoParser.parse_catalog(html))
+        self.assertEqual(AvitoParser.parse_items(html), [])
+        self.assertFalse(AvitoParser.has_catalog(html))
 
     def test_empty_catalog_is_valid_but_login_page_is_not(self):
         html = '<html><script>' + json.dumps({"loaderData": {"data": {"catalog": {"items": []}}}}) + '</script></html>'
@@ -245,6 +248,20 @@ class TestCatalogCoverage(unittest.TestCase):
         self.assertIn('p=2', AvitoParser.next_page_url(valid, current))
         for href in ('https://evil.test/?p=2', '?q=other&p=2', '?q=phone&p=20'):
             self.assertIsNone(AvitoParser.next_page_url(f'<a rel="next" href="{href}">Next</a>', current))
+
+    def test_pagination_regex_handles_attribute_order_quotes_and_noise(self):
+        current = 'https://www.avito.ru/moskva?q=phone&s=104'
+        html = (
+            '<a href="?q=phone&amp;s=104&amp;p=7" data-marker="pagination-button/page">7</a>'
+            "<A class='x' HREF='?q=phone&amp;s=104&amp;p=2' data-marker='pagination-button/nextPage'>›</A>"
+        )
+        self.assertIn('p=2', AvitoParser.next_page_url(html, current))
+        self.assertIsNone(AvitoParser.next_page_url('<a data-marker="pagination-button/nextPage">no href</a>', current))
+
+    def test_search_title_without_dom_parser(self):
+        self.assertEqual(AvitoParser.extract_search_title('<h1 class="t">iPhone&nbsp;15 <span>Pro</span></h1>', 'https://www.avito.ru/x'), 'iPhone 15 Pro')
+        self.assertEqual(AvitoParser.extract_search_title('<title>Ноутбуки — Авито</title>', 'https://www.avito.ru/x'), 'Ноутбуки')
+        self.assertEqual(AvitoParser.extract_search_title('', 'https://www.avito.ru/moskva/noutbuki'), 'noutbuki')
 
 
 class TestBudgetedCurlPath(unittest.IsolatedAsyncioTestCase):

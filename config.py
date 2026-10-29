@@ -16,6 +16,7 @@ DEPRECATED_ENV_VARS = (
     "MAX_CONCURRENT_WORKERS",
     "AVITO_MAX_IN_FLIGHT",
     "SCAN_MAX_INTERVAL",
+    "PARSE_WORKERS",
 )
 
 
@@ -98,8 +99,10 @@ PROXY_QUARANTINE_BASE = positive_float_setting("PROXY_QUARANTINE_BASE", "2")
 PROXY_QUARANTINE_MAX = positive_float_setting("PROXY_QUARANTINE_MAX", "15")
 PROXY_TRANSPORT_BACKOFF_BASE = positive_float_setting("PROXY_TRANSPORT_BACKOFF_BASE", "2")
 PROXY_TRANSPORT_BACKOFF_MAX = positive_float_setting("PROXY_TRANSPORT_BACKOFF_MAX", "10")
+# Token bucket per proxy client: sustained PROXY_RATE_LIMIT req/s with bursts up to PROXY_RATE_BURST requests.
+PROXY_RATE_BURST = positive_float_setting("PROXY_RATE_BURST", "3")
 CHALLENGE_WORKERS = positive_int_setting("CHALLENGE_WORKERS", "1")
-PARSE_WORKERS = positive_int_setting("PARSE_WORKERS", "2")
+COOKIE_SAVE_INTERVAL = non_negative_float_setting("COOKIE_SAVE_INTERVAL", "30")
 
 AVITO_CONNECT_TIMEOUT = positive_float_setting("AVITO_CONNECT_TIMEOUT", "3.0")
 AVITO_READ_TIMEOUT = positive_float_setting("AVITO_READ_TIMEOUT", "8.0")
@@ -136,6 +139,9 @@ SOURCE_SNAPSHOT_CACHE_SIZE = positive_int_setting("SOURCE_SNAPSHOT_CACHE_SIZE", 
 SOURCE_SNAPSHOT_TTL = positive_float_setting("SOURCE_SNAPSHOT_TTL", "20")
 BLACKLIST_CACHE_TTL = positive_float_setting("BLACKLIST_CACHE_TTL", "45")
 FAST_SKIP_FULL_SCAN_INTERVAL = positive_float_setting("FAST_SKIP_FULL_SCAN_INTERVAL", "60")
+# In-memory per-source memory of already processed item IDs (skips DB fanout when a scan brings nothing new).
+SEEN_CACHE_TTL_HOURS = positive_float_setting("SEEN_CACHE_TTL_HOURS", "48")
+SEEN_CACHE_MAX_PER_SOURCE = positive_int_setting("SEEN_CACHE_MAX_PER_SOURCE", "1000")
 CATCHUP_MAX_AGE_MINUTES = positive_int_setting("CATCHUP_MAX_AGE_MINUTES", "30")
 CATCHUP_MAX_ITEMS = positive_int_setting("CATCHUP_MAX_ITEMS", "10")
 CATCHUP_MAX_PAGES = positive_int_setting("CATCHUP_MAX_PAGES", "5")
