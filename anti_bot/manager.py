@@ -442,6 +442,26 @@ def is_geetest_challenge(response: Any) -> bool:
     return False
 
 
+# GeeTest's own servers do not care which IP solves the puzzle; only Avito's final verify must come from
+# the challenged IP. Talking to GeeTest directly avoids slow-proxy timeouts and keeps those requests out of
+# the proxy's rate budget and block statistics.
+GEETEST_DIRECT = os.getenv("GEETEST_DIRECT", "1").strip() != "0"
+
+
+def _geetest_session(avito_session: Any) -> tuple[Any, bool]:
+    """(session for GeeTest calls, whether it must be closed afterwards)."""
+    if not GEETEST_DIRECT:
+        return avito_session, False
+    headers = getattr(avito_session, "headers", None) or {}
+    user_agent = headers.get("User-Agent") or headers.get("user-agent") or get_browser_user_agent()
+    direct = requests.Session(
+        impersonate=BROWSER_PROFILE,
+        headers={"User-Agent": user_agent, "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"},
+        timeout=(5, 10),
+    )
+    return direct, True
+
+
 def solve_geetest_if_available(
     session: requests.Session,
     response: Any,
@@ -455,6 +475,7 @@ def solve_geetest_if_available(
     выводит понятное предупреждение в лог без падения бота.
     """
     check_cancelled(cancel_event)
+    geetest_session, owns_geetest_session = session, False
     geeked_root_str = str(GEEKED_TEST_ROOT)
     if geeked_root_str not in sys.path:
         sys.path.insert(0, geeked_root_str)
@@ -475,13 +496,17 @@ def solve_geetest_if_available(
         m = re.search(r"const\s+captchaId\s*=\s*['\"]([^'\"]+)['\"]", text)
         captcha_id = m.group(1) if m else GEETEST_CAPTCHA_ID
 
-        logger.info(f"🤖 Запуск автономного решателя GeeTest v4 (id: {captcha_id})...")
+        logger.info(
+            f"🤖 Запуск автономного решателя GeeTest v4 (id: {captcha_id}, "
+            f"{'GeeTest напрямую с сервера' if GEETEST_DIRECT else 'через канал сканирования'})..."
+        )
+        geetest_session, owns_geetest_session = _geetest_session(session)
 
         # Получаем задачу от GeeTest
         challenge = str(secrets.token_hex(16))
         callback = f"geetest_{int(time.time() * 1000) + secrets.randbelow(10000)}"
 
-        load_resp = session.get(
+        load_resp = geetest_session.get(
             GEETEST_LOAD_URL,
             params={
                 "callback": callback,
@@ -491,7 +516,7 @@ def solve_geetest_if_available(
                 "lang": "rus",
             },
             headers={"Referer": BASE_URL + "/"},
-            timeout=15,
+            timeout=(5, 10),
             allow_redirects=False,
         )
         check_cancelled(cancel_event)
@@ -511,7 +536,7 @@ def solve_geetest_if_available(
         solver = Geeked(
             captcha_id,
             lang="rus",
-            session=session,
+            session=geetest_session,
             request_headers={"Referer": BASE_URL + "/"},
             cancel_event=cancel_event,
         )
@@ -522,7 +547,7 @@ def solve_geetest_if_available(
         if not isinstance(seccode, dict) or "lot_number" not in seccode:
             return False
 
-        # Отправляем подтверждение на Авито
+        # Подтверждение уходит на Авито с того же IP, который получил капчу (через канал сканирования)
         check_cancelled(cancel_event)
         cube_val = str(10 + secrets.randbelow(90))
         verify_payload = {
@@ -559,6 +584,12 @@ def solve_geetest_if_available(
     except Exception as e:
         logger.error(f"Исключение при решении GeeTest: {e}")
         return False
+    finally:
+        if owns_geetest_session:
+            try:
+                geetest_session.close()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════

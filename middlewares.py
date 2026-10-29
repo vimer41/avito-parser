@@ -2,6 +2,7 @@ import html
 import logging
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware, Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import TelegramObject, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 import config
@@ -66,6 +67,10 @@ class ActionLoggingMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except Exception as e:
+            if isinstance(e, TelegramBadRequest) and isinstance(event, CallbackQuery) and "query is too old" in str(e):
+                # The button press outlived Telegram's answer window (bot was busy); nothing to repair.
+                logging.getLogger(__name__).info("Пропущен устаревший callback %r от %s", event.data, user.id)
+                return None
             log_user_event(
                 user_id=user.id,
                 username=user.username,
