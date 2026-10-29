@@ -1,9 +1,9 @@
 """Premium (animated) custom emoji for the bot UI.
 
-Every icon in the interface is a named slot with a plain emoji fallback. An admin fills the slots
-from the bot (🎨 in the admin panel): send any emoji of a premium pack and every slot whose plain
-emoji exists in that pack gets the animated version. Until a slot is filled, the plain emoji is used,
-so the bot looks the same as before and tests see plain text.
+Every icon in the interface is a named slot with a plain emoji fallback. Out of the box the slots use
+Telegram's official animated pack (DEFAULT_IDS). An admin can override them from the bot (🎨 in the
+admin panel): send any emoji of another pack and every slot whose plain emoji exists in it switches.
+Tests never call load(), so they see plain emoji.
 
 Bot API 9.4+: a bot may use custom emoji in messages and on buttons when its owner has Telegram
 Premium. If Telegram ever rejects them, `PremiumEmojiFallback` resends the request with plain emoji
@@ -27,7 +27,7 @@ SETTING_ENABLED = "ui_emoji_enabled"
 
 # name -> (plain emoji, what it marks). The order is the order of the admin screen.
 SLOTS: dict[str, tuple[str, str]] = {
-    "logo": ("📡", "логотип, главный экран"),
+    "logo": ("🛰", "логотип, главный экран"),
     "hello": ("👋", "приветствие"),
     "radar": ("🎯", "радар, добавить радар"),
     "radars": ("📁", "мои радары"),
@@ -35,45 +35,45 @@ SLOTS: dict[str, tuple[str, str]] = {
     "tariffs": ("💎", "тарифы"),
     "profile": ("👤", "профиль, продавец"),
     "help": ("📖", "инструкция"),
-    "docs": ("📄", "документы"),
+    "docs": ("📚", "документы"),
     "support": ("💬", "поддержка"),
     "home": ("🏠", "главное меню"),
     "trial": ("🎁", "пробный период"),
     "lite": ("⚡", "тариф Базовый"),
     "standart": ("🚀", "тариф Средний"),
     "pro": ("🔥", "тариф Полный"),
-    "on": ("🟢", "радар работает"),
-    "pause": ("⏸", "пауза"),
-    "play": ("▶️", "запустить"),
-    "shield": ("🛡", "стоп-слова"),
-    "ban": ("🚫", "чёрный список"),
+    "on": ("💚", "радар работает"),
+    "pause": ("💤", "пауза"),
+    "play": ("🔔", "запустить"),
+    "shield": ("✂️", "стоп-слова"),
+    "ban": ("🙈", "чёрный список"),
     "link": ("🔗", "открыть на Авито"),
-    "trash": ("🗑", "удалить"),
+    "trash": ("✖️", "удалить"),
     "refresh": ("🔄", "обновить"),
     "ok": ("✅", "готово"),
-    "warn": ("⚠️", "предупреждение"),
+    "warn": ("❗️", "предупреждение"),
     "cancel": ("❌", "отмена"),
     "wait": ("⏳", "ожидание"),
     "new": ("⚡", "новый лот"),
     "price": ("💰", "цена"),
-    "place": ("📍", "адрес"),
-    "time": ("🕒", "время"),
-    "box": ("📦", "детали лота"),
+    "place": ("🗺", "адрес"),
+    "time": ("⏰", "время"),
+    "box": ("🛍", "детали лота"),
     "views": ("👁", "просмотры"),
     "note": ("📝", "описание"),
-    "card": ("💳", "оплата СБП"),
+    "card": ("💸", "оплата СБП"),
     "star": ("⭐", "Telegram Stars"),
     "coin": ("🪙", "криптовалюта"),
-    "lock": ("🔒", "конфиденциальность, резерв"),
+    "lock": ("🔐", "конфиденциальность, резерв"),
     "scope": ("🔍", "область поиска, поиск"),
     "write": ("✍️", "написать"),
-    "mail": ("📧", "почта"),
+    "mail": ("📨", "почта"),
     "admin": ("👑", "админ-панель"),
     "users": ("👥", "пользователи"),
-    "net": ("🌐", "сеть и прокси"),
+    "net": ("🌍", "сеть и прокси"),
     "stats": ("📊", "мониторинг"),
-    "db": ("💾", "база"),
-    "logs": ("📋", "логи"),
+    "db": ("🗂", "база"),
+    "logs": ("📰", "логи"),
     "palette": ("🎨", "премиум-эмодзи"),
 }
 
@@ -102,8 +102,32 @@ def menu_texts(*keys: str) -> set[str]:
 
 ALL_MENU_TEXTS = menu_texts(*MENU) | CANCEL_TEXTS
 
+# Telegram's official animated pack «Animated Emoji» (t.me/addemoji/RestrictedEmoji): every slot's
+# plain emoji is picked so that this pack has it. Rebuild with getStickerSet + match_slots.
+DEFAULT_PACK = "RestrictedEmoji"
+DEFAULT_IDS: dict[str, str] = {
+    "logo": "5321304062715517873", "hello": "5472055112702629499", "radar": "5350460637182993292",
+    "radars": "5433653135799228968", "add": "5226945370684140473", "tariffs": "5471952986970267163",
+    "profile": "5373012449597335010", "help": "5226512880362332956", "docs": "5373098009640836781",
+    "support": "5465300082628763143", "home": "5465226866321268133", "trial": "5199749070830197566",
+    "lite": "5431449001532594346", "standart": "5445284980978621387", "pro": "5420315771991497307",
+    "on": "5449380056201697322", "pause": "5451959871257713464", "play": "5242628160297641831",
+    "shield": "5237808360882977239", "ban": "5467370583282950466", "link": "5375129357373165375",
+    "trash": "5226660202035554522", "refresh": "5264727218734524899", "ok": "5427009714745517609",
+    "warn": "5467928559664242360", "cancel": "5465665476971471368", "wait": "5451732530048802485",
+    "new": "5431449001532594346", "price": "5375296873982604963", "place": "5415803062738504079",
+    "time": "5413704112220949842", "box": "5373052667671093676", "views": "5424892643760937442",
+    "note": "5334882760735598374", "card": "5472030678633684592", "star": "5435957248314579621",
+    "coin": "5379600444098093058", "lock": "5472308992514464048", "scope": "5188217332748527444",
+    "write": "5470060791883374114", "mail": "5406631276042002796", "admin": "5467406098367521267",
+    "users": "5372926953978341366", "net": "5399898266265475100", "stats": "5431577498364158238",
+    "db": "5431736674147114227", "logs": "5433982607035474385", "palette": "5431456208487716895",
+}
+
 ENABLED = True
-IDS: dict[str, str] = {}
+IDS: dict[str, str] = {}          # effective: defaults + admin overrides, minus slots set to plain
+OVERRIDES: dict[str, str] = {}    # admin choices; "0" = plain emoji for that slot
+_defaults: dict[str, str] = {}    # DEFAULT_IDS once load() ran; empty in tests, so they see plain emoji
 _CHAR_BY_ID: dict[str, str] = {}
 _TAG_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', re.DOTALL)
 _ANY_TAG_RE = re.compile(r"<[^>]+>")
@@ -113,10 +137,13 @@ def _norm(char: str) -> str:
     return (char or "").replace("️", "").strip()
 
 
-def _apply(ids: dict, enabled: bool) -> None:
-    global ENABLED, IDS, _CHAR_BY_ID
+def _apply(overrides: dict, enabled: bool, defaults: Optional[dict] = None) -> None:
+    global ENABLED, IDS, OVERRIDES, _defaults, _CHAR_BY_ID
+    if defaults is not None:
+        _defaults = dict(defaults)
     ENABLED = bool(enabled)
-    IDS = {k: str(v) for k, v in (ids or {}).items() if k in SLOTS and str(v).isdigit()}
+    OVERRIDES = {k: str(v) for k, v in (overrides or {}).items() if k in SLOTS and str(v).isdigit()}
+    IDS = {k: v for k, v in {**_defaults, **OVERRIDES}.items() if v != "0"}
     _CHAR_BY_ID = {v: SLOTS[k][0] for k, v in IDS.items()}
 
 
@@ -191,17 +218,18 @@ async def load() -> None:
     except (TypeError, ValueError):
         ids = {}
     enabled = (await database.get_bot_setting(SETTING_ENABLED, "1")) != "0"
-    _apply(ids if isinstance(ids, dict) else {}, enabled)
-    logger.info("Премиум-эмодзи: заполнено %s из %s слотов, включены=%s", len(IDS), len(SLOTS), ENABLED)
+    _apply(ids if isinstance(ids, dict) else {}, enabled, DEFAULT_IDS)
+    logger.info("Премиум-эмодзи: заполнено %s из %s слотов, своих замен %s, включены=%s",
+                len(IDS), len(SLOTS), len(OVERRIDES), ENABLED)
 
 
-async def save(ids: Optional[dict] = None, enabled: Optional[bool] = None) -> None:
+async def save(overrides: Optional[dict] = None, enabled: Optional[bool] = None) -> None:
     import database
-    if ids is not None:
-        await database.set_bot_setting(SETTING_IDS, json.dumps(ids))
+    if overrides is not None:
+        await database.set_bot_setting(SETTING_IDS, json.dumps(overrides))
     if enabled is not None:
         await database.set_bot_setting(SETTING_ENABLED, "1" if enabled else "0")
-    _apply(IDS if ids is None else ids, ENABLED if enabled is None else enabled)
+    _apply(OVERRIDES if overrides is None else overrides, ENABLED if enabled is None else enabled)
 
 
 def match_slots(stickers: Iterable[tuple[str, str]], only_empty: bool = False) -> dict[str, str]:

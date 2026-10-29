@@ -17,19 +17,27 @@ import ui
 
 class TestPremiumEmoji(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.saved = (dict(ui.IDS), ui.ENABLED)
-        ui._apply({"radar": "111", "home": "222"}, True)
+        self.saved = (dict(ui.OVERRIDES), ui.ENABLED, dict(ui._defaults))
+        ui._apply({"radar": "111", "home": "222"}, True, {})
 
     def tearDown(self):
         ui._apply(*self.saved)
 
+    def test_defaults_cover_every_slot_and_admin_overrides_win(self):
+        self.assertEqual(set(ui.DEFAULT_IDS), set(ui.SLOTS))
+        ui._apply({"radar": "111", "trash": "0"}, True, ui.DEFAULT_IDS)
+        self.assertEqual(ui.custom_id("radar"), "111")
+        self.assertEqual(ui.custom_id("home"), ui.DEFAULT_IDS["home"])
+        self.assertIsNone(ui.custom_id("trash"))
+        self.assertEqual(ui.e("trash"), ui.plain("trash"))
+
     def test_filled_slot_renders_animated_emoji_and_empty_slot_stays_plain(self):
         self.assertEqual(ui.e("radar"), '<tg-emoji emoji-id="111">🎯</tg-emoji>')
-        self.assertEqual(ui.e("trash"), "🗑")
+        self.assertEqual(ui.e("trash"), "✖️")
         button = ui.btn("Радар", "radar", callback_data="x")
         self.assertEqual((button.text, button.icon_custom_emoji_id), ("Радар", "111"))
         plain = ui.btn("Удалить", "trash", callback_data="x")
-        self.assertEqual((plain.text, plain.icon_custom_emoji_id), ("🗑 Удалить", None))
+        self.assertEqual((plain.text, plain.icon_custom_emoji_id), ("✖️ Удалить", None))
 
     def test_disabled_emoji_fall_back_to_plain_everywhere(self):
         ui._apply(ui.IDS, False)
@@ -40,7 +48,7 @@ class TestPremiumEmoji(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ui.visible_len(f"{ui.e('radar')} <b>a&amp;b</b>"), 5)
 
     def test_pack_matching_ignores_variation_selector(self):
-        found = ui.match_slots([("⚠", "9"), ("🎯", "8"), ("🎯", "7")])
+        found = ui.match_slots([("❗", "9"), ("🎯", "8"), ("🎯", "7")])
         self.assertEqual(found["warn"], "9")
         self.assertEqual(found["radar"], "8")
         self.assertNotIn("trash", found)

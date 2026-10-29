@@ -1709,27 +1709,26 @@ EMOJI_SLOTS_PER_PAGE = 24
 
 
 def _emoji_home() -> tuple[str, InlineKeyboardMarkup]:
-    filled = len(ui.IDS)
-    total = len(ui.SLOTS)
     status = f"{ui.e('on')} включены" if ui.ENABLED else f"{ui.e('pause')} выключены"
     lines = [
         f"{ui.e('palette')} <b>Премиум-эмодзи</b>",
         "",
-        f"Статус: {status} · заполнено <b>{filled}</b> из {total}",
+        f"Статус: {status} · анимированных <b>{len(ui.IDS)}</b> из {len(ui.SLOTS)} · своих замен {len(ui.OVERRIDES)}",
         "",
-        "<b>Как заполнить:</b> «Загрузить пак» → пришлите любой премиум-эмодзи из понравившегося пака. "
-        "Бот возьмёт весь пак и поставит анимированные версии везде, где совпадает обычный эмодзи. "
-        "Остальное можно назначить по одному.",
+        "По умолчанию стоит официальный анимированный пак Telegram. "
+        "Хотите другой стиль: «Загрузить пак» → пришлите любой эмодзи из нужного пака, "
+        "бот заменит все совпадающие места. Отдельные места меняются по одному.",
         "",
     ]
     lines += [f"{ui.e(name)} {desc}" + ("" if name in ui.IDS else " <i>(обычный)</i>")
+              + (" <i>· своя</i>" if name in ui.OVERRIDES else "")
               for name, (_char, desc) in ui.SLOTS.items()]
     markup = ui.kb(
         [ui.btn("Загрузить пак", "box", callback_data="admin_emoji_pack", style="primary")],
-        [ui.btn("Назначить по одному", "write", callback_data="admin_emoji_slots:0")],
+        [ui.btn("Заменить по одному", "write", callback_data="admin_emoji_slots:0")],
         [ui.btn("Выключить" if ui.ENABLED else "Включить", "pause" if ui.ENABLED else "play",
                 callback_data="admin_emoji_toggle"),
-         ui.btn("Сбросить все", "trash", callback_data="admin_emoji_reset")],
+         ui.btn("К стандартным", "refresh", callback_data="admin_emoji_reset")],
         [ui.btn("« Админ-панель", callback_data="admin_refresh")],
     )
     return "\n".join(lines), markup
@@ -1760,8 +1759,9 @@ async def cb_admin_emoji_reset(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         return
     await call.answer()
-    await _show(call, f"{ui.e('trash')} <b>Сбросить все премиум-эмодзи?</b>\n\nВезде вернутся обычные.", ui.kb([
-        ui.btn("Да, сбросить", callback_data="admin_emoji_reset_yes", style="danger"),
+    await _show(call, f"{ui.e('refresh')} <b>Убрать все свои замены?</b>\n\n"
+                      "Везде вернётся стандартный анимированный пак Telegram.", ui.kb([
+        ui.btn("Да, вернуть", callback_data="admin_emoji_reset_yes", style="danger"),
         ui.btn("Отмена", callback_data="admin_emoji"),
     ]))
 
@@ -1770,8 +1770,8 @@ async def cb_admin_emoji_reset(call: CallbackQuery):
 async def cb_admin_emoji_reset_yes(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         return
-    await ui.save(ids={})
-    await call.answer("Сброшено")
+    await ui.save(overrides={})
+    await call.answer("Вернул стандартные")
     text, markup = _emoji_home()
     await _show(call, text, markup)
 
@@ -1833,21 +1833,26 @@ async def cb_admin_emoji_slot(call: CallbackQuery, state: FSMContext):
     await call.answer()
     rows = [[ui.btn("Отмена", "cancel", callback_data="admin_emoji_slots:0")]]
     if name in ui.IDS:
-        rows.insert(0, [ui.btn("Вернуть обычный", "refresh", callback_data=f"admin_emoji_clear:{name}")])
+        rows.insert(0, [ui.btn(f"Обычный {ui.plain(name)}", callback_data=f"admin_emoji_plain:{name}")])
+    if name in ui.OVERRIDES:
+        rows.insert(0, [ui.btn("Вернуть стандартный", "refresh", callback_data=f"admin_emoji_clear:{name}")])
     await _show(call, (
         f"{ui.e(name)} <b>{ui.SLOTS[name][1]}</b>\n\n"
         f"Обычный: {ui.plain(name)}. Пришлите один премиум-эмодзи для этого места."
     ), ui.kb(*rows))
 
 
-@router.callback_query(F.data.startswith("admin_emoji_clear:"))
+@router.callback_query(F.data.startswith(("admin_emoji_clear:", "admin_emoji_plain:")))
 async def cb_admin_emoji_clear(call: CallbackQuery, state: FSMContext):
     if not config.is_admin(call.from_user.id):
         return
     await state.clear()
-    name = call.data.split(":", 1)[1]
-    await ui.save(ids={k: v for k, v in ui.IDS.items() if k != name})
-    await call.answer("Вернул обычный")
+    action, name = call.data.split(":", 1)
+    overrides = {k: v for k, v in ui.OVERRIDES.items() if k != name}
+    if action == "admin_emoji_plain":
+        overrides[name] = "0"
+    await ui.save(overrides=overrides)
+    await call.answer("Поставил обычный" if action == "admin_emoji_plain" else "Вернул стандартный")
     text, markup = _emoji_home()
     await _show(call, text, markup)
 
@@ -1883,7 +1888,7 @@ async def msg_admin_emoji_pack(message: Message, state: FSMContext, bot: Bot):
     status = await message.answer(f"{ui.e('wait')} Загружаю пак…", parse_mode="HTML")
     found = ui.match_slots(await _pack_pairs(bot, [cid for _c, cid in own]))
     found.update(ui.match_slots(own))
-    await ui.save(ids={**ui.IDS, **found})
+    await ui.save(overrides={**ui.OVERRIDES, **found})
     missing = [ui.SLOTS[n][0] for n in ui.SLOTS if n not in ui.IDS]
     text = f"{ui.e('ok')} <b>Заполнено мест: {len(found)}</b>\n" + " ".join(ui.e(n) for n in found)
     if missing:
@@ -1905,7 +1910,7 @@ async def msg_admin_emoji_slot(message: Message, state: FSMContext):
                              reply_markup=ui.kb([ui.btn("Отмена", "cancel", callback_data="admin_emoji_slots:0")]))
         return
     await state.clear()
-    await ui.save(ids={**ui.IDS, name: own[0][1]})
+    await ui.save(overrides={**ui.OVERRIDES, name: own[0][1]})
     await message.answer(f"{ui.e(name)} <b>Готово:</b> {ui.SLOTS[name][1]}", parse_mode="HTML", reply_markup=ui.kb(
         [ui.btn("Ещё одно место", "write", callback_data="admin_emoji_slots:0")],
         [ui.btn("« Эмодзи", callback_data="admin_emoji")],
