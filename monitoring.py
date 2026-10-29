@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import logging
 import time
+import zlib
 from collections import defaultdict
 from typing import Optional
 
@@ -47,9 +48,16 @@ async def nothing_new_for_fanout(seen_store, task, collection, has_pro_catchup: 
     return await seen_store.all_known(task.key, task.group_revision, (it.item_id for it in collection.items))
 
 
-def source_interval(radars: list[dict]) -> float:
-    """Uniform target scan interval across all tariffs (15-20s)."""
-    return (float(config.SCAN_INTERVAL_MIN) + float(config.SCAN_INTERVAL_MAX)) / 2.0
+def source_interval(radars: list[dict], key: str = "") -> float:
+    """Scan interval of a URL: the fastest tariff among its radars, minus a stable per-URL jitter of up to 10 %."""
+    base = min(
+        (config.TARIFF_SCAN_INTERVAL.get(database.classify_user_tariff(r)[0], config.TARIFF_SCAN_INTERVAL["base"])
+         for r in radars),
+        default=config.TARIFF_SCAN_INTERVAL["base"],
+    )
+    # Stable per URL so the planner does not reschedule every second, yet URLs of one tariff do not tick in step.
+    jitter = (zlib.crc32(key.encode("utf-8")) % 1000) / 10000.0
+    return round(float(base) * (1.0 - jitter), 2)
 
 
 async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
@@ -97,12 +105,11 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         return consecutive_failures >= 5 and time.monotonic() - last_ok_at >= float(config.HEALTH_ALERT_AFTER_SECONDS)
 
     logger.info(
-        "📡 Планировщик: %s HTTP-воркеров, %s fanout-воркеров, прокси в пуле=%s, целевой интервал %.1f-%.1f с",
+        "📡 Планировщик: %s HTTP-воркеров, %s fanout-воркеров, прокси в пуле=%s, интервалы тарифов %s",
         len(parsers),
         config.FANOUT_WORKERS,
         len(pool.clients),
-        config.SCAN_INTERVAL_MIN,
-        config.SCAN_INTERVAL_MAX,
+        config.TARIFF_SCAN_INTERVAL,
     )
 
     async def queue_state_update(source_url: str, processed_at: float, top_ids: tuple[str, ...], failure_streak: int):
@@ -496,7 +503,8 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             )
             effective_rps = max(0.1, effective_rps)
 
-            base = {key: source_interval(radars) for key, radars in groups.items()}
+            base = {key: source_interval(radars, key) for key, radars in groups.items()}
+            METRICS.set_planned_scan_rate(sum(1.0 / interval for interval in base.values()))
             plan = calculate_interval_plan(
                 base,
                 effective_rps,
@@ -507,7 +515,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             now = time.monotonic()
             planner.sync(
                 groups,
-                None,  # Uniform [interval_low, interval_high] jitter across all tariffs
+                base,  # Per-tariff interval of every URL
                 now,
                 startup=startup,
                 startup_spread=config.SCAN_STARTUP_SPREAD,

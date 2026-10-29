@@ -22,10 +22,13 @@ async def payment_terms(event):
     message = event.message if isinstance(event, CallbackQuery) else event
     text = (
         "<b>УСЛОВИЯ ПОДПИСКИ И ОПЛАТЫ</b>\n"
-        "<i>Редакция от 26.10.2026 г. · Код верификации: mekbuda</i>\n"
+        "<i>Редакция от 29.10.2026 г. · Код верификации: mekbuda</i>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"• <b>Standart:</b> {config.STARS_PRICE_STANDART} ⭐ / 30 дней, до 4 радаров.\n"
-        f"• <b>PRO:</b> {config.STARS_PRICE_PRO} ⭐ / 30 дней, до 9 радаров и мониторинг скидок.\n\n"
+        + "".join(
+            f"• <b>{config.plan_title(plan)}:</b> {config.stars_price(plan)} ⭐ / 30 дней, радаров — до {config.plan_radars(plan)}, "
+            f"проверка раз в {config.plan_interval(plan)} с.\n"
+            for plan in config.PAID_PLANS
+        ) + "\n"
         "<b>Правила предоставления услуги:</b>\n"
         "• Услуга является нематериальной цифровой услугой по программному мониторингу открытых объявлений.\n"
         "• Разовая оплата за 30 дней доступа, <b>без автосписаний</b>. Подписка включается сразу после подтверждения транзакции.\n"
@@ -71,8 +74,11 @@ async def buy_stars(call: CallbackQuery, bot: Bot, state: FSMContext):
     await state.clear()
     await call.answer("Открываю счёт Telegram Stars")
     try:
-        plan_title = "AVITO RADAR · ТЕСТ · 1 день" if plan == "test" else f"AVITO RADAR · {plan.upper()} · 30 дней"
-        plan_desc = "Тестовая проверка оплаты Telegram Stars (1 день)." if plan == "test" else f"До {9 if plan == 'pro' else 4} радаров. Разовая подписка, без автосписания. Условия: /terms. Поддержка и возврат: /paysupport."
+        plan_title = "AVITO RADAR · ТЕСТ · 1 день" if plan == "test" else f"AVITO RADAR · {config.plan_title(plan)} · 30 дней"
+        plan_desc = "Тестовая проверка оплаты Telegram Stars (1 день)." if plan == "test" else (
+            f"Радаров — до {config.plan_radars(plan)}, проверка раз в {config.plan_interval(plan)} с. "
+            "Разовая подписка, без автосписания. Условия: /terms. Поддержка и возврат: /paysupport."
+        )
         label = "Тестовый доступ (1 день)" if plan == "test" else "Подписка на 30 дней"
         await bot.send_invoice(
             chat_id=call.from_user.id,
@@ -135,7 +141,7 @@ async def successful_payment(message: Message, bot: Bot):
         return
     await message.answer(
         f"✅ <b>Оплата {order['total_amount']} ⭐ подтверждена!</b>\n"
-        f"Тариф: <b>{order['tariff_plan'].upper()}</b>, до {9 if order['tariff_plan'] == 'pro' else 4} радаров.\n"
+        f"Тариф: <b>{config.plan_title(order['tariff_plan'])}</b>, радаров — до {await database.get_user_max_radars(order['user_id'])}.\n"
         f"Добавлено {order['days']} дней. Действует: {database.format_subscription_date(order['subscription_after'])}\n"
         f"Номер заказа: <code>{order['id']}</code>. Без автосписания. Поддержка: /paysupport.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -155,7 +161,7 @@ async def payment_support(event, state: FSMContext):
     text = "💬 <b>ПОДДЕРЖКА ПЛАТЕЖЕЙ / ВОЗВРАТ</b>\n\n📧 <b>Email:</b> bernardgofov@gmail.com\n\n"
     if orders:
         text += "Последние платежи:\n" + "\n".join(
-            f"• #{o['id']} · {o['tariff_plan'].upper()} · {o['total_amount']} ⭐ · "
+            f"• #{o['id']} · {config.plan_title(o['tariff_plan'])} · {o['total_amount']} ⭐ · "
             f"{'возвращён' if o['status'] == 'refunded' else 'возврат обрабатывается' if o['status'] == 'refunding' else 'оплачен'}"
             for o in orders
         ) + "\n\n"
@@ -184,7 +190,7 @@ async def admin_payments(call: CallbackQuery):
     lines = [f"⭐ <b>ПЛАТЕЖИ ПОЛЬЗОВАТЕЛЯ {user_id}</b>"]
     buttons = []
     for order in orders:
-        lines.append(f"#{order['id']} · {order['tariff_plan'].upper()} · {order['total_amount']} ⭐ · {order['status']}"
+        lines.append(f"#{order['id']} · {config.plan_title(order['tariff_plan'])} · {order['total_amount']} ⭐ · {order['status']}"
                      + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else ""))
         if order["status"] in ("paid", "refunding"):
             buttons.append([InlineKeyboardButton(text=f"↩️ Вернуть #{order['id']} ({order['total_amount']} ⭐)", callback_data=f"admin_refund_prompt:{order['id']}")])

@@ -43,8 +43,8 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
         return await billing.complete_payment(self.user_id, order["payload"], "XTR", order["total_amount"], charge)
 
     async def test_default_prices_and_explicit_disable(self):
-        self.assertEqual(config.stars_price("standart"), 170)
-        self.assertEqual(config.stars_price("pro"), 470)
+        self.assertEqual(config.stars_price("standart"), 449)
+        self.assertEqual(config.stars_price("pro"), 899)
         self.assertEqual(config.stars_price("test"), 10)
         with self.assertRaises(ValueError):
             config.stars_price("fake")
@@ -69,8 +69,8 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
         order = await billing.create_order(self.user_id, "standart")
         before = await database.get_user(self.user_id)
         for user_id, payload, currency, amount in (
-            (654321, order["payload"], "XTR", 170), (self.user_id, "fake", "XTR", 170),
-            (self.user_id, order["payload"], "RUB", 170), (self.user_id, order["payload"], "XTR", 1),
+            (654321, order["payload"], "XTR", 449), (self.user_id, "fake", "XTR", 449),
+            (self.user_id, order["payload"], "RUB", 449), (self.user_id, order["payload"], "XTR", 1),
         ):
             with self.subTest(user_id=user_id, payload=payload, currency=currency, amount=amount):
                 with self.assertRaises(billing.PaymentValidationError):
@@ -81,19 +81,19 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
     async def test_checkout_never_grants_and_reserves_invoice_once(self):
         before = await database.get_user(self.user_id)
         order = await self.approved_order()
-        await billing.approve_checkout(f"q-{order['id']}", self.user_id, order["payload"], "XTR", 170)
+        await billing.approve_checkout(f"q-{order['id']}", self.user_id, order["payload"], "XTR", 449)
         self.assertEqual(await database.get_user(self.user_id), before)
         with self.assertRaises(billing.PaymentValidationError):
-            await billing.approve_checkout("another-q", self.user_id, order["payload"], "XTR", 170)
+            await billing.approve_checkout("another-q", self.user_id, order["payload"], "XTR", 449)
 
     async def test_checkout_rejects_stale_or_changed_price(self):
         order = await billing.create_order(self.user_id, "standart")
-        with patch.object(config, "STARS_PRICE_STANDART", 171):
+        with patch.object(config, "STARS_PRICE_STANDART", 450):
             with self.assertRaises(billing.PaymentValidationError):
-                await billing.approve_checkout("q", self.user_id, order["payload"], "XTR", 170)
+                await billing.approve_checkout("q", self.user_id, order["payload"], "XTR", 449)
         await self.execute("UPDATE stars_orders SET expires_at = datetime('now', '-1 second')")
         with self.assertRaises(billing.PaymentValidationError):
-            await billing.approve_checkout("q", self.user_id, order["payload"], "XTR", 170)
+            await billing.approve_checkout("q", self.user_id, order["payload"], "XTR", 449)
 
     async def test_permanent_or_admin_access_is_not_sold(self):
         await database.set_user_allowed(self.user_id, 1)
@@ -111,7 +111,7 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["telegram_payment_charge_id"], "charge-1")
         self.assertEqual(after["tariff_plan"], "pro")
         self.assertEqual(after["is_allowed"], 1)
-        self.assertEqual(await database.get_user_max_radars(self.user_id), 9)
+        self.assertEqual(await database.get_user_max_radars(self.user_id), 4)
         self.assertEqual(datetime.fromisoformat(after["subscription_until"]),
                          datetime.fromisoformat(before["subscription_until"]) + timedelta(days=30))
 
@@ -143,13 +143,13 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
         order = await billing.create_order(self.user_id, "standart")
         with self.assertRaises(billing.PaymentValidationError):
             await self.pay(order)
-        await billing.approve_checkout("q", self.user_id, order["payload"], "XTR", 170)
+        await billing.approve_checkout("q", self.user_id, order["payload"], "XTR", 449)
         for user, payload, currency, amount, charge in (
-            (self.user_id + 1, order["payload"], "XTR", 170, "charge"),
-            (self.user_id, "fake", "XTR", 170, "charge"),
-            (self.user_id, order["payload"], "RUB", 170, "charge"),
-            (self.user_id, order["payload"], "XTR", 470, "charge"),
-            (self.user_id, order["payload"], "XTR", 170, ""),
+            (self.user_id + 1, order["payload"], "XTR", 449, "charge"),
+            (self.user_id, "fake", "XTR", 449, "charge"),
+            (self.user_id, order["payload"], "RUB", 449, "charge"),
+            (self.user_id, order["payload"], "XTR", 899, "charge"),
+            (self.user_id, order["payload"], "XTR", 449, ""),
         ):
             with self.assertRaises(billing.PaymentValidationError):
                 await billing.complete_payment(user, payload, currency, amount, charge)
@@ -158,11 +158,11 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
     async def test_confirmed_payment_is_fulfilled_after_disable_and_expiry_of_invoice(self):
         order = await self.approved_order()
         await self.execute("UPDATE stars_orders SET expires_at = datetime('now', '-1 day')")
-        with patch.object(config, "STARS_PAYMENTS_ENABLED", False), patch.object(config, "STARS_PRICE_STANDART", 180):
+        with patch.object(config, "STARS_PAYMENTS_ENABLED", False), patch.object(config, "STARS_PRICE_STANDART", 460):
             result = await self.pay(order)
             self.assertTrue(result["applied"])
             with self.assertRaises(billing.PaymentValidationError):
-                await billing.approve_checkout("q", self.user_id, order["payload"], "XTR", 170)
+                await billing.approve_checkout("q", self.user_id, order["payload"], "XTR", 449)
 
     async def test_failed_transaction_leaves_payment_retryable(self):
         order = await self.approved_order()

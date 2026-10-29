@@ -74,20 +74,20 @@ class TestAdminRadars(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(await database.get_user_searches(USER_ID)), 1)
 
     async def test_admin_raises_and_lowers_user_limit(self):
-        self.assertEqual(await database.get_user_max_radars(USER_ID), 9)
+        self.assertEqual(await database.get_user_max_radars(USER_ID), 4)
         await self.dispatch_callback(f"admin_radar_limit:{USER_ID}:20:0", config.ADMIN_ID)
-        self.assertEqual(await database.get_user_max_radars(USER_ID), 29)
+        self.assertEqual(await database.get_user_max_radars(USER_ID), 24)
         self.assertIn("из них +20 от админа", self.last_text())
         for _ in range(6):
             await self.dispatch_callback(f"admin_radar_limit:{USER_ID}:-5:0", config.ADMIN_ID)
-        self.assertEqual(await database.get_user_max_radars(USER_ID), 9, "bonus never goes below zero")
+        self.assertEqual(await database.get_user_max_radars(USER_ID), 4, "bonus never goes below zero")
 
         # The limit applies when adding radars, too.
         await database.change_user_extra_radars(USER_ID, 1)
-        for i in range(10):
+        for i in range(5):
             await database.add_search(USER_ID, f"R{i}", f"https://www.avito.ru/moskva?q=u{i}")
         with self.assertRaises(database.RadarLimitError):
-            await database.add_search(USER_ID, "R10", "https://www.avito.ru/moskva?q=u10")
+            await database.add_search(USER_ID, "R5", "https://www.avito.ru/moskva?q=u5")
 
     async def test_admin_card_of_an_admin_opens_with_limit_buttons(self):
         other_admin = next(a for a in config.ADMIN_IDS if a != config.ADMIN_ID)
@@ -104,7 +104,7 @@ class TestAdminRadars(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_non_admin_cannot_change_limits(self):
         await self.dispatch_callback(f"admin_radar_limit:{USER_ID}:20:0", USER_ID)
-        self.assertEqual(await database.get_user_max_radars(USER_ID), 9)
+        self.assertEqual(await database.get_user_max_radars(USER_ID), 4)
 
 
 if __name__ == "__main__":

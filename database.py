@@ -285,9 +285,10 @@ def classify_user_tariff(
 ) -> tuple[str, int, float]:
     """
     Возвращает (tariff_key, priority, delivery_delay_seconds):
-    - admin / PRO -> ('pro', 10, 0.0)
-    - оплаченный Standart -> ('standart', 20, 1.0)
-    - base / test / trial -> ('base', 30, 1.5)
+    - admin / Полный (pro) -> ('pro', 10, ...)
+    - Средний (standart) -> ('standart', 20, ...)
+    - Базовый (lite) -> ('lite', 25, ...)
+    - test / trial / без доступа -> ('base', 30, ...)
     """
     if isinstance(user_id, dict):
         row = user_id
@@ -308,6 +309,8 @@ def classify_user_tariff(
         return "pro", 10, config.tariff_delivery_delay("pro")
     if plan in ("base", "test", "trial") or test_val or not bool(allowed_val):
         return "base", 30, config.tariff_delivery_delay("base")
+    if plan == "lite":
+        return "lite", 25, config.tariff_delivery_delay("lite")
     return "standart", 20, config.tariff_delivery_delay("standart")
 
 
@@ -583,7 +586,7 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 payload TEXT NOT NULL UNIQUE,
                 user_id INTEGER NOT NULL,
-                tariff_plan TEXT NOT NULL CHECK(tariff_plan IN ('standart', 'pro', 'test')),
+                tariff_plan TEXT NOT NULL CHECK(tariff_plan IN ('lite', 'standart', 'pro', 'test')),
                 total_amount INTEGER NOT NULL CHECK(total_amount > 0),
                 days INTEGER NOT NULL CHECK(days > 0),
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -609,14 +612,15 @@ async def init_db():
         """)
         async with db.execute("SELECT sql FROM sqlite_master WHERE name = 'stars_orders'") as cur:
             row = await cur.fetchone()
-            if row and row[0] and "'test'" not in row[0]:
+            # Rebuild when the CHECK predates a tariff (first 'test', then 'lite' for «Базовый»).
+            if row and row[0] and "'lite'" not in row[0]:
                 await db.execute("ALTER TABLE stars_orders RENAME TO stars_orders_old;")
                 await db.execute("""
                     CREATE TABLE stars_orders (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         payload TEXT NOT NULL UNIQUE,
                         user_id INTEGER NOT NULL,
-                        tariff_plan TEXT NOT NULL CHECK(tariff_plan IN ('standart', 'pro', 'test')),
+                        tariff_plan TEXT NOT NULL CHECK(tariff_plan IN ('lite', 'standart', 'pro', 'test')),
                         total_amount INTEGER NOT NULL CHECK(total_amount > 0),
                         days INTEGER NOT NULL CHECK(days > 0),
                         status TEXT NOT NULL DEFAULT 'pending',
@@ -945,10 +949,8 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
 
 def _plan_max_radars(plan: str, is_allowed: bool, trial_used: bool) -> int:
     if is_allowed or plan == "pro":
-        return 9 if plan == "pro" else 4
-    if trial_used and not is_allowed:
-        return 1
-    return 4 if plan == "standart" else 1
+        return config.plan_radars(plan)
+    return config.TRIAL_RADARS
 
 
 async def get_user_max_radars(user_id: int) -> int:
@@ -1042,7 +1044,7 @@ async def find_users_by_query(query: str) -> List[Dict[str, Any]]:
 
 
 async def grant_vip_access(user_id: int, tariff_plan: str = "pro") -> Dict[str, Any]:
-    plan = tariff_plan.lower() if tariff_plan in ("standart", "pro") else "pro"
+    plan = tariff_plan.lower() if tariff_plan in config.PAID_PLANS else "pro"
     async with writer_connection() as db:
         await db.execute("""
             UPDATE users 
@@ -1101,7 +1103,7 @@ async def add_search(user_id: int, title: str, url: str, search_in_title_only: i
                     raise PermissionError("Доступ к мониторингу истёк или отозван")
                 plan = (user["tariff_plan"] or "standart").lower()
                 max_radars = (
-                    (9 if plan == "pro" else 4 if user["is_allowed"] else 1 if user["trial_used"] else 4)
+                    _plan_max_radars(plan, bool(user["is_allowed"]), bool(user["trial_used"]))
                     + int(user["extra_radars"] or 0)
                 )
         async with db.execute("SELECT COUNT(*) FROM searches WHERE user_id = ?", (user_id,)) as cursor:
@@ -2850,7 +2852,7 @@ async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_
     """Shared atomic update; the caller owns the transaction and commit."""
     if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
         raise ValueError("days must be a positive integer")
-    if tariff_plan is not None and tariff_plan.lower() not in ("standart", "pro", "test"):
+    if tariff_plan is not None and tariff_plan.lower() not in (*config.PAID_PLANS, "test"):
         raise ValueError("Unknown tariff plan")
     effective_plan = "standart" if (tariff_plan and tariff_plan.lower() == "test") else (tariff_plan.lower() if tariff_plan else None)
     cursor = await db.execute("""
@@ -2880,7 +2882,7 @@ async def grant_subscription(user_id: int, days: int = 30, tariff_plan: Optional
 async def create_admin_subscription_action(admin_id: int, user_id: int, plan: str, days: int, page: int = 0) -> str:
     if admin_id not in ADMIN_IDS or user_id in ADMIN_IDS:
         raise PermissionError("Нельзя изменять подписку администратора")
-    if plan not in ("standart", "pro") or days not in (1, 7, 14, 30, 90, 180, 365):
+    if plan not in config.PAID_PLANS or days not in (1, 7, 14, 30, 90, 180, 365):
         raise ValueError("Неверный тариф или срок")
     token = secrets.token_hex(16)
     async with writer_connection() as db:

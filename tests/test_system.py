@@ -64,12 +64,12 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         # Апгрейд до Standart
         await database.grant_subscription(user_id, days=30, tariff_plan="standart")
         standart_radars = await database.get_user_max_radars(user_id)
-        self.assertEqual(standart_radars, 4)
+        self.assertEqual(standart_radars, 2)
 
         # Апгрейд до PRO
         await database.grant_subscription(user_id, days=30, tariff_plan="pro")
         pro_radars = await database.get_user_max_radars(user_id)
-        self.assertEqual(pro_radars, 9)
+        self.assertEqual(pro_radars, 4)
 
     def test_main_keyboard_tariffs(self):
         """Проверка наличия кнопки тарифов в главном меню."""

@@ -114,6 +114,41 @@ def get_main_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
+PLAN_ICONS = {"lite": "🟢", "standart": "🔵", "pro": "🔥"}
+
+
+def radars_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return f"{count} радар"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return f"{count} радара"
+    return f"{count} радаров"
+
+
+def plan_summary(plan: str) -> str:
+    """«🔵 Средний — 449 ⭐ / 30 дней» plus its limits, for tariff lists."""
+    return (
+        f"{PLAN_ICONS[plan]} <b>{config.plan_title(plan)}</b> — {config.stars_price(plan)} ⭐ / 30 дней\n"
+        f"    {radars_word(config.plan_radars(plan))}, проверка раз в {config.plan_interval(plan)} с"
+    )
+
+
+def access_status(user: dict, user_id: int) -> str:
+    """One-line access status shared by the start screen, the profile and the tariff menu."""
+    if config.is_admin(user_id):
+        return "Администратор"
+    sub_until = user.get("subscription_until")
+    is_allowed = bool(user.get("is_allowed"))
+    if sub_until and bool(user.get("trial_used")) and not is_allowed:
+        return f"Пробный период до {database.format_subscription_date(sub_until)}"
+    plan = config.plan_title(user.get("tariff_plan"))
+    if sub_until and is_allowed:
+        return f"Тариф «{plan}» до {database.format_subscription_date(sub_until)}"
+    if is_allowed:
+        return f"Тариф «{plan}», бессрочно"
+    return "Подписка не активна"
+
+
 @router.message(CommandStart())
 @router.callback_query(F.data == "start_approved")
 async def cmd_start(event, state: FSMContext):
@@ -131,36 +166,16 @@ async def cmd_start(event, state: FSMContext):
     first_name = user.first_name or "Пользователь"
 
     user_record = await database.get_or_create_user(user_id, username, first_name)
-    is_adm = config.is_admin(user_id)
-    sub_until = user_record.get("subscription_until")
-    trial_used = bool(user_record.get("trial_used"))
-    is_allowed = bool(user_record.get("is_allowed"))
-
-    if is_adm:
-        badge = "Администратор"
-    elif sub_until and trial_used and not is_allowed:
-        formatted_until = database.format_subscription_date(sub_until)
-        badge = f"Пробный доступ (до {formatted_until})"
-    elif sub_until and is_allowed:
-        plan_name = (user_record.get("tariff_plan") or "Standart").upper()
-        formatted_until = database.format_subscription_date(sub_until)
-        badge = f"Подписка {plan_name} (до {formatted_until})"
-    elif is_allowed:
-        badge = "Доступ активен"
-    else:
-        badge = "Подписка не активна"
+    badge = access_status(user_record, user_id)
 
     text = (
-        "<b>Avito Radar</b> — автоматизированный мониторинг объявлений\n"
+        "<b>Avito Radar</b> — новые объявления Авито прямо в Telegram\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Пользователь: <b>{html.escape(first_name)}</b>\n"
-        f"Статус: <b>{badge}</b>\n\n"
-        "Сервис непрерывно проверяет новые объявления на Авито по заданным параметрам "
-        "и отправляет подходящие лоты сразу после обнаружения.\n\n"
-        "<b>Как запустить мониторинг:</b>\n"
-        "1. Настройте поиск и фильтры на <code>avito.ru</code> в браузере.\n"
-        "2. Скопируйте ссылку и отправьте её в этот чат.\n\n"
-        "Для управления используйте кнопки меню ниже."
+        f"👋 <b>{html.escape(first_name)}</b> · {badge}\n\n"
+        "<b>Как начать:</b>\n"
+        "1. Откройте <code>avito.ru</code>, задайте поиск и фильтры.\n"
+        "2. Скопируйте ссылку из адресной строки и пришлите её сюда.\n\n"
+        "Бот будет проверять выдачу и присылать каждый новый лот."
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -202,31 +217,28 @@ async def cmd_help(event):
         message = event
 
     help_text = (
-        "<b>Инструкция по работе с сервисом Avito Radar</b>\n"
+        "<b>Как пользоваться Avito Radar</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>1. Добавление поискового радара</b>\n"
-        "• Откройте <code>avito.ru</code> в любом браузере.\n"
-        "• Задайте поисковый запрос и выставьте нужные фильтры (город, цену, состояние лота).\n"
-        "• Скопируйте ссылку из адресной строки и отправьте её боту в чат.\n"
-        "• Сортировку по дате бот применяет автоматически.\n\n"
-        "<b>2. Мгновенная доставка и догон после паузы (PRO)</b>\n"
-        "• Все радары опрашиваются с единым целевым интервалом 15–20 секунд.\n"
-        "• На тарифе PRO уведомления отправляются мгновенно (0.0 с задержки) с наивысшим приоритетом.\n"
-        "• После технических пауз пользователи PRO получают до 10 самых свежих объявлений моложе 30 минут с пометкой «🕒 найдено после паузы».\n\n"
-        "<b>3. Фильтрация и защита от спама</b>\n"
-        "• <b>Стоп-слова:</b> отсекают объявления с указанными словами (например, «запчасти», «реплика»).\n"
-        "• <b>Чёрный список:</b> блокировка продавцов и спам-магазинов в 1 клик под карточкой лота.\n"
-        "• <b>Область поиска:</b> переключение поиска строго в заголовках или в заголовке и описании.\n\n"
-        "<b>4. Тарифные планы</b>\n"
-        "• Всем новым пользователям доступен ознакомительный период (6 часов, 1 радар).\n"
-        f"• <b>Standart ({config.STARS_PRICE_STANDART} ⭐ / 30 дней):</b> до 4 радаров, фото лотов, фильтрация стоп-слов, чёрный список.\n"
-        f"• <b>PRO ({config.STARS_PRICE_PRO} ⭐ / 30 дней):</b> до 9 радаров, мгновенная доставка (0.0 с), догон свежих лотов после паузы.\n\n"
-        "Официальные регламенты и правила: /docs, /agreement, /privacy. Поддержка: /paysupport."
+        "<b>1. Добавьте радар</b>\n"
+        "• Откройте <code>avito.ru</code>, задайте запрос и фильтры: город, цену, состояние.\n"
+        "• Скопируйте ссылку из адресной строки и пришлите её боту.\n"
+        "• Сортировку по дате бот включит сам. Уже выложенные лоты не придут — только новые.\n\n"
+        "<b>2. Отсекайте лишнее</b>\n"
+        "• <b>Стоп-слова</b> — лоты с этими словами не придут («запчасти», «реплика»).\n"
+        "• <b>Чёрный список</b> — кнопка под лотом скрывает все объявления продавца.\n"
+        "• <b>Область поиска</b> — только заголовок или заголовок с описанием.\n\n"
+        "<b>3. Тарифы</b>\n"
+        f"• Пробный период: {config.TRIAL_RADARS} радар на 6 часов.\n"
+        f"{plan_summary('lite')}\n"
+        f"{plan_summary('standart')}\n"
+        f"{plan_summary('pro')}\n"
+        "• На «Полном» после технических пауз приходят до 10 свежих лотов, найденных за время паузы.\n\n"
+        "Документы: /docs. Поддержка: /support."
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="💳 Тарифы и подписка", callback_data="open_subscription_menu")
+            InlineKeyboardButton(text="💳 Тарифы", callback_data="open_subscription_menu")
         ],
         [
             InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
@@ -266,23 +278,8 @@ async def cmd_profile(event):
     is_adm = config.is_admin(user_id)
     sub_until = user.get("subscription_until")
     trial_used = bool(user.get("trial_used"))
-    is_allowed = bool(user.get("is_allowed"))
-
     max_radars = await database.get_user_max_radars(user_id)
-
-    if is_adm:
-        status_str = "Администратор (PRO)"
-    elif sub_until and trial_used and not is_allowed:
-        formatted_until = database.format_subscription_date(sub_until)
-        status_str = f"Пробный период (до {formatted_until})"
-    elif sub_until and is_allowed:
-        plan_name = (user.get("tariff_plan") or "Standart").upper()
-        formatted_until = database.format_subscription_date(sub_until)
-        status_str = f"Подписка {plan_name} (до {formatted_until})"
-    elif is_allowed:
-        status_str = "Доступ активен"
-    else:
-        status_str = "Подписка не активна"
+    scan_interval = config.plan_interval(database.classify_user_tariff(user)[0])
 
     from scheduler import get_last_scan_info
     scan_info = get_last_scan_info()
@@ -290,38 +287,30 @@ async def cmd_profile(event):
     blocked_count = len(blocked_sellers_list)
 
     text = (
-        "<b>Личный кабинет</b>\n"
+        "<b>Мой профиль</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>ID аккаунта:</b> <code>{user_id}</code>\n"
-        f"• <b>Тарифный статус:</b> {status_str}\n"
-        f"• <b>Радары:</b> {active_count} активных из {searches_count} (лимит: {max_radars})\n"
+        f"• <b>Доступ:</b> {access_status(user, user_id)}\n"
+        f"• <b>Радары:</b> {active_count} активных, всего {searches_count} из {max_radars}\n"
+        f"• <b>Проверка:</b> раз в {scan_interval} с\n"
         f"• <b>Чёрный список:</b> {blocked_count} продавцов\n"
-        f"• <b>Состояние мониторинга:</b> {scan_info}\n"
+        f"• <b>Мониторинг:</b> {scan_info}\n"
+        f"• <b>ID:</b> <code>{user_id}</code>\n"
     )
 
     buttons = []
     if not is_adm and not sub_until and not trial_used:
-        buttons.append([InlineKeyboardButton(text="Активировать пробный период 6 часов", callback_data="activate_trial_btn")])
-
-    if is_adm:
-        sub_btn_text = "Тарифные планы"
-    elif sub_until:
-        sub_btn_text = "Продлить / сменить тариф"
-    else:
-        sub_btn_text = "💳 Выбрать тариф"
-    buttons.append([InlineKeyboardButton(text=sub_btn_text, callback_data="open_subscription_menu")])
+        buttons.append([InlineKeyboardButton(text="🎁 Пробный период 6 часов", callback_data="activate_trial_btn")])
+    if not is_adm:
+        sub_btn_text = "💳 Продлить или сменить тариф" if sub_until or user.get("is_allowed") else "💳 Выбрать тариф"
+        buttons.append([InlineKeyboardButton(text=sub_btn_text, callback_data="open_subscription_menu")])
 
     buttons.append([
-        InlineKeyboardButton(text="🎯 Добавить радар", callback_data="add_search_prompt"),
-        InlineKeyboardButton(text=f"📁 Мои радары ({searches_count})", callback_data="list_searches")
+        InlineKeyboardButton(text=f"📁 Мои радары ({searches_count})", callback_data="list_searches"),
+        InlineKeyboardButton(text=f"🚷 Чёрный список ({blocked_count})", callback_data="manage_blacklist")
     ])
     buttons.append([
-        InlineKeyboardButton(text=f"Чёрный список ({blocked_count})", callback_data="manage_blacklist"),
-        InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_profile")
-    ])
-    buttons.append([
-        InlineKeyboardButton(text="📄 Документы", callback_data="open_docs_menu"),
-        InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_profile"),
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -362,60 +351,37 @@ async def cmd_subscription_menu(event):
 
     user = await database.get_or_create_user(user_id)
     is_adm = config.is_admin(user_id)
-    sub_until = user.get("subscription_until")
-    trial_used = bool(user.get("trial_used"))
-    is_allowed = bool(user.get("is_allowed"))
-
-    if is_adm:
-        status_line = f"<b>Текущий статус:</b> Администратор (лимит: {await database.get_user_max_radars(user_id)} радаров)"
-    elif sub_until and trial_used and not is_allowed:
-        formatted_until = database.format_subscription_date(sub_until)
-        status_line = f"<b>Текущий статус:</b> Пробный доступ (до {formatted_until})"
-    elif sub_until and is_allowed:
-        plan_name = (user.get("tariff_plan") or "Standart").upper()
-        formatted_until = database.format_subscription_date(sub_until)
-        status_line = f"<b>Текущий статус:</b> Подписка {plan_name} (до {formatted_until})"
-    elif is_allowed:
-        status_line = "<b>Текущий статус:</b> Доступ активен"
-    else:
-        status_line = "<b>Текущий статус:</b> Подписка не активна. Выберите тариф для продления:"
+    current = (user.get("tariff_plan") or "").lower() if user.get("is_allowed") else ""
 
     text = (
-        "<b>Тарифные планы · Avito Radar</b>\n"
+        "<b>Тарифы Avito Radar</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{status_line}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Standart:</b> {config.STARS_PRICE_STANDART} ⭐ / 30 дней\n"
-        "  До 4 радаров, фото лотов, фильтрация стоп-слов, чёрный список продавцов.\n\n"
-        f"• <b>PRO:</b> {config.STARS_PRICE_PRO} ⭐ / 30 дней\n"
-        "  До 9 радаров, мгновенная доставка (0.0 с), догон свежих лотов после паузы (до 30 мин), приоритетная очередь, поиск в заголовках.\n\n"
-        "Оплата производится через Telegram Stars. Разовая подписка на 30 дней без автоматических списаний.\n\n"
-        f"{'Приём платежей включён.' if config.STARS_PAYMENTS_ENABLED else 'Приём платежей временно выключен.'}\n\n"
-        "<i>Выберите интересующий тариф для просмотра параметров:</i>"
+        f"Сейчас: <b>{access_status(user, user_id)}</b>\n\n"
+        f"{plan_summary('lite')}\n\n"
+        f"{plan_summary('standart')}\n\n"
+        f"{plan_summary('pro')}\n"
+        "    + догон свежих лотов после технических пауз\n\n"
+        "Чем чаще проверка, тем раньше вы увидите лот и успеете позвонить первым.\n"
+        "Оплата — Telegram Stars, разово на 30 дней, без автосписаний. "
+        "Оплаченные дни суммируются с текущим сроком."
     )
+    if not config.STARS_PAYMENTS_ENABLED:
+        text += "\n\n⏸ Приём оплаты временно выключен."
 
     buttons = []
-    if not is_adm and not sub_until and not trial_used:
-        buttons.append([
-            InlineKeyboardButton(text="Активировать пробный период 6 часов", callback_data="activate_trial_btn")
-        ])
-
+    if not is_adm and not user.get("subscription_until") and not user.get("trial_used"):
+        buttons.append([InlineKeyboardButton(text="🎁 Пробный период 6 часов", callback_data="activate_trial_btn")])
+    for plan in config.PAID_PLANS:
+        mark = " · ваш" if plan == current else ""
+        buttons.append([InlineKeyboardButton(
+            text=f"{PLAN_ICONS[plan]} {config.plan_title(plan)} — {config.stars_price(plan)} ⭐{mark}",
+            callback_data=f"buy_tariff:{plan}",
+        )])
     buttons.append([
-        InlineKeyboardButton(text=f"Standart — {config.STARS_PRICE_STANDART} ⭐ / 30 дней", callback_data="buy_tariff:standart")
+        InlineKeyboardButton(text="📄 Условия", callback_data="payment_terms"),
+        InlineKeyboardButton(text="💬 Вопрос по оплате", callback_data="payment_support")
     ])
-    buttons.append([
-        InlineKeyboardButton(text=f"PRO — {config.STARS_PRICE_PRO} ⭐ / 30 дней", callback_data="buy_tariff:pro")
-    ])
-    buttons.append([
-        InlineKeyboardButton(text="💳 Другие способы оплаты", callback_data="other_payment_methods")
-    ])
-    buttons.append([
-        InlineKeyboardButton(text="📄 Документы", callback_data="open_docs_menu"),
-        InlineKeyboardButton(text="💬 Поддержка", callback_data="support_start_ticket")
-    ])
-    buttons.append([
-        InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
-    ])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="start_approved")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     if isinstance(event, CallbackQuery):
@@ -428,82 +394,49 @@ async def cmd_subscription_menu(event):
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
+PLAN_PERKS = {
+    "lite": "Для личного поиска: квартира, техника, вещь для себя.",
+    "standart": "Для активного поиска и перепродажи в небольших городах.",
+    "pro": "Для перепродажи в больших городах и конкурентных категориях. "
+           "После технических пауз присылает до 10 свежих лотов, найденных за паузу.",
+}
+
+
 @router.callback_query(F.data.startswith("buy_tariff:"))
 async def cb_select_tariff(call: CallbackQuery):
     tariff_key = call.data.split(":")[1]
-    if tariff_key not in ("standart", "pro", "test"):
-        await call.answer("Неизвестный тариф", show_alert=True)
+    if tariff_key not in (*config.PAID_PLANS, "test"):
+        # Old buttons (removed tariffs) lead back to the current tariff list.
+        await cmd_subscription_menu(call)
         return
-    tariffs = {
-        "test": {
-            "name": "Тестовый доступ",
-            "radars": 4,
-            "price": f"{config.STARS_PRICE_TEST} ⭐ / 1 день",
-            "price_num": f"{config.STARS_PRICE_TEST} ⭐",
-            "perks": (
-                "• Тестовый доступ на 1 день для проверки сервиса\n"
-                "• До 4 активных радаров одновременно\n"
-                "• Опрос каждые 15–20 сек., оповещения с ценой и ссылкой"
-            )
-        },
-        "standart": {
-            "name": "Standart",
-            "radars": 4,
-            "price": f"{config.STARS_PRICE_STANDART} ⭐ / 30 дней",
-            "price_num": f"{config.STARS_PRICE_STANDART} ⭐",
-            "perks": (
-                "• До 4 активных радаров одновременно\n"
-                f"• Целевой интервал опроса: {int(config.SCAN_INTERVAL_MIN)}–{int(config.SCAN_INTERVAL_MAX)} сек.\n"
-                "• Оповещения с фото, ценой и ссылкой\n"
-                "• Фильтрация по стоп-словам\n"
-                "• Чёрный список продавцов"
-            )
-        },
-        "pro": {
-            "name": "PRO Мониторинг",
-            "radars": 9,
-            "price": f"{config.STARS_PRICE_PRO} ⭐ / 30 дней",
-            "price_num": f"{config.STARS_PRICE_PRO} ⭐",
-            "perks": (
-                "• До 9 активных радаров одновременно\n"
-                "• Мгновенная доставка уведомлений без задержки (0.0 с)\n"
-                "• Авто-догон до 10 свежих лотов (моложе 30 мин) после паузы\n"
-                "• Точный поиск строго в названиях\n"
-                "• Оповещения с фото, фильтрация стоп-слов и чёрный список"
-            )
-        }
-    }
-    selected = tariffs.get(tariff_key, tariffs["standart"])
-    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Выбор тарифа", f"Тариф {selected['name']} ({selected['price']})", status="INFO")
+    title = config.plan_title(tariff_key)
+    price = config.stars_price(tariff_key)
+    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Выбор тарифа", f"Тариф {title} ({price} ⭐)", status="INFO")
 
+    # "test" is a hidden 1-day plan for checking Stars checkout end to end; it grants the Средний tariff.
+    plan = "standart" if tariff_key == "test" else tariff_key
     text = (
-        f"<b>Тарифный план: {selected['name']}</b>\n"
+        f"{PLAN_ICONS[plan]} <b>Тариф «{title}»</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Лимит радаров:</b> до {selected['radars']} одновременно\n"
-        f"• <b>Стоимость:</b> {selected['price']}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>Параметры тарифа:</b>\n"
-        f"{selected['perks']}\n\n"
-        "Разовая оплата на 30 дней без автосписаний. Доступ активируется сразу после подтверждения транзакции. "
-        "Условия обслуживания: /terms | Поддержка и возврат: /paysupport"
+        f"• Радаров: <b>до {config.plan_radars(plan)}</b>\n"
+        f"• Проверка каждого радара: <b>раз в {config.plan_interval(plan)} с</b>\n"
+        "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n"
+        f"• Цена: <b>{price} ⭐</b> за {'1 день' if tariff_key == 'test' else '30 дней'}\n\n"
+        f"{PLAN_PERKS[plan]}\n\n"
+        "Разовая оплата без автосписаний, доступ включается сразу после оплаты. "
+        "Нажимая «Оплатить», вы соглашаетесь с /terms."
     )
 
-    nav_buttons = [
-        InlineKeyboardButton(text="« Назад к тарифам", callback_data="open_subscription_menu"),
-        InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_approved")
-    ]
     buttons = []
     if config.STARS_PAYMENTS_ENABLED:
-        buttons.append([InlineKeyboardButton(text=f"Согласен с условиями — оплатить {selected['price_num']}",
-                                             callback_data=f"stars_buy:{tariff_key}:{config.stars_price(tariff_key)}")])
+        buttons.append([InlineKeyboardButton(text=f"⭐ Оплатить {price} Stars",
+                                             callback_data=f"stars_buy:{tariff_key}:{price}")])
     else:
-        text += "\n\nПриём платежей временно выключен."
+        text += "\n\n⏸ Приём оплаты временно выключен. Напишите в поддержку, если нужен доступ."
     buttons.append([
-        InlineKeyboardButton(text="💳 Другие способы оплаты", callback_data="other_payment_methods")
+        InlineKeyboardButton(text="« Все тарифы", callback_data="open_subscription_menu"),
+        InlineKeyboardButton(text="💬 Вопрос по оплате", callback_data="payment_support")
     ])
-    buttons.append([InlineKeyboardButton(text="📄 Условия подписки", callback_data="payment_terms"),
-                    InlineKeyboardButton(text="💬 Платёжная поддержка", callback_data="payment_support")])
-    buttons.append(nav_buttons)
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     try:
@@ -515,25 +448,8 @@ async def cb_select_tariff(call: CallbackQuery):
 
 @router.callback_query(F.data == "other_payment_methods")
 async def cb_other_payment_methods(call: CallbackQuery):
-    text = (
-        "<b>ДРУГИЕ СПОСОБЫ ОПЛАТЫ</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Основной автоматический способ оплаты — <b>Telegram Stars</b> (моментальное зачисление).\n\n"
-        "Для оплаты банковскими картами, через СБП или для юридических лиц доступно выставление счёта через поддержку. "
-        "Служба поддержки поможет с подбором параметров и индивидуальной настройки доступа.\n\n"
-        "• Официальный email: <b>bernardgofov@gmail.com</b>\n"
-        "• Написать в поддержку: кнопка ниже."
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Оплатить через Telegram Stars", callback_data="open_subscription_menu")],
-        [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="support_start_ticket")],
-        [InlineKeyboardButton(text="« Назад к тарифам", callback_data="open_subscription_menu")]
-    ])
-    try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
+    # The separate "other payment methods" screen is gone; old buttons open the tariff list.
+    await cmd_subscription_menu(call)
 
 
 # ── Документы и регламенты ─────────────────────────────────────────────

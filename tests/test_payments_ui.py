@@ -56,25 +56,25 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         with patch.object(config, "STARS_PAYMENTS_ENABLED", False):
             await self.dispatch_message(text="/tariffs")
             text = self.methods("SendMessage")[-1].text
-            self.assertIn("170 ⭐", text)
-            self.assertIn("470 ⭐", text)
+            self.assertIn("449 ⭐", text)
+            self.assertIn("899 ⭐", text)
             self.assertNotIn("₽", text)
             await self.dispatch_callback("buy_tariff:pro")
             self.assertFalse(any(v and v.startswith("stars_buy:") for v in self.callback_values()))
-            await self.dispatch_callback("stars_buy:pro:470")
+            await self.dispatch_callback("stars_buy:pro:899")
             self.assertEqual(self.methods("SendInvoice"), [])
             self.assertIn("выключен", self.methods("AnswerCallbackQuery")[-1].text)
 
     async def test_invoice_is_one_xtr_price_without_provider_or_autobilling(self):
         before = await database.get_user(self.user_id)
         await self.dispatch_callback("buy_tariff:pro")
-        self.assertIn("stars_buy:pro:470", self.callback_values())
-        await self.dispatch_callback("stars_buy:pro:470")
+        self.assertIn("stars_buy:pro:899", self.callback_values())
+        await self.dispatch_callback("stars_buy:pro:899")
         invoice = self.methods("SendInvoice")[-1]
         self.assertEqual(invoice.currency, "XTR")
         self.assertEqual(invoice.provider_token, "")
         self.assertEqual(invoice.chat_id, self.user_id)
-        self.assertEqual([p.amount for p in invoice.prices], [470])
+        self.assertEqual([p.amount for p in invoice.prices], [899])
         self.assertLessEqual(len(invoice.payload.encode()), 128)
         self.assertTrue(invoice.start_parameter)
         self.assertNotIn("subscription_period", invoice.model_dump())
@@ -90,8 +90,8 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn("ТЕСТ", invoice.title)
 
     async def test_stale_price_foreign_chat_and_invalid_plan_never_send_invoice(self):
-        for value, chat_id in (("stars_buy:pro:1", self.user_id), ("stars_buy:fake:170", self.user_id),
-                               ("stars_buy:pro", self.user_id), ("stars_buy:pro:470", 654321)):
+        for value, chat_id in (("stars_buy:pro:1", self.user_id), ("stars_buy:fake:449", self.user_id),
+                               ("stars_buy:pro", self.user_id), ("stars_buy:pro:899", 654321)):
             await self.dispatch_callback(value, chat_id=chat_id)
             self.assertTrue(self.methods("AnswerCallbackQuery")[-1].show_alert)
         self.assertEqual(self.methods("SendInvoice"), [])
@@ -106,17 +106,19 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.methods("SendInvoice"), [])
         self.assertEqual(self.methods("SendMessage"), [])
 
-    async def test_other_payment_methods_button_and_screen(self):
+    async def test_tariff_list_has_three_plans_and_old_other_methods_button_opens_it(self):
         await self.dispatch_callback("open_subscription_menu")
-        self.assertIn("other_payment_methods", self.callback_values())
-        await self.dispatch_callback("buy_tariff:standart")
-        self.assertIn("other_payment_methods", self.callback_values())
-        await self.dispatch_callback("other_payment_methods")
+        values = self.callback_values()
+        for plan in ("lite", "standart", "pro"):
+            self.assertIn(f"buy_tariff:{plan}", values)
+        self.assertNotIn("other_payment_methods", values)
         text = self.methods("EditMessageText")[-1].text
-        self.assertIn("ДРУГИЕ СПОСОБЫ ОПЛАТЫ", text)
-        self.assertIn("Telegram Stars", text)
-        self.assertIn("настройки", text)
-        self.assertIn("open_subscription_menu", self.callback_values())
+        for title in ("Базовый", "Средний", "Полный", "199 ⭐", "449 ⭐", "899 ⭐"):
+            self.assertIn(title, text)
+        await self.dispatch_callback("buy_tariff:standart")
+        self.assertNotIn("other_payment_methods", self.callback_values())
+        await self.dispatch_callback("other_payment_methods")
+        self.assertIn("buy_tariff:pro", self.callback_values())
 
     async def test_precheckout_can_reject_invalid_amount_then_approve_without_access(self):
         order = await billing.create_order(self.user_id, "standart")
@@ -133,7 +135,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await state.set_state("SupportStates:waiting_for_user_message")
         await self.dispatch_message(successful_payment=self.successful(order))
         self.assertTrue(await database.is_user_allowed(self.user_id))
-        self.assertEqual(await database.get_user_max_radars(self.user_id), 4)
+        self.assertEqual(await database.get_user_max_radars(self.user_id), 2)
         after = await database.get_user(self.user_id)
         await self.dispatch_message(successful_payment=self.successful(order))
         self.assertEqual(await database.get_user(self.user_id), after)
@@ -191,7 +193,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_refunded_message_is_handled_even_when_payments_disabled(self):
         order = await self.paid_order()
-        refund = RefundedPayment(currency="XTR", total_amount=170, invoice_payload=order["payload"], telegram_payment_charge_id="fixture-charge")
+        refund = RefundedPayment(currency="XTR", total_amount=449, invoice_payload=order["payload"], telegram_payment_charge_id="fixture-charge")
         with patch.object(config, "STARS_PAYMENTS_ENABLED", False):
             await self.dispatch_message(refunded_payment=refund)
             self.assertFalse(await database.is_user_allowed(self.user_id))
@@ -216,7 +218,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await database.get_user(self.user_id), before)
         self.assertEqual((await billing.get_order(order_id=order["id"]))["status"], "refunding")
         self.session.failures.clear()
-        refund = RefundedPayment(currency="XTR", total_amount=170, invoice_payload=order["payload"], telegram_payment_charge_id="fixture-charge")
+        refund = RefundedPayment(currency="XTR", total_amount=449, invoice_payload=order["payload"], telegram_payment_charge_id="fixture-charge")
         await self.dispatch_message(refunded_payment=refund)
         self.assertFalse(await database.is_user_allowed(self.user_id))
 
@@ -230,7 +232,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_invoice_network_failure_cannot_grant_access(self):
         self.session.failures["SendInvoice"] = TelegramNetworkError(method=SendMessage(chat_id=self.user_id, text="fixture"), message="offline")
-        await self.dispatch_callback("stars_buy:standart:170")
+        await self.dispatch_callback("stars_buy:standart:449")
         self.assertFalse(await database.is_user_allowed(self.user_id))
         self.assertIn("Деньги не списаны", self.methods("SendMessage")[-1].text)
 

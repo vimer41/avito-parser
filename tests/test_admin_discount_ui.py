@@ -40,7 +40,7 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_message(text="/tariffs", user_id=self.user_id)
         tariff_text = self.methods("SendMessage")[-1].text
         self.assertNotIn("Price Drop", tariff_text)
-        self.assertIn("0.0", tariff_text)
+        self.assertIn("раз в 20 с", tariff_text)
 
         await self.dispatch_callback(f"view_search:{self.radar_id}", self.user_id)
         callbacks = self.callback_values()

@@ -28,7 +28,7 @@ async def cb_admin_probe(call: CallbackQuery):
     await call.message.answer(
         "✅ <b>Проверка реального запроса Telegram пройдена.</b>\n"
         f"Stars: {'включены' if config.STARS_PAYMENTS_ENABLED else 'выключены'}, "
-        f"Standart {config.STARS_PRICE_STANDART} ⭐ / PRO {config.STARS_PRICE_PRO} ⭐.\n"
+        f"Базовый {config.STARS_PRICE_LITE} ⭐ / Средний {config.STARS_PRICE_STANDART} ⭐ / Полный {config.STARS_PRICE_PRO} ⭐.\n"
         "Для проверки покупки нужен неадминистративный аккаунт: у администратора доступ бесплатный.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_refresh")],
@@ -132,7 +132,7 @@ async def cb_admin_grant_sub(call: CallbackQuery):
         return
     await call.message.edit_text(
         f"💳 <b>ПОДТВЕРЖДЕНИЕ ВЫДАЧИ ПОДПИСКИ</b>\n\n"
-        f"Пользователь: <code>{target_user_id}</code>\nТариф: <b>{plan.upper()}</b>\nДобавить: <b>{days} дн.</b>\n\n"
+        f"Пользователь: <code>{target_user_id}</code>\nТариф: <b>{config.plan_title(plan)}</b>\nДобавить: <b>{days} дн.</b>\n\n"
         "Срок добавится к текущей подписке или триалу; выбранный тариф применяется сразу. "
         "Это ручная выдача доступа, а не подтверждение оплаты Stars.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -161,7 +161,7 @@ async def cb_admin_confirm_sub(call: CallbackQuery, bot: Bot):
     max_radars = await database.get_user_max_radars(target_user_id)
     formatted_until = database.format_subscription_date(until)
 
-    plan_title = "🔥 PRO" if plan == "pro" else "⚡️ STANDART"
+    plan_title = f"«{config.plan_title(plan)}»"
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} выдал подписку {plan_title} на {days} дн. пользователю ID:{target_user_id}")
 
     await call.message.edit_text(
@@ -206,7 +206,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
         return None, None
     has_access = await database.is_user_allowed(target_id)
     until = database.format_subscription_date(user.get("subscription_until"))
-    plan_name = (user.get("tariff_plan") or "standart").upper()
+    plan_name = config.plan_title(user.get("tariff_plan"))
     trial_used = bool(user.get("trial_used"))
     is_allowed = bool(user.get("is_allowed"))
 
@@ -218,7 +218,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
     blocked_count = len(await database.get_user_blocked_sellers_list(target_id))
 
     if has_access and not is_allowed and trial_used:
-        status_line = "🎁 <b>Бесплатный триал (5 ч)</b>"
+        status_line = "🎁 <b>Бесплатный триал (6 ч)</b>"
     elif has_access and is_allowed and user.get("subscription_until"):
         status_line = f"🟢 <b>{plan_name} Подписка</b>"
     elif has_access and is_allowed:
@@ -265,7 +265,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
 
     buttons = [
         [InlineKeyboardButton(text="💳 Выдать / продлить → выбрать тариф", callback_data=f"admin_sub_menu:{target_id}:{page}")],
-        [InlineKeyboardButton(text="🎁 Выдать / обновить триал (5 ч)", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
+        [InlineKeyboardButton(text="🎁 Выдать / обновить триал (6 ч)", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
         [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}"),
          InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
         limit_row,
@@ -317,7 +317,7 @@ async def cb_admin_user(call: CallbackQuery):
         target_id = int(parts[1])
         plan = parts[2] if parts[0] == "admin_sub_days" else None
         page = max(0, int(parts[3] if plan is not None else parts[2]))
-        if plan is not None and plan not in ("standart", "pro"):
+        if plan is not None and plan not in config.PAID_PLANS:
             raise ValueError("Неизвестный тариф")
     except (ValueError, IndexError):
         await call.answer("Некорректная кнопка пользователя", show_alert=True)
@@ -343,20 +343,24 @@ async def cb_admin_user(call: CallbackQuery):
     has_access = await database.is_user_allowed(target_id)
     text = (f"👤 <b>{html.escape(user.get('first_name') or 'Пользователь')}</b>\n"
             f"🆔 ID: <code>{target_id}</code>\n"
-            f"📦 Тариф: <b>{(user.get('tariff_plan') or 'standart').upper()}</b>\n"
+            f"📦 Тариф: <b>{config.plan_title(user.get('tariff_plan'))}</b>\n"
             f"🔑 Доступ: {'активен' if has_access else 'истёк / отозван'}\n📅 Срок: {until}\n\n")
 
     if parts[0] == "admin_sub_menu":
         text += "<b>Выберите тариф для выдачи / продления:</b>"
         buttons = [
-            [InlineKeyboardButton(text="⚡️ Standart · 4 радара", callback_data=f"admin_sub_days:{target_id}:standart:{page}")],
-            [InlineKeyboardButton(text="🔥 PRO · 9 радаров и скидки", callback_data=f"admin_sub_days:{target_id}:pro:{page}")],
-            [InlineKeyboardButton(text="👑 Бессрочный Standart (VIP)", callback_data=f"admin_grant_vip_prompt:{target_id}:standart:{page}")],
-            [InlineKeyboardButton(text="👑 Бессрочный PRO (VIP)", callback_data=f"admin_grant_vip_prompt:{target_id}:pro:{page}")],
+            *[[InlineKeyboardButton(
+                text=f"{config.plan_title(p)} · {config.plan_radars(p)} рад. · раз в {config.plan_interval(p)} с",
+                callback_data=f"admin_sub_days:{target_id}:{p}:{page}",
+            )] for p in config.PAID_PLANS],
+            *[[InlineKeyboardButton(
+                text=f"👑 Бессрочный «{config.plan_title(p)}» (VIP)",
+                callback_data=f"admin_grant_vip_prompt:{target_id}:{p}:{page}",
+            )] for p in config.PAID_PLANS],
             [InlineKeyboardButton(text="« Назад в карточку", callback_data=f"admin_user:{target_id}:{page}")]
         ]
     elif parts[0] == "admin_sub_days":
-        text += f"<b>Добавить срок на тарифе {plan.upper()}:</b>"
+        text += f"<b>Добавить срок на тарифе «{config.plan_title(plan)}»:</b>"
         buttons = [
             [InlineKeyboardButton(text=f"➕ {days} дн.", callback_data=f"admin_grant_sub:{target_id}:{plan}:{days}:{page}") for days in (1, 7, 14)],
             [InlineKeyboardButton(text=f"➕ {days} дн.", callback_data=f"admin_grant_sub:{target_id}:{plan}:{days}:{page}") for days in (30, 90, 365)],
@@ -373,7 +377,7 @@ async def cb_admin_grant_vip_prompt(call: CallbackQuery):
         return
     parts = call.data.split(":")
     target_id, plan, page = int(parts[1]), parts[2], int(parts[3])
-    plan_title = "🔥 PRO" if plan == "pro" else "⚡️ STANDART"
+    plan_title = f"«{config.plan_title(plan)}»"
     text = (
         f"👑 <b>ВЫДАЧА БЕССРОЧНОГО VIP-ДОСТУПА</b>\n\n"
         f"Пользователь: <code>{target_id}</code>\n"
@@ -398,7 +402,7 @@ async def cb_admin_confirm_vip(call: CallbackQuery, bot: Bot):
     target_id, plan, page = int(parts[1]), parts[2], int(parts[3])
     await database.grant_vip_access(target_id, plan)
     max_radars = await database.get_user_max_radars(target_id)
-    plan_title = "🔥 PRO" if plan == "pro" else "⚡️ STANDART"
+    plan_title = f"«{config.plan_title(plan)}»"
 
     logger.info("👑 [АДМИН] Администратор ID:%s выдал бессрочный VIP (%s) пользователю ID:%s", call.from_user.id, plan_title, target_id)
 
@@ -441,7 +445,7 @@ async def cb_admin_reset_trial_prompt(call: CallbackQuery):
     text = (
         f"🎁 <b>АКТИВАЦИЯ ТРИАЛА (6 ЧАСОВ)</b>\n\n"
         f"Пользователь: <code>{target_id}</code>\n\n"
-        "Пользователю будет выдан бесплатный пробный доступ на <b>6 часов</b> (1 радар, Standart). "
+        f"Пользователю будет выдан бесплатный пробный доступ на <b>6 часов</b> (1 радар, проверка раз в {config.plan_interval('base')} с). "
         "Пользователь получит мгновенное уведомление в чат."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -474,7 +478,7 @@ async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
             text=(
                 f"🎁 <b>Администратор активировал вам бесплатный пробный период на 6 часов!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 Доступен: <b>1 активный радар</b> (Standart)\n"
+                f"🎯 Доступен: <b>1 радар</b>\n"
                 f"📅 Срок действия: <b>{until}</b> (6 ч.)\n\n"
                 f"Отправьте ссылку на поиск с Авито прямо в чат или нажмите кнопку ниже:"
             ),
@@ -693,7 +697,7 @@ async def cmd_admin_panel(event, page: int = 0):
         elif await database.is_user_allowed(u_id):
             trial = not u.get("is_allowed") and u.get("trial_used")
             icon = "🎁" if trial else "🟢"
-            status = "триал" if trial else (u.get("tariff_plan") or "standart").upper()
+            status = "триал" if trial else config.plan_title(u.get("tariff_plan"))
             until = _short_until(u.get("subscription_until"))
             status = f"{status} {until}".strip()
         else:
@@ -1136,7 +1140,7 @@ async def do_admin_user_search(message: Message, query: str, state: FSMContext):
         u_id = u["user_id"]
         uname = f"@{u['username']}" if u.get("username") else f"ID: {u_id}"
         fname = html.escape(u.get("first_name") or "Без имени")
-        plan = (u.get("tariff_plan") or "standart").upper()
+        plan = config.plan_title(u.get("tariff_plan"))
         has_access = await database.is_user_allowed(u_id)
         status_icon = "🟢" if has_access else "🔴"
         text += f"{idx}. {status_icon} <b>{fname}</b> ({uname}) — <i>[{plan}]</i> [ID: <code>{u_id}</code>]\n"

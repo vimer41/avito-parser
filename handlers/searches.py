@@ -271,7 +271,8 @@ async def process_avito_url(message: Message, state: FSMContext):
         )
         await message.answer(
             f"⚠️ <b>Достигнут лимит активных радаров ({max_radars})!</b>\n\n"
-            "Вы можете освободить место в меню <b>📁 Мои радары</b> или расширить лимит до 4 или 9 радаров в меню <b>💳 Тарифы</b>.",
+            "Удалите ненужный радар в <b>📁 Мои радары</b> или перейдите на тариф с большим лимитом "
+            f"(Средний — {config.plan_radars('standart')}, Полный — {config.plan_radars('pro')} радара).",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [limit_button],
                 [InlineKeyboardButton(text="📁 Мои радары", callback_data="list_searches")]
@@ -335,6 +336,8 @@ async def process_avito_url(message: Message, state: FSMContext):
     await state.clear()
 
     clean_title = html.escape(search_title)
+    owner = await database.get_user(user_id) or {"user_id": user_id}
+    scan_interval = config.plan_interval(database.classify_user_tariff(owner)[0])
     scope_icon = "🏷 Только в названиях" if is_title_only else "📄 Название + описание"
     scope_btn = "🔍 Выборка: Только в названиях 🏷" if is_title_only else "🔍 Выборка: Название + описание 📄"
     existing_line = (
@@ -348,8 +351,8 @@ async def process_avito_url(message: Message, state: FSMContext):
         f"├ 🔍 <b>Область выборки:</b> <b>{scope_icon}</b>\n"
         f"{existing_line}"
         f"├ 📡 <b>Статус:</b> 🟢 Мониторинг 24/7 активен\n"
-        f"└ ⚡️ <b>Целевой интервал опроса:</b> {int(config.SCAN_INTERVAL_MIN)}–{int(config.SCAN_INTERVAL_MAX)} сек.\n\n"
-        "<i>При обнаружении нового лота бот сразу отправит уведомление с ценой, ссылкой и фото (для тарифов Standart и PRO).</i>"
+        f"└ ⚡️ <b>Проверка:</b> раз в {scan_interval} сек.\n\n"
+        "<i>Новый лот придёт сюда сразу после обнаружения: цена, продавец и ссылка.</i>"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[

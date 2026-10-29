@@ -79,7 +79,8 @@ def main():
     args = parser.parse_args()
     import config
     print("Safe configuration:", json.dumps({"stars_enabled": config.STARS_PAYMENTS_ENABLED,
-                                             "standart": config.STARS_PRICE_STANDART, "pro": config.STARS_PRICE_PRO,
+                                             "lite": config.STARS_PRICE_LITE, "standart": config.STARS_PRICE_STANDART,
+                                             "pro": config.STARS_PRICE_PRO,
                                              "check_interval": config.CHECK_INTERVAL, "workers": config.MAX_CONCURRENT_WORKERS,
                                              "admin_radar_limit": config.MAX_SEARCHES_PER_USER,
                                              "proxy_configured": bool(config.PROXY_URL)}))

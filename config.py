@@ -125,13 +125,30 @@ AVITO_MAX_REQUESTS_PER_SCAN = positive_int_setting("AVITO_MAX_REQUESTS_PER_SCAN"
 AVITO_MAX_PAGES_PER_SCAN = min(5, positive_int_setting("AVITO_MAX_PAGES_PER_SCAN", "2"))
 
 # --- Доставка и outbox ---
+# Tariffs differ by scan interval (TARIFF_SCAN_INTERVAL), so found lots go out without an artificial delay.
 TARIFF_DELAY_PRO = non_negative_float_setting("TARIFF_DELAY_PRO", "0.0")
-TARIFF_DELAY_STANDART = non_negative_float_setting("TARIFF_DELAY_STANDART", "1.0")
-TARIFF_DELAY_BASE = non_negative_float_setting("TARIFF_DELAY_BASE", "1.5")
+TARIFF_DELAY_STANDART = non_negative_float_setting("TARIFF_DELAY_STANDART", "0.0")
+TARIFF_DELAY_LITE = non_negative_float_setting("TARIFF_DELAY_LITE", "0.0")
+TARIFF_DELAY_BASE = non_negative_float_setting("TARIFF_DELAY_BASE", "0.0")
 TARIFF_DELIVERY_DELAY: dict[str, float] = {
     "pro": TARIFF_DELAY_PRO,
     "standart": TARIFF_DELAY_STANDART,
+    "lite": TARIFF_DELAY_LITE,
     "base": TARIFF_DELAY_BASE,
+}
+
+# --- Тарифы ---
+# Internal keys stay as stored in the DB and old orders: lite = «Базовый», standart = «Средний», pro = «Полный».
+# "base" is the trial / unpaid classification. A URL watched by several tariffs is scanned at the fastest one.
+PAID_PLANS: tuple[str, ...] = ("lite", "standart", "pro")
+PLAN_TITLES: dict[str, str] = {"lite": "Базовый", "standart": "Средний", "pro": "Полный", "test": "Тест", "base": "Пробный"}
+PLAN_RADARS: dict[str, int] = {"lite": 1, "standart": 2, "pro": 4}
+TRIAL_RADARS = 1
+TARIFF_SCAN_INTERVAL: dict[str, float] = {
+    "pro": positive_float_setting("TARIFF_INTERVAL_PRO", "20"),
+    "standart": positive_float_setting("TARIFF_INTERVAL_STANDART", "30"),
+    "lite": positive_float_setting("TARIFF_INTERVAL_LITE", "40"),
+    "base": positive_float_setting("TARIFF_INTERVAL_TRIAL", "30"),
 }
 
 NOTIFICATION_WORKERS = positive_int_setting("NOTIFICATION_WORKERS", "10")
@@ -254,24 +271,40 @@ validate_runtime_config()
 
 # Stars — единственный способ оплаты цифровой подписки. Включается явно.
 STARS_PAYMENTS_ENABLED = os.getenv("STARS_PAYMENTS_ENABLED", "0").strip() == "1"
-STARS_PRICE_STANDART = int(os.getenv("STARS_PRICE_STANDART", "170"))
-STARS_PRICE_PRO = int(os.getenv("STARS_PRICE_PRO", "470"))
+# New env names on purpose: the deploy still writes the old STARS_PRICE_STANDART/PRO (170/470), which are ignored now.
+STARS_PRICE_LITE = int(os.getenv("STARS_PRICE_BASIC", "199"))
+STARS_PRICE_STANDART = int(os.getenv("STARS_PRICE_MEDIUM", "449"))
+STARS_PRICE_PRO = int(os.getenv("STARS_PRICE_FULL", "899"))
 STARS_PRICE_TEST = int(os.getenv("STARS_PRICE_TEST", "10"))
 STARS_SUBSCRIPTION_DAYS = 30
-if STARS_PRICE_STANDART <= 0 or STARS_PRICE_PRO <= 0 or STARS_PRICE_TEST <= 0:
+if min(STARS_PRICE_LITE, STARS_PRICE_STANDART, STARS_PRICE_PRO, STARS_PRICE_TEST) <= 0:
     raise ValueError("Telegram Stars prices must be positive integers")
-if STARS_PRICE_PRO <= STARS_PRICE_STANDART:
-    raise ValueError("PRO must cost more Stars than Standart")
+if not STARS_PRICE_LITE < STARS_PRICE_STANDART < STARS_PRICE_PRO:
+    raise ValueError("Tariff prices must grow: Базовый < Средний < Полный")
 
 
 def stars_price(plan: str) -> int:
     if plan == "test":
         return STARS_PRICE_TEST
+    if plan == "lite":
+        return STARS_PRICE_LITE
     if plan == "standart":
         return STARS_PRICE_STANDART
     if plan == "pro":
         return STARS_PRICE_PRO
     raise ValueError("Unknown tariff plan")
+
+
+def plan_title(plan: str | None) -> str:
+    return PLAN_TITLES.get((plan or "standart").lower(), PLAN_TITLES["standart"])
+
+
+def plan_radars(plan: str | None) -> int:
+    return PLAN_RADARS.get((plan or "standart").lower(), PLAN_RADARS["standart"])
+
+
+def plan_interval(plan: str | None) -> int:
+    return int(TARIFF_SCAN_INTERVAL.get((plan or "standart").lower(), TARIFF_SCAN_INTERVAL["standart"]))
 
 
 def parse_proxy(raw_proxy: str | None) -> str | None:

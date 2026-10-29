@@ -27,7 +27,7 @@ PUB_DELAY_BOUNDS: tuple[float, ...] = (
     5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 120.0, 180.0, 300.0, 600.0, 900.0, 1800.0, float("inf")
 )
 
-TARIFF_KEYS: tuple[str, ...] = ("pro", "standart", "base")
+TARIFF_KEYS: tuple[str, ...] = ("pro", "standart", "lite", "base")
 
 _URL_CREDENTIALS_RE = re.compile(
     r"(?i)\b(https?|socks5h?)://([^\s/@:]+):([^\s/@]+)@([^\s/]+)"
@@ -454,6 +454,8 @@ class RuntimeMetricsRegistry:
         self._pending_depth_history: list[int] = []
         self._alert_cooldown_seconds: float = 300.0
         self._last_capacity_report: dict[str, Any] = {}
+        # Scans per second the planner aims for (sum of 1/interval over URLs); None = uniform SCAN_INTERVAL_* range.
+        self._planned_scan_rate: float | None = None
         self._outbox_live_state: dict[str, Any] = {
             "pending_depth": 0,
             "leased_depth": 0,
@@ -714,6 +716,9 @@ class RuntimeMetricsRegistry:
     def record_bot_api_retry_after(self) -> None:
         self._bucket().bot_api_retry_after_count += 1
 
+    def set_planned_scan_rate(self, scans_per_second: float | None) -> None:
+        self._planned_scan_rate = scans_per_second if scans_per_second and scans_per_second > 0 else None
+
     def update_outbox_state(
         self,
         *,
@@ -884,12 +889,21 @@ class RuntimeMetricsRegistry:
         scans_failed = sum(b.scans_failed for b in buckets)
 
         proxy_summaries = self.get_proxy_summaries()
+        unique_sources = self._scheduler_live_state["unique_sources"]
+        # Tariff intervals differ per URL: the mean interval that gives the planned scan rate stands in for the range.
+        mean_interval = (
+            unique_sources / self._planned_scan_rate
+            if self._planned_scan_rate and unique_sources
+            else None
+        )
         capacity = calculate_capacity_report(
-            unique_sources=self._scheduler_live_state["unique_sources"],
+            unique_sources=unique_sources,
             proxy_endpoints=proxy_summaries,
             rolling_mean_cost=cost_summary["mean"],
             p95_cost=cost_summary["p95"],
             completed_scans_count=scans_completed,
+            interval_min=mean_interval,
+            interval_max=mean_interval,
         )
         capacity["available_rps"] = capacity["available_rate_now"]
         capacity["required_rps"] = capacity["required_rate_target"]
@@ -1093,7 +1107,7 @@ class RuntimeMetricsRegistry:
             "🌐 <b>Емкость пула прокси:</b>",
             f"• Прокси: всего=<code>{cap['total_proxies']}</code>, здоровых=<code>{cap['healthy_proxies']}</code>, карантин=<code>{cap['quarantined_proxies']}</code>",
             f"• Цена 1 скана (HTTP): mean=<code>{cap['rolling_mean_http_requests_per_scan']:.2f}</code>, p95=<code>{cap['p95_http_requests_per_scan']:.2f}</code> ({'cold-start' if cap['cold_start_cost_used'] else 'measured'})",
-            f"• Требуется: max(20с)=<code>{cap['required_rate_at_max']:.2f} req/s</code>, target(17.5с)=<code>{cap['required_rate_target']:.2f} req/s</code>",
+            f"• Требуется: <code>{cap['required_rate_target']:.2f} req/s</code> (средний интервал URL <code>{cap['recommended_interval_high']:.1f} с</code>)",
             f"• Доступно: сейчас=<code>{cap['available_rate_now']:.2f} req/s</code>, с резервом 20%=<code>{cap['available_rate_with_reserve']:.2f} req/s</code>",
             f"• Дефицит: сейчас=<code>{cap['deficit_now']:.2f} req/s</code>, с резервом=<code>{cap['deficit_with_reserve']:.2f} req/s</code>",
             f"• Требуемый PROXY_RATE_LIMIT: hard=<code>{cap['required_configured_rate_hard']:.2f}</code>, target=<code>{cap['required_configured_rate_target']:.2f}</code>",
@@ -1111,7 +1125,7 @@ class RuntimeMetricsRegistry:
         for t_key in TARIFF_KEYS:
             ts = sla["by_tariff"][t_key]
             header_lines.append(
-                f"• Тариф <b>{t_key.upper()}</b>: "
+                f"• Тариф <b>{config.plan_title(t_key)}</b>: "
                 f"deliver→sent <code>{_fmt_hist(ts['deliver_at_to_sent_seconds'])}</code> | "
                 f"queued→sent <code>{_fmt_hist(ts['queued_to_sent_seconds'])}</code> | "
                 f"seen→queued <code>{_fmt_hist(ts['seen_to_queued_seconds'])}</code> | "
