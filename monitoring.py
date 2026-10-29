@@ -261,6 +261,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
 
             # Production multi-proxy collection with up to SCAN_PROXY_ATTEMPTS (2) distinct proxies
             tried_proxy_ids: set[str] = set()
+            scan_client = None
             collection = None
             last_failure = None
             total_http_reqs = 0
@@ -289,6 +290,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 if lease is None:
                     break
                 client = lease.client
+                scan_client = client  # the channel that produced this scan's final outcome
                 tried_proxy_ids.add(client.proxy_id)
                 proxy_parser = getattr(client, "_bound_parser", None)
                 if proxy_parser is None:
@@ -335,6 +337,8 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 revisit_seconds=revisit_seconds,
                 due_lag_seconds=due_lag_seconds,
                 is_catchup=has_pro_catchup,
+                proxy_id=scan_client.proxy_id if scan_client is not None else "direct",
+                masked_url=scan_client.masked_url if scan_client is not None else "direct",
             )
 
             if not ok:

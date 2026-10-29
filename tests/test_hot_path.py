@@ -181,3 +181,16 @@ class TestBatchedRadarEligibility(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestScanAttribution(unittest.TestCase):
+    def test_scan_is_counted_on_the_channel_that_ran_it(self):
+        from runtime_metrics import RuntimeMetricsRegistry
+
+        metrics = RuntimeMetricsRegistry()
+        metrics.record_scan_attempt(success=True, elapsed_ms=500, proxy_id="p-abc", masked_url="http://***@10.0.0.1:3000")
+        metrics.record_scan_attempt(success=False, elapsed_ms=300)
+        proxy = metrics._proxy_slice("p-abc", "http://***@10.0.0.1:3000")
+        direct = metrics._proxy_slice("direct", "direct")
+        self.assertEqual((proxy.collection_total, proxy.collection_success), (1, 1))
+        self.assertEqual((direct.collection_total, direct.collection_success), (1, 0))
