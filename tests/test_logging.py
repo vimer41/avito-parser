@@ -1,0 +1,385 @@
+import asyncio
+import gzip
+import json
+import logging
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+import config
+import database
+import log_report
+import logger_setup
+import parser
+from anti_bot import manager
+from parser import FetchFailure
+from logger_setup import log_event, new_trace, set_trace, setup_logging, stop_logging, write_metrics_row
+from runtime_metrics import RuntimeMetricsRegistry, format_minute_line, sanitize_proxy_credentials, short_channel
+
+
+class LogFixture(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="avito-logs-")
+        self.addCleanup(directory.cleanup)
+        self.logs = Path(directory.name)
+        saved_handlers = list(logging.getLogger().handlers)
+        patches = [
+            patch.object(logger_setup, "LOGS_DIR", self.logs),
+            patch.object(logger_setup, "EVENTS_LOG", self.logs / "events.jsonl"),
+            patch.object(logger_setup, "METRICS_LOG", self.logs / "metrics.jsonl"),
+            patch.object(logger_setup, "ERRORS_LOG", self.logs / "errors.log"),
+            patch.object(logger_setup, "USER_ACTIONS_LOG", self.logs / "user_actions.log"),
+            patch.object(logger_setup, "COMBINED_LOG", self.logs / "bot.log"),
+            patch.object(logger_setup, "_crash_file", object()),
+            patch.object(logger_setup, "_stdout_is_combined_log", return_value=True),
+            patch.object(log_report, "EVENTS_LOG", self.logs / "events.jsonl"),
+            patch.object(log_report, "METRICS_LOG", self.logs / "metrics.jsonl"),
+            patch.object(log_report, "CRASH_LOG", self.logs / "crash.log"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+        def restore():
+            stop_logging()
+            root = logging.getLogger()
+            root.handlers[:] = saved_handlers
+            set_trace("")
+
+        self.addCleanup(restore)
+        setup_logging()
+
+    def flush(self):
+        stop_logging()
+
+    def events(self):
+        return [json.loads(line) for line in (self.logs / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+class TestLogFiles(LogFixture):
+    def test_trace_follows_a_scan_and_routes_to_files(self):
+        logger = logging.getLogger("monitoring")
+        trace = new_trace()
+        log_event(logger, logging.INFO, "scan.fail", "✗ «iphone» 100% forbidden", kind="forbidden")
+        logger.warning("нужно внимание")
+        logging.getLogger("user_action").info("клик")
+        self.flush()
+
+        fail, warning, click = self.events()
+        self.assertEqual((fail["ev"], fail["id"], fail["f"]["kind"]), ("scan.fail", trace, "forbidden"))
+        self.assertNotIn("msg", fail)  # the fields already say it
+        self.assertEqual(warning["l"], "W")
+        self.assertEqual(click["c"], "user_ac")
+
+        bot_log = (self.logs / "bot.log").read_text(encoding="utf-8")
+        self.assertIn(f"scan    {trace} ✗ «iphone» 100% forbidden", bot_log)
+        self.assertNotIn("клик", bot_log)
+        errors = (self.logs / "errors.log").read_text(encoding="utf-8")
+        self.assertIn("нужно внимание", errors)
+        self.assertNotIn("forbidden", errors)  # a routine failed scan is not an error
+        self.assertIn("клик", (self.logs / "user_actions.log").read_text(encoding="utf-8"))
+
+    def test_secrets_never_reach_the_files(self):
+        logger = logging.getLogger("proxy_pool")
+        logger.warning("сбой http://login:s3cret@1.2.3.4:3000 token 1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        log_event(logger, logging.INFO, "proxy.x", "ok", url="http://login:s3cret@1.2.3.4:3000")
+        try:
+            raise RuntimeError("ключ 1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        except RuntimeError:
+            logger.exception("падение")
+        self.flush()
+        for name in ("bot.log", "errors.log", "events.jsonl"):
+            text = (self.logs / name).read_text(encoding="utf-8")
+            self.assertNotIn("s3cret", text, name)
+            self.assertNotIn("AAAAAAAA", text, name)
+
+    def test_debug_mode_writes_only_to_events_and_turns_off(self):
+        logger = logging.getLogger("scheduler")
+        logger.debug("скрыто")
+        logger_setup.set_debug_mode(5)
+        self.assertGreater(logger_setup.debug_mode_remaining(), 0)
+        logger.debug("подробно")
+        logger_setup.set_debug_mode(0)
+        logger.debug("снова скрыто")
+        self.assertEqual(logger_setup.debug_mode_remaining(), 0)
+        self.flush()
+        self.assertEqual([row.get("msg") for row in self.events()], ["подробно"])
+        self.assertNotIn("подробно", (self.logs / "bot.log").read_text(encoding="utf-8"))
+
+    def test_events_rotate_to_gzip_and_the_report_reads_both(self):
+        self.flush()
+        with patch.object(logger_setup, "EVENTS_MAX_MB", 0.002):
+            setup_logging()
+        logger = logging.getLogger("monitoring")
+        for index in range(60):
+            log_event(logger, logging.INFO, "scan.fail", "x", src=f"источник {index}", kind="timeout", padding="y" * 40)
+        self.flush()
+        self.assertTrue((self.logs / "events.jsonl.1.gz").is_file())
+        rows = log_report.read_rows(self.logs / "events.jsonl", time.time() - 60)
+        self.assertEqual([row["f"]["src"] for row in rows][-1], "источник 59")
+        self.assertGreater(len(rows), 40)
+
+    def test_full_queue_drops_instead_of_blocking(self):
+        self.flush()
+        handler = logging.getLogger().handlers[0]
+        before = logger_setup.dropped_records
+        for _ in range(logger_setup.QUEUE_SIZE + 5):
+            logging.getLogger("monitoring").info("x")
+        self.assertEqual(logger_setup.dropped_records - before, 5)
+        self.assertEqual(handler.queue.qsize(), logger_setup.QUEUE_SIZE)
+
+    def test_user_is_erased_from_rotated_archives_too(self):
+        logging.getLogger("monitoring").info("чужая строка")
+        logging.getLogger("user_action").info("[ID:1 @vasya_test] клик")
+        self.flush()
+        archive = self.logs / "events.jsonl.1.gz"
+        with gzip.open(archive, "wt", encoding="utf-8") as packed:
+            packed.write('{"t":1,"msg":"@vasya_test"}\n{"t":2,"msg":"чужая"}\n')
+        logger_setup.sanitize_logs_for_user("@vasya_test")
+        with gzip.open(archive, "rt", encoding="utf-8") as packed:
+            self.assertEqual(packed.read(), '{"t":2,"msg":"чужая"}\n')
+        self.assertNotIn("vasya_test", (self.logs / "events.jsonl").read_text(encoding="utf-8"))
+        self.assertIn("чужая строка", (self.logs / "events.jsonl").read_text(encoding="utf-8"))
+
+
+class TestMinuteRows(unittest.TestCase):
+    def setUp(self):
+        self.clock = [6000.0]
+        self.registry = RuntimeMetricsRegistry(monotonic_fn=lambda: self.clock[0], wall_clock_fn=lambda: 1_760_000_000.0)
+
+    def test_each_finished_minute_is_returned_once(self):
+        registry = self.registry
+        registry.record_scan_attempt(success=True, elapsed_ms=900, pages_fetched=1, due_lag_seconds=3.0, coverage_gap=True)
+        registry.record_scan_attempt(success=False, failure_kind="forbidden", proxy_id="p1", masked_url="http://***@1.2.3.4:3000")
+        registry.record_http_request("p1", "http://***@1.2.3.4:3000", 403, 0.4)
+        registry.record_loop_lag(1.5, stall=True)
+        registry.record_bot_api_retry_after(42)
+        registry.record_challenge("geetest", solved=True, seconds=2.0)
+        registry.record_challenge("geetest", solved=False, seconds=4.0)
+        registry.record_fanout_items(new=5, queued=2, stop_word=1, too_old=2)
+        self.assertEqual(registry.pop_minute_rows(), [])
+
+        self.clock[0] += 60
+        row = registry.pop_minute_rows()[0]
+        self.assertEqual(row["scans"], {"ok": 1, "fail": 1, "fast": 0, "new": 1, "gap": 1})
+        self.assertEqual(row["fail"], {"forbidden": 1})
+        self.assertEqual(row["ch"]["1.2.3.4:3000"]["403"], 1)
+        self.assertEqual(row["loop_max_ms"], 1500)
+        self.assertEqual((row["flood"], row["flood_max_s"]), (1, 42.0))
+        self.assertEqual(row["challenge"]["geetest"], {"ok": 1, "fail": 1, "avg_s": 3.0})
+        self.assertEqual(row["lots"]["queued"], 2)
+        self.assertEqual(row["due_s"]["p95"], 5.0)
+        self.assertEqual(registry.pop_minute_rows(), [])
+
+        line = format_minute_line(row)
+        self.assertIn("forbidden×1", line)
+        self.assertIn("flood 1", line)
+        json.dumps(row)
+
+    def test_short_channel_never_shows_credentials(self):
+        self.assertEqual(short_channel("direct"), "direct")
+        self.assertEqual(short_channel("x", sanitize_proxy_credentials("http://u:p@1.2.3.4:3000")), "1.2.3.4:3000")
+
+
+class TestDiagnosis(unittest.TestCase):
+    def test_stub_page_fingerprint_says_what_the_page_was(self):
+        page = "<html><head><title>Вход\n в аккаунт</title></head><body>доступ ограничен geetest" + "x" * 5000
+        self.assertEqual(parser.page_fingerprint(page), "«Вход в аккаунт» 4 КБ [geetest, доступ ограничен]")
+        self.assertEqual(parser.page_fingerprint("<html>"), "«без title» 0 КБ")
+
+    def test_challenge_outcome_is_measured_even_when_the_solver_raises(self):
+        with patch.object(manager.METRICS, "record_challenge") as record:
+            self.assertTrue(manager._timed_solve("pow", lambda: True))
+            with self.assertRaises(ValueError):
+                manager._timed_solve("pow", lambda: (_ for _ in ()).throw(ValueError()))
+        self.assertEqual([call.kwargs["solved"] for call in record.call_args_list], [True, False])
+
+    def test_stalled_loop_is_recorded(self):
+        async def scenario():
+            import monitoring
+            with patch.object(monitoring, "LOOP_PROBE_SECONDS", 0.01), patch.object(monitoring, "LOOP_STALL_SECONDS", 0.02), \
+                    patch.object(monitoring.METRICS, "record_loop_lag") as record:
+                watcher = asyncio.create_task(monitoring.watch_event_loop())
+                await asyncio.sleep(0.015)
+                time.sleep(0.05)
+                await asyncio.sleep(0.03)
+                watcher.cancel()
+            return record
+
+        record = asyncio.run(scenario())
+        self.assertTrue(any(call.kwargs["stall"] for call in record.call_args_list))
+
+
+class TestReport(LogFixture):
+    def minute(self, stamp, **overrides):
+        row = {
+            "t": stamp, "ts": "10-30 12:00", "scans": {"ok": 10, "fail": 30, "fast": 0, "new": 2, "gap": 0},
+            "fail": {"catalog_missing": 30},
+            "ch": {"direct": {"http": 40, "ok": 36, "403": 4, "429": 0, "5xx": 0, "terr": 0, "coll": 40, "coll_ok": 10,
+                              "ms_p50": 500, "fail": {"catalog_missing": 30}, "state": "healthy", "rate": 1.5}},
+            "scan_s": {"p50": 1.0, "p95": 2.0}, "due_s": {"p50": 1.0, "p95": 5.0}, "lots": {"new": 5, "queued": 2, "stop": 1,
+            "seller": 0, "old": 2, "title": 0}, "pub_sent_s": {"n": 2, "p50": 30.0, "p95": 60.0}, "sent": 2, "flood": 1,
+            "flood_max_s": 120.0, "challenge": {"geetest": {"ok": 3, "fail": 1, "avg_s": 2.0}}, "loop_max_ms": 2100, "stalls": 1,
+            "rps_need": 3.5, "rps_have": 2.0, "outbox": 0, "rss_mb": 300.0, "log_drops": 0,
+        }
+        row.update(overrides)
+        return row
+
+    def test_report_points_at_the_cause_and_stays_small(self):
+        logger = logging.getLogger("monitoring")
+        log_event(logging.getLogger("bot"), logging.INFO, "app.start", "старт", version="abc", net_mode="both")
+        log_event(logging.getLogger("bot"), logging.INFO, "app.start", "старт", version="abd", net_mode="both")
+        for _ in range(3):
+            log_event(logger, logging.INFO, "scan.fail", "✗", src="iphone", kind="catalog_missing", detail="«Вход» 12 КБ [login]", rids=[7])
+        try:
+            raise KeyError("boom")
+        except KeyError:
+            logger.exception("Сбой 123")
+            logger.exception("Сбой 456")
+        now = int(time.time())
+        write_metrics_row(self.minute(now - 120))
+        write_metrics_row(self.minute(now - 60))
+        self.flush()
+
+        report = log_report.build_report(60, {"net_mode": "both"})
+        self.assertIn("HTTP ok 90%, но каталог получен лишь в 25%", report)
+        self.assertIn("Event loop зависал 2 раз", report)
+        self.assertIn("Telegram flood-wait 2 раз", report)
+        self.assertIn("Мощности не хватает 2 мин", report)
+        self.assertIn("ПРЕДЫДУЩИЙ ЗАПУСК УПАЛ", report)
+        self.assertIn("3× catalog_missing: «Вход» N КБ [login]", report)
+        self.assertIn("3× «iphone»: catalog_missing×3", report)
+        self.assertIn("geetest: решено 6/8 (75%)", report)
+        self.assertIn("[E] 2× ", report)
+        self.assertIn("KeyError", report)
+        self.assertLess(len(report), 40000)
+
+    def test_old_rows_are_skipped_and_empty_logs_do_not_fail(self):
+        self.assertIn("Нет минутных метрик", log_report.build_report(5))
+        now = time.time()
+        (self.logs / "metrics.jsonl").write_text(
+            json.dumps(self.minute(int(now - 7200))) + "\n" + "обрезанная строка\n" + json.dumps(self.minute(int(now)))[:40] + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(log_report.read_rows(self.logs / "metrics.jsonl", now - 60), [])
+
+    def test_select_finds_one_scan_or_radar(self):
+        rows = [
+            {"id": "a1f3", "ev": "scan.fail", "f": {"rids": [7]}},
+            {"id": "a1f3", "ev": "fanout.found", "f": {"radar": 7, "chat": 5}},
+            {"id": "b2c4", "ev": "send.ok", "f": {"chat": 5}},
+        ]
+        self.assertEqual(len(log_report.select(rows, trace="a1f3")), 2)
+        self.assertEqual(len(log_report.select(rows, radar=7)), 2)
+        self.assertEqual(len(log_report.select(rows, chat=5)), 2)
+        self.assertEqual(len(log_report.select(rows, text="FANOUT")), 1)
+
+
+# The loop takes the production path only for a parser whose class is called AvitoParser.
+_ScanParser = type("AvitoParser", (), {
+    "__init__": lambda self, **kwargs: None,
+    "close": lambda self: None,
+    "normalize_url": staticmethod(parser.AvitoParser.normalize_url),
+})
+
+
+class _FakeClient:
+    is_direct = False
+    in_flight = 0
+
+    def __init__(self):
+        self.proxy_id = "p1"
+        self.masked_url = "http://***@1.2.3.4:3000"
+        self._bound_parser = Mock(last_failure=FetchFailure("forbidden", status=403), last_http_requests=2)
+
+    def cooldown_remaining(self):
+        return 0.0
+
+
+class _FakePool:
+    is_direct_only = False
+
+    def __init__(self):
+        self.clients = [_FakeClient()]
+
+    def healthy_count(self):
+        return 1
+
+    def acquire_client(self, exclude_ids=()):
+        if self.clients[0].proxy_id in exclude_ids:
+            return None
+        return Mock(client=self.clients[0])
+
+    def snapshots(self):
+        return []
+
+
+class TestProductionScanLoop(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_and_good_scan_log_one_line_and_fanout_keeps_the_trace(self):
+        import monitoring
+        import scheduler
+        from collector import SourceCollection
+
+        radars = [
+            {"id": 1, "user_id": 9, "url": "https://www.avito.ru/search?q=bad", "tariff_plan": "pro", "title": "плохой"},
+            {"id": 2, "user_id": 9, "url": "https://www.avito.ru/search?q=good", "tariff_plan": "pro", "title": "хороший"},
+        ]
+        fanned_out = asyncio.Event()
+        fanout_trace = []
+        events = []
+
+        async def collect(parser_, url, *args, **kwargs):
+            if "bad" in url:
+                return None
+            return SourceCollection("Поиск", (), time.time(), 1, False, 120, top_ids=("1",))
+
+        async def fanout(*args, **kwargs):
+            fanout_trace.append(logger_setup.get_trace())
+            fanned_out.set()
+            return True
+
+        def capture(_logger, level, event, message, **fields):
+            events.append((event, logger_setup.get_trace(), level, message, fields))
+
+        with (
+            patch.object(monitoring, "get_proxy_pool", return_value=_FakePool()),
+            patch.object(monitoring, "AvitoParser", _ScanParser),
+            patch.object(monitoring, "collect_source", collect),
+            patch.object(monitoring, "log_event", capture),
+            patch.object(monitoring, "write_metrics_row") as write_row,
+            patch.object(monitoring.METRICS, "pop_minute_rows", side_effect=lambda: [monitoring.METRICS._minute_row(monitoring.METRICS._bucket(), time.time())]),
+            patch.object(scheduler, "process_collected_group_fanout", fanout),
+            patch.object(database, "get_all_active_searches", AsyncMock(return_value=radars)),
+            patch.object(database, "get_outbox_metrics", AsyncMock(return_value={"pending": 3, "oldest_seconds": 1.5})),
+            patch.object(database, "load_all_source_scan_states", AsyncMock(return_value={})),
+            patch.object(database, "upsert_source_scan_states_batch", AsyncMock()),
+            patch.object(config, "METRICS_REPORT_INTERVAL", 0),
+            patch.object(config, "SCAN_STARTUP_SPREAD", 0),
+            patch.object(config, "MAX_CONCURRENT_WORKERS", 1),
+        ):
+            task = asyncio.create_task(monitoring.run_monitoring(Mock(send_message=AsyncMock())))
+            await asyncio.wait_for(fanned_out.wait(), 5)
+            await asyncio.sleep(1.2)  # one more dispatcher pass, with fresh outbox numbers
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        by_event = {event[0]: event for event in reversed(events)}
+        failed, good = by_event["scan.fail"], by_event["scan.ok"]
+        self.assertEqual(failed[4]["kind"], "forbidden")
+        self.assertEqual(set(failed[4]["attempts"]), {"1.2.3.4:3000: forbidden"})
+        self.assertEqual(failed[4]["rids"], [1])
+        self.assertEqual((good[4]["src"], good[4]["ch"], good[2]), ("хороший", "1.2.3.4:3000", logging.DEBUG))
+        self.assertEqual(fanout_trace, [good[1]])
+        self.assertNotEqual(failed[1], good[1])
+
+        row = write_row.call_args.args[0]
+        self.assertEqual((row["urls"], row["radars"], row["outbox"]), (2, 2, 3))
+        self.assertEqual(row["channels"], "0/0")
+        self.assertIn("minute", by_event)
+
+
+if __name__ == "__main__":
+    unittest.main()

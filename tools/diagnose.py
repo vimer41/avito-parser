@@ -3,8 +3,6 @@
 import argparse
 import asyncio
 import json
-import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -14,23 +12,32 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-def scan_summary(text: str):
-    rows = [(int(ok), int(ms), int(count), int(blocked)) for ok, ms, count, blocked in
-            re.findall(r"Scan result: ok=(\d) elapsed_ms=(\d+) items=(\d+) blocked=(\d)", text)]
-    success_ms = sorted(row[1] for row in rows if row[0])
+def scan_summary(metrics_text: str, log_text: str = ""):
+    """Totals from the minute rows of metrics.jsonl; bounded, and they hold no user data."""
+    rows = []
+    for line in metrics_text.splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    successes = sum(row["scans"]["ok"] for row in rows)
+    failures = sum(row["scans"]["fail"] for row in rows)
+    attempts = successes + failures
+    scan_p95 = sorted(row["scan_s"]["p95"] for row in rows if row["scan_s"]["p95"] is not None)
+    channels = [channel for row in rows for channel in row["ch"].values()]
     return {
-        "scope": "page fetch including challenges; bounded log tail, not a sustained SLA",
-        "attempts": len(rows), "successes": sum(row[0] for row in rows),
-        "failures": sum(not row[0] for row in rows), "blocked_attempts": sum(row[3] for row in rows),
-        "success_rate": round(sum(row[0] for row in rows) / len(rows), 4) if rows else None,
-        "success_latency_p50_ms": success_ms[len(success_ms) // 2] if success_ms else None,
-        "success_latency_p95_ms": success_ms[min(len(success_ms) - 1, int(len(success_ms) * .95))] if success_ms else None,
-        "http_403_entries": len(re.findall(r"HTTP 403\b", text)),
-        "http_429_entries": len(re.findall(r"HTTP 429\b", text)),
-        "traceback_entries": text.count("Traceback (most recent call last)"),
-        "payment_confirmation_entries": text.count("Stars payment fulfilled:"),
-        "real_admin_probe_entries": text.count("Live Telegram probe completed by admin="),
-        "ad_delivery_log_entries": sum(text.count(marker) for marker in ("Доставлено (текст)", "Доставлено (с фото)", "Доставлено (file_id")),
+        "scope": "minute rows from a bounded tail of metrics.jsonl, not a sustained SLA",
+        "minutes": len(rows), "attempts": attempts, "successes": successes, "failures": failures,
+        "success_rate": round(successes / attempts, 4) if attempts else None,
+        "scan_latency_p95_s_median": scan_p95[len(scan_p95) // 2] if scan_p95 else None,
+        "http_403_entries": sum(channel["403"] for channel in channels),
+        "http_429_entries": sum(channel["429"] for channel in channels),
+        "ad_deliveries": sum(row["sent"] for row in rows),
+        "loop_stalls": sum(row["stalls"] for row in rows),
+        "telegram_flood_waits": sum(row["flood"] for row in rows),
+        "traceback_entries": log_text.count("Traceback (most recent call last)"),
+        "payment_confirmation_entries": log_text.count("Stars payment fulfilled:"),
+        "real_admin_probe_entries": log_text.count("Live Telegram probe completed by admin="),
     }
 
 
@@ -85,7 +92,8 @@ def main():
                                              "admin_radar_limit": config.MAX_SEARCHES_PER_USER,
                                              "proxy_configured": bool(config.PROXY_URL)}))
     print_database_summary(config.DB_PATH)
-    print("Avito / delivery metrics:", json.dumps(scan_summary(tail(Path(os.getenv("COMBINED_LOG", str(ROOT / "bot.log")))))))
+    from logger_setup import COMBINED_LOG, METRICS_LOG
+    print("Avito / delivery metrics:", json.dumps(scan_summary(tail(METRICS_LOG), tail(COMBINED_LOG))))
     if sys.platform == "linux":
         result = subprocess.run(["journalctl", "-u", "avito-bot", "--since", "-20 minutes", "--no-pager", "-o", "cat"],
                                 capture_output=True, text=True, timeout=15)

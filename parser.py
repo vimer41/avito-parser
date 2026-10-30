@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextvars
 import copy
 import hashlib
 import json
@@ -86,6 +87,23 @@ class FetchFailure:
     retryable: bool = True
     retry_after: float = 0.0
     status: Optional[int] = None
+    detail: str = ""
+
+
+_STUB_MARKERS = ("firewall", "captcha", "geetest", "qrator", "login", "доступ ограничен", "доступ временно", "blocked")
+
+
+def page_fingerprint(html: str) -> str:
+    """What a page without a catalog actually was: title, size and anti-bot markers. Failures only."""
+    match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    title = " ".join(match.group(1).split())[:60] if match else "без title"
+    lowered = html.lower()
+    markers = [marker for marker in _STUB_MARKERS if marker in lowered]
+    return f"«{title}» {len(html) // 1024} КБ" + (f" [{', '.join(markers)}]" if markers else "")
+
+
+def _error_detail(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"[:120]
 
 
 @dataclass
@@ -272,7 +290,7 @@ class AvitoParser:
             )
             cooldown = max(cooldown, proxy_cooldown)
         self.last_failure = FetchFailure(failure_kind, retry_after=cooldown, status=status)
-        logger.warning(
+        logger.debug(
             "⚠️ HTTP %s (%s): общая пауза %.1f с, серия %s. Это не подтверждение IP-бана.",
             status, self.last_failure.kind, cooldown, self.block_streak,
         )
@@ -716,11 +734,12 @@ class AvitoParser:
                             self.last_failure = FetchFailure("challenge", retry_after=cooldown, status=response.status_code)
                             return None
                         challenge_attempts += 1
-                        logger.info("🛡 %s [%s]: проверка HTTP %s (попытка %d/2)", human, client.proxy_id, response.status_code, challenge_attempts)
+                        logger.debug("🛡 %s [%s]: проверка HTTP %s (попытка %d/2)", human, client.proxy_id, response.status_code, challenge_attempts)
                         cancel_event = Event()
                         loop = asyncio.get_running_loop()
                         fut = loop.run_in_executor(
                             _get_challenge_executor(),
+                            contextvars.copy_context().run,  # keeps the scan's trace id in anti-bot logs
                             self._solve_challenge_sync_bridge,
                             async_session.cookies.jar,
                             response,
@@ -765,7 +784,7 @@ class AvitoParser:
                             retry_after=cooldown,
                             status=response.status_code,
                         )
-                        logger.warning("⚠️ %s [%s]: Авито ответил HTTP %s", human, client.proxy_id, response.status_code)
+                        logger.debug("⚠️ %s [%s]: Авито ответил HTTP %s", human, client.proxy_id, response.status_code)
                         return None
 
                     if '"isSuspenseRedirect":true' in page_html:
@@ -781,7 +800,7 @@ class AvitoParser:
 
                     if not page_html or not re.search(r"<(?:!doctype\s+html|html|head|body|script)\b", page_html, re.I):
                         self.last_failure = FetchFailure("invalid_html")
-                        logger.warning("⚠️ %s [%s]: HTTP 200 без HTML страницы", human, client.proxy_id)
+                        logger.debug("⚠️ %s [%s]: HTTP 200 без HTML страницы", human, client.proxy_id)
                         return None
 
                     client.record_success()
@@ -805,17 +824,17 @@ class AvitoParser:
                     return None
                 except RequestBudgetExceeded as exc:
                     self.last_failure = FetchFailure("request_budget")
-                    logger.warning("🌐 %s [%s]: %s", human, client.proxy_id, exc)
+                    logger.debug("🌐 %s [%s]: %s", human, client.proxy_id, exc)
                     return None
                 except PowSearchError as exc:
-                    logger.warning("PoW stopped [%s]: %s", client.proxy_id, exc)
+                    logger.debug("PoW stopped [%s]: %s", client.proxy_id, exc)
                     cooldown = client.record_block_or_challenge_failure(status=439, reason="pow_error")
                     await client.reset_async_session()
-                    self.last_failure = FetchFailure("challenge", retry_after=cooldown, status=439)
+                    self.last_failure = FetchFailure("challenge", retry_after=cooldown, status=439, detail=_error_detail(exc))
                     return None
                 except ValueError as exc:
                     self.last_failure = FetchFailure("invalid_response", False)
-                    logger.warning("Некорректный ответ/URL Авито: %s", exc)
+                    logger.debug("Некорректный ответ/URL Авито: %s", exc)
                     return None
                 except asyncio.CancelledError:
                     raise
@@ -824,16 +843,19 @@ class AvitoParser:
                     if proxy_failure is not None:
                         kind, status = proxy_failure
                         cooldown = client.record_transport_error(reason=kind)
-                        self.last_failure = self.last_failure or FetchFailure(kind, retry_after=cooldown, status=status)
-                        logger.warning("🌐 %s [%s]: ошибка прокси %s%s", human, client.proxy_id, kind, f" (HTTP {status})" if status else "")
+                        self.last_failure = self.last_failure or FetchFailure(
+                            kind, retry_after=cooldown, status=status, detail=_error_detail(exc)
+                        )
+                        logger.debug("🌐 %s [%s]: ошибка прокси %s%s", human, client.proxy_id, kind, f" (HTTP {status})" if status else "")
                         return None
                     is_timeout = "timeout" in type(exc).__name__.lower() or isinstance(exc, TimeoutError)
                     cooldown = client.record_transport_error(reason="timeout" if is_timeout else "network")
                     self.last_failure = self.last_failure or FetchFailure(
                         "timeout" if is_timeout else "network",
                         retry_after=cooldown,
+                        detail=_error_detail(exc),
                     )
-                    logger.warning("🌐 %s [%s]: сетевой сбой (%s), повтор отложен планировщиком", human, client.proxy_id, type(exc).__name__)
+                    logger.debug("🌐 %s [%s]: сетевой сбой (%s), повтор отложен планировщиком", human, client.proxy_id, type(exc).__name__)
                     return None
         finally:
             self.last_http_requests = request_counter[0]
@@ -918,7 +940,7 @@ class AvitoParser:
                             self._register_block(response.status_code, response.headers, response=response, kind="challenge")
                             return None
                         challenge_attempts += 1
-                        logger.info("🛡 %s: проверка HTTP %s (попытка %d/2)", human, response.status_code, challenge_attempts)
+                        logger.debug("🛡 %s: проверка HTTP %s (попытка %d/2)", human, response.status_code, challenge_attempts)
                         accepted = handle_anti_bot_challenge(self.session, response, actual_url, cancel_event=cancel_event)
                         check_cancelled(cancel_event)
                         if not accepted:
@@ -930,7 +952,7 @@ class AvitoParser:
 
                     if response.status_code != 200:
                         self.last_failure = FetchFailure("server" if response.status_code >= 500 else "http_client", response.status_code >= 500, status=response.status_code)
-                        logger.warning("⚠️ %s: Авито ответил HTTP %s", human, response.status_code)
+                        logger.debug("⚠️ %s: Авито ответил HTTP %s", human, response.status_code)
                         return None
                     page_html = response.text
                     if '"isSuspenseRedirect":true' in page_html:
@@ -946,7 +968,7 @@ class AvitoParser:
 
                     if not page_html or not re.search(r"<(?:!doctype\s+html|html|head|body|script)\b", page_html, re.I):
                         self.last_failure = FetchFailure("invalid_html")
-                        logger.warning("⚠️ %s: HTTP 200 без HTML страницы", human)
+                        logger.debug("⚠️ %s: HTTP 200 без HTML страницы", human)
                         return None
                     if self.block_streak:
                         logger.info("✅ Доступ к целевой странице Авито восстановлен")
@@ -968,20 +990,20 @@ class AvitoParser:
                     return None
                 except RequestBudgetExceeded as exc:
                     self.last_failure = FetchFailure("request_budget")
-                    logger.warning("🌐 %s: %s", human, exc)
+                    logger.debug("🌐 %s: %s", human, exc)
                     return None
                 except PowSearchError as exc:
-                    logger.warning("PoW stopped: %s", exc)
+                    logger.debug("PoW stopped: %s", exc)
                     self._register_block(439)
                     return None
                 except ValueError as exc:
                     self.last_failure = FetchFailure("invalid_response", False)
-                    logger.warning("Некорректный ответ/URL Авито: %s", exc)
+                    logger.debug("Некорректный ответ/URL Авито: %s", exc)
                     return None
                 except Exception as exc:
                     check_cancelled(cancel_event)
                     self.last_failure = self.last_failure or FetchFailure("timeout" if "timeout" in type(exc).__name__.lower() else "network")
-                    logger.warning("🌐 %s: сетевой сбой (%s), повтор отложен планировщиком", human, type(exc).__name__)
+                    logger.debug("🌐 %s: сетевой сбой (%s), повтор отложен планировщиком", human, type(exc).__name__)
                     return None
 
     def fetch_item_details(self, item_id: str | int) -> Optional[dict]:

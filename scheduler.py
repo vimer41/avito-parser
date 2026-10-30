@@ -25,6 +25,7 @@ import database
 import ui
 from freshness import freshness_status, publication_age_seconds
 from request_budget import get_network_block_state, RequestDeferred, RequestBudgetExceeded
+from logger_setup import get_trace, log_event, set_trace
 from runtime_metrics import METRICS
 from parser import AvitoParser, AvitoItem
 from collector import SourceCollection, collect_source
@@ -610,8 +611,8 @@ async def send_ad_to_user(
                 disable_notification=silent,
                 parse_mode="HTML",
             )
-            logger.info(
-                f"     ⚡️ [Радар #{search_id}{owner_str}] Доставлено (file_id кэш): {it.price} · «{it.title[:35]}»"
+            logger.debug(
+                f"Радар #{search_id}{owner_str}: file_id из кэша · {it.price} · «{it.title[:35]}»"
             )
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
@@ -635,8 +636,8 @@ async def send_ad_to_user(
             fid = _extract_photo_file_id(msg)
             if fid:
                 set_cached_photo_file_id(it.item_id, fid)
-            logger.info(
-                f"     🖼 [Радар #{search_id}{owner_str}] Доставлено (photo URL): {it.price} · «{it.title[:35]}»"
+            logger.debug(
+                f"Радар #{search_id}{owner_str}: фото по URL · {it.price} · «{it.title[:35]}»"
             )
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
@@ -681,8 +682,8 @@ async def send_ad_to_user(
                             fid = _extract_photo_file_id(msg)
                             if fid:
                                 set_cached_photo_file_id(it.item_id, fid)
-                            logger.info(
-                                f"     🖼 [Радар #{search_id}{owner_str}] Доставлено (BufferedInputFile): {it.price} · «{it.title[:35]}»"
+                            logger.debug(
+                                f"Радар #{search_id}{owner_str}: фото загрузкой · {it.price} · «{it.title[:35]}»"
                             )
                             return True
                         except (TelegramForbiddenError, TelegramRetryAfter):
@@ -703,8 +704,8 @@ async def send_ad_to_user(
                 parse_mode="HTML",
                 disable_web_page_preview=False,
             )
-            logger.info(
-                f"     🚀 [Радар #{search_id}{owner_str}] Доставлено (текст): {it.price} · «{it.title[:35]}»"
+            logger.debug(
+                f"Радар #{search_id}{owner_str}: текстом · {it.price} · «{it.title[:35]}»"
             )
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
@@ -774,7 +775,7 @@ async def process_collected_group_fanout(
             if radar.get("initialized_at") is None:
                 await database.initialize_search_snapshot(radar["id"], [])
         LAST_SCAN_TIMESTAMP = time.time()
-        logger.info(
+        logger.debug(
             f"📡 {w_tag}[ПАРСЕР] По URL «{clean_url[:60]}...»: страница получена за {fetch_ms} мс, лотов в каталоге не найдено"
         )
         return True
@@ -837,7 +838,7 @@ async def process_collected_group_fanout(
             if it.item_id not in seen_set
         ]
         if not new_items:
-            logger.info(
+            logger.debug(
                 f"  {w_tag}🔹 Радар #{radar_id} [{user_str}] «{search_title}»: проверено {len(items)} лотов [{source_tag}] (новых нет)"
             )
             continue
@@ -857,12 +858,13 @@ async def process_collected_group_fanout(
                         if any(kw in it.title.lower() for kw in keywords):
                             matching_title_items.append(it)
                         else:
-                            logger.info(
+                            logger.debug(
                                 f"  {w_tag}🏷 [ТОЛЬКО В НАЗВАНИИ] Отсеян лот «{it.title[:35]}» (нет '{q_val}' в заголовке) [{user_str}]"
                             )
                     new_items = matching_title_items
 
         if not new_items:
+            METRICS.record_fanout_items(new=len(all_new_candidates), title=len(all_new_candidates))
             for item_id, price in all_new_candidates.items():
                 seen_batch.append((radar_id, item_id, price or 0))
             continue
@@ -901,15 +903,26 @@ async def process_collected_group_fanout(
         fresh_items = [item for item in new_items if ages[item.item_id] is True]
 
         deliverable_items = []
+        stop_word_hits = seller_hits = 0
         for it in fresh_items:
             matched_stop = is_stop_word_matched(it, stop_words)
             if matched_stop:
-                logger.info(f"     🛡 Отсеяно по стоп-слову «{matched_stop}» [{user_str}]: «{it.title[:30]}»")
+                stop_word_hits += 1
+                logger.debug(f"Отсеяно по стоп-слову «{matched_stop}» [{user_str}]: «{it.title[:30]}»")
                 continue
             if it.seller_name and it.seller_name.lower().strip() in blocked_sellers:
-                logger.info(f"     🚷 Отсеян продавец «{it.seller_name}» из ЧС [{user_str}]")
+                seller_hits += 1
+                logger.debug(f"Отсеян продавец «{it.seller_name}» из ЧС [{user_str}]")
                 continue
             deliverable_items.append(it)
+        METRICS.record_fanout_items(
+            new=len(all_new_candidates),
+            queued=len(deliverable_items),
+            stop_word=stop_word_hits,
+            seller=seller_hits,
+            too_old=len(new_items) - len(fresh_items) - len(unknown_ids),
+            title=len(all_new_candidates) - len(new_items),
+        )
 
         # In downtime catch-up mode for PRO/admin, cap to CATCHUP_MAX_ITEMS (10) newest items
         omitted_catchup_ids: set[str] = set()
@@ -933,7 +946,7 @@ async def process_collected_group_fanout(
                 seen_batch.append((radar_id, item_id, price or 0))
 
         if unknown_ids:
-            logger.info(
+            logger.debug(
                 "Радар #%s: %s объявлений без достоверного возраста оставлены для повторной проверки",
                 radar_id,
                 len(unknown_ids),
@@ -946,14 +959,23 @@ async def process_collected_group_fanout(
                 age_summary += f", и ещё {len(new_items) - 2}"
             items_label = plural_form(len(new_items), "лот", "лота", "лотов")
             limit_label = f"порог {effective_age_min} мин."
-            logger.info(
+            logger.debug(
                 f"  {w_tag}🔹 Радар #{radar_id} [{user_str}] «{search_title}»: {items_label} в ротации [{source_tag}] "
                 f"(отсеян по возрасту: {age_summary}; {limit_label})"
             )
             continue
 
         fresh_label = plural_form(len(deliverable_items), "СВЕЖИЙ ЛОТ", "СВЕЖИХ ЛОТА", "СВЕЖИХ ЛОТОВ")
-        logger.info(f"  {w_tag}🔥 Радар #{radar_id} [{user_str}] «{search_title}»: НАЙДЕНО {fresh_label}!")
+        log_event(
+            logger,
+            logging.INFO,
+            "fanout.found",
+            f"🔥 Радар #{radar_id} [{user_str}] «{search_title}»: {fresh_label.lower()}",
+            radar=radar_id,
+            chat=user_id,
+            n=len(deliverable_items),
+            items=[it.item_id for it in deliverable_items][:10],
+        )
 
         for it in reversed(deliverable_items):
             disc_at = collection.discovery_times.get(it.item_id, now_epoch)
@@ -971,6 +993,7 @@ async def process_collected_group_fanout(
                     radar_titles=[search_title],
                 )
             )
+            task_dict["scan_trace"] = get_trace()
             candidates_to_enqueue.append(
                 {
                     "user_id": user_id,
@@ -1011,7 +1034,6 @@ async def process_url_group(
 ):
     """Collect an exact source once, then apply each subscriber's filters."""
     try:
-        fetch_t0 = time.monotonic()
         parser.last_coverage_gap = False
         max_age = max((min(30, max(1, int(radar.get("max_age_minutes") or 5))) for radar in radars_for_url), default=5)
         has_pro_catchup = (
@@ -1031,21 +1053,8 @@ async def process_url_group(
             last_top_ids=last_top_ids,
         )
         if collection is None:
-            logger.info(
-                "Scan result: ok=0 elapsed_ms=%d items=0 blocked=%d failure=%s",
-                int((time.monotonic() - fetch_t0) * 1000),
-                int(bool(parser.is_blocked())),
-                getattr(parser, "last_failure", None),
-            )
             return False
 
-        logger.info(
-            "Scan result: ok=1 elapsed_ms=%d items=%d blocked=0 pages=%d coverage_gap=%d",
-            collection.elapsed_ms,
-            len(collection.items),
-            collection.pages,
-            int(collection.coverage_gap),
-        )
         return await process_collected_group_fanout(
             clean_url,
             radars_for_url,
@@ -1083,6 +1092,7 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
         discovered_at = float(payload.get("discovered_at") or row.get("t_seen") or row.get("queued_at") or 0.0)
         freshness_verified = bool(payload.get("freshness_verified", False))
         is_price_drop = bool(payload.get("is_price_drop", False))
+        set_trace(str(payload.get("scan_trace") or ""))
     except (ValueError, KeyError, TypeError):
         logger.error("Invalid outbox payload #%s", notification_id)
         await database.discard_notification(notification_id, token)
@@ -1223,12 +1233,21 @@ async def _acknowledge_delivery(row: dict, ctx: dict) -> bool:
             t_sent=t_sent,
             is_catchup=ctx["is_catchup"],
         )
-        logger.info(
-            "Delivery result: notification=%s discovery_to_send_ms=%d deliver_lag_ms=%d attempts=%s",
-            ctx["id"],
-            int(max(0.0, t_sent - t_seen_val) * 1000),
-            int(max(0.0, t_sent - deliver_at_val) * 1000),
-            row.get("attempts", 1),
+        t_pub_val = row.get("t_pub") or item.timestamp
+        pub_age = max(0.0, t_sent - float(t_pub_val)) if t_pub_val and row.get("t_pub_reliable") else None
+        log_event(
+            logger,
+            logging.INFO,
+            "send.ok",
+            f"→ chat {ctx['user_id']} · лот {item.item_id} · нашли→отправили {t_sent - t_seen_val:.1f} с"
+            + (f" · с публикации {pub_age:.0f} с" if pub_age is not None else ""),
+            chat=ctx["user_id"],
+            item=item.item_id,
+            seen_to_sent_s=round(max(0.0, t_sent - t_seen_val), 2),
+            lag_s=round(max(0.0, t_sent - deliver_at_val), 2),
+            pub_age_s=round(pub_age, 1) if pub_age is not None else None,
+            attempts=row.get("attempts", 1),
+            tariff=ctx["tariff"],
         )
     return acknowledged
 
@@ -1285,6 +1304,15 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
         return False
     except TelegramRetryAfter as exc:
         retry_delay = float(exc.retry_after) + random.uniform(0.5, 1.5)
+        METRICS.record_bot_api_retry_after(exc.retry_after)
+        log_event(
+            logger,
+            logging.WARNING,
+            "send.flood",
+            f"Telegram flood-wait {exc.retry_after} с [chat {user_id}]",
+            chat=user_id,
+            retry_after=exc.retry_after,
+        )
         await database.release_notification(notification_id, token, retry_delay)
         return False
     except Exception as exc:
@@ -1365,6 +1393,15 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
         return 0
     except TelegramRetryAfter as exc:
         retry_delay = float(exc.retry_after) + random.uniform(0.5, 1.5)
+        METRICS.record_bot_api_retry_after(exc.retry_after)
+        log_event(
+            logger,
+            logging.WARNING,
+            "send.flood",
+            f"Telegram flood-wait {exc.retry_after} с [chat {user_id}]",
+            chat=user_id,
+            retry_after=exc.retry_after,
+        )
         for row, ctx in ready:
             await database.release_notification(ctx["id"], ctx["token"], retry_delay)
         return 0
@@ -1374,7 +1411,7 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
             await _release_after_failure(row, str(exc))
         return 0
 
-    logger.info("📦 Пачка из %s лотов доставлена одним сообщением [chat %s]", len(ready), user_id)
+    log_event(logger, logging.INFO, "send.digest", f"📦 Пачка из {len(ready)} лотов [chat {user_id}]", chat=user_id, n=len(ready))
     delivered = 0
     for row, ctx in ready:
         delivered += int(await _acknowledge_delivery(row, ctx))

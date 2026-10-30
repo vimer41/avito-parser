@@ -16,7 +16,6 @@ from scan_planner import DeadlineScheduler, calculate_interval_plan
 from tools.simulate_scheduler import simulate
 from collector import collect_source
 from source_cache import SourceSnapshotCache, SourceSnapshot
-from tools.diagnose import scan_summary
 from tests.test_anti_bot import FakeResponse
 import config
 import monitoring
@@ -211,12 +210,6 @@ class TestSharedRequestBudget(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(state.snapshot()["current_rps"], 0.25)
             self.assertLessEqual(state.snapshot()["current_rps"], 0.5)
             self.assertEqual(state.block_streak, 0)
-
-    def test_scan_log_remains_compatible_with_bounded_diagnostics(self):
-        result = scan_summary('Scan result: ok=1 elapsed_ms=100 items=60 blocked=0 pages=2 coverage_gap=1\nScan result: ok=0 elapsed_ms=20 items=0 blocked=1 failure=cooldown')
-        self.assertEqual(result["attempts"], 2)
-        self.assertEqual(result["successes"], 1)
-        self.assertEqual(result["blocked_attempts"], 1)
 
 
 class TestCatalogCoverage(unittest.TestCase):

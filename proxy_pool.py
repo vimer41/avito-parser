@@ -18,7 +18,8 @@ from curl_cffi import requests as curl_requests
 
 import logging
 import config
-from runtime_metrics import METRICS, mask_proxy_url, sanitize_proxy_credentials
+from logger_setup import log_event
+from runtime_metrics import METRICS, mask_proxy_url, sanitize_proxy_credentials, short_channel
 
 log = logging.getLogger("proxy_pool")
 
@@ -396,7 +397,7 @@ class ProxyClient:
                     round(self.effective_rate * config.PROXY_RECOVERY_FACTOR, 4),
                 )
                 self.recovery_success_streak = 0
-                log.info(
+                log.debug(
                     f"📈 Прокси {self.proxy_id} ({self.masked_url}) восстановил эффективную скорость до "
                     f"{self.effective_rate:.2f}/{self.configured_rate:.2f} req/s"
                 )
@@ -511,9 +512,16 @@ class ProxyClient:
         self._state = "quarantined"
         self.quarantine_reason = reason
         self._sync_metrics_state()
-        log.warning(
-            f"🛑 Прокси {self.proxy_id} ({self.masked_url}) переведен в карантин на {duration_seconds:.1f} с "
-            f"(причина: {sanitize_proxy_credentials(reason)}, rate={self.effective_rate:.2f} req/s)"
+        channel = short_channel(self.proxy_id, self.masked_url)
+        log_event(
+            log,
+            logging.INFO,
+            "proxy.quarantine",
+            f"🛑 {channel} в карантин на {duration_seconds:.1f} с · {reason} · {self.effective_rate:.2f} req/s",
+            ch=channel,
+            s=round(duration_seconds, 1),
+            reason=reason,
+            rate=self.effective_rate,
         )
 
     def snapshot(self) -> dict[str, Any]:

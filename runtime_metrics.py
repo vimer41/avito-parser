@@ -5,6 +5,7 @@ from __future__ import annotations
 import bisect
 from html import escape as html_escape
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,7 @@ FAILURE_LABELS = {
     "rate_limit": "Авито ограничил частоту (429)",
     "challenge": "антибот-проверка не пройдена",
     "cooldown": "канал на паузе после блокировки",
+    "no_channel": "нет свободного канала (все на паузе или заняты)",
     "catalog_missing": "страница без каталога (логин/заглушка)",
     "proxy_auth": "прокси не принял логин/пароль (407) — проверьте данные или привязку по IP",
     "proxy_forbidden": "провайдер прокси блокирует Авито (403 на CONNECT) — нужен другой провайдер или тариф",
@@ -199,8 +201,21 @@ class MinuteBucket:
     source_interval: HistogramSlice = field(default_factory=lambda: HistogramSlice(SCAN_INTERVAL_BOUNDS))
     fanout_duration: HistogramSlice = field(default_factory=lambda: HistogramSlice(SUBSECOND_LATENCY_BOUNDS))
     bot_api_service_time: HistogramSlice = field(default_factory=lambda: HistogramSlice(SUBSECOND_LATENCY_BOUNDS))
+    scan_due_lag: HistogramSlice = field(default_factory=lambda: HistogramSlice(SCAN_INTERVAL_BOUNDS))
+    pub_to_sent: HistogramSlice = field(default_factory=lambda: HistogramSlice(PUB_DELAY_BOUNDS))
 
     # Counters
+    scans_coverage_gap: int = 0
+    items_new: int = 0
+    items_queued: int = 0
+    items_stop_word: int = 0
+    items_seller: int = 0
+    items_too_old: int = 0
+    items_title: int = 0
+    bot_api_flood_max_seconds: float = 0.0
+    loop_lag_max: float = 0.0
+    loop_stalls: int = 0
+    challenges: dict[str, list[float]] = field(default_factory=dict)  # kind -> [ok, failed, seconds]
     pub_timestamp_missing_count: int = 0
     scans_completed: int = 0
     scans_fast_skipped: int = 0
@@ -231,6 +246,19 @@ class MinuteBucket:
         self.source_interval.reset()
         self.fanout_duration.reset()
         self.bot_api_service_time.reset()
+        self.scan_due_lag.reset()
+        self.pub_to_sent.reset()
+        self.scans_coverage_gap = 0
+        self.items_new = 0
+        self.items_queued = 0
+        self.items_stop_word = 0
+        self.items_seller = 0
+        self.items_too_old = 0
+        self.items_title = 0
+        self.bot_api_flood_max_seconds = 0.0
+        self.loop_lag_max = 0.0
+        self.loop_stalls = 0
+        self.challenges.clear()
         self.pub_timestamp_missing_count = 0
         self.scans_completed = 0
         self.scans_fast_skipped = 0
@@ -492,6 +520,8 @@ class RuntimeMetricsRegistry:
             "capacity_mode": "normal",
         }
         self._reset_daily()
+        self._last_row_minute = self._current_minute_id() - 1
+        self._cpu_mark = (time.process_time(), self._monotonic())
 
     # ── Daily totals for the morning admin report (the minute buckets keep only an hour) ──
 
@@ -709,10 +739,11 @@ class RuntimeMetricsRegistry:
         d_sec = float(deliver_at_to_sent_seconds or 0.0)
 
         self._daily_sent += 1
+        b = self._bucket()
         if t_sent is not None and t_pub is not None and t_pub_reliable and not is_catchup:
             self._daily_pub_to_sent.observe(max(0.0, float(t_sent) - float(t_pub)))
+            b.pub_to_sent.observe(max(0.0, float(t_sent) - float(t_pub)))
 
-        b = self._bucket()
         b.bot_api_sent_total += 1
         b.bot_api_service_time.observe(float(bot_api_service_seconds or 0.0))
 
@@ -763,6 +794,10 @@ class RuntimeMetricsRegistry:
     ) -> None:
         if revisit_seconds is not None and revisit_seconds > 0:
             self.record_source_interval(revisit_seconds)
+        if due_lag_seconds is not None:
+            self._bucket().scan_due_lag.observe(due_lag_seconds)
+        if coverage_gap:
+            self._bucket().scans_coverage_gap += 1
         if success:
             self._daily_scans_ok += 1
         else:
@@ -782,8 +817,126 @@ class RuntimeMetricsRegistry:
         if omitted_count > 0:
             self._bucket().catchup_omitted_count += int(omitted_count)
 
-    def record_bot_api_retry_after(self) -> None:
-        self._bucket().bot_api_retry_after_count += 1
+    def record_bot_api_retry_after(self, seconds: float = 0.0) -> None:
+        b = self._bucket()
+        b.bot_api_retry_after_count += 1
+        b.bot_api_flood_max_seconds = max(b.bot_api_flood_max_seconds, float(seconds))
+
+    def record_loop_lag(self, lag_seconds: float, *, stall: bool = False) -> None:
+        b = self._bucket()
+        b.loop_lag_max = max(b.loop_lag_max, float(lag_seconds))
+        b.loop_stalls += int(stall)
+
+    def record_challenge(self, kind: str, *, solved: bool, seconds: float) -> None:
+        stats = self._bucket().challenges.setdefault(kind, [0, 0, 0.0])
+        stats[0 if solved else 1] += 1
+        stats[2] += float(seconds)
+
+    def record_fanout_items(
+        self, *, new: int = 0, queued: int = 0, stop_word: int = 0, seller: int = 0, too_old: int = 0, title: int = 0
+    ) -> None:
+        """Lot funnel of one radar: what the scan found and where each lot went."""
+        b = self._bucket()
+        b.items_new += new
+        b.items_queued += queued
+        b.items_stop_word += stop_word
+        b.items_seller += seller
+        b.items_too_old += too_old
+        b.items_title += title
+
+    def process_stats(self) -> dict[str, Any]:
+        """RSS, this process's share of one CPU since the previous call, and the system load."""
+        cpu_time, wall = time.process_time(), self._monotonic()
+        prev_cpu, prev_wall = self._cpu_mark
+        self._cpu_mark = (cpu_time, wall)
+        stats: dict[str, Any] = {"cpu_pct": round(100.0 * (cpu_time - prev_cpu) / max(wall - prev_wall, 0.001), 1)}
+        try:
+            with open("/proc/self/statm", encoding="ascii") as statm:
+                stats["rss_mb"] = round(int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576, 1)
+            stats["load1"] = round(os.getloadavg()[0], 2)
+        except (OSError, AttributeError, ValueError):
+            pass  # not Linux
+        return stats
+
+    def pop_minute_rows(self) -> list[dict[str, Any]]:
+        """Finished minutes not yet returned, oldest first. Each is one row of logs/metrics.jsonl."""
+        now_mid = self._current_minute_id()
+        first = max(self._last_row_minute + 1, now_mid - self.NUM_BUCKETS + 1)
+        wall_now = self._wall_clock()
+        rows = []
+        for mid in range(first, now_mid):
+            bucket = self._buckets[mid % self.NUM_BUCKETS]
+            if bucket.minute_id == mid:
+                rows.append(self._minute_row(bucket, wall_now - (now_mid - mid - 1) * 60.0))
+        self._last_row_minute = max(self._last_row_minute, now_mid - 1)
+        return rows
+
+    def _minute_row(self, b: MinuteBucket, epoch: float) -> dict[str, Any]:
+        failures: dict[str, int] = {}
+        channels: dict[str, dict[str, Any]] = {}
+        for proxy_id, ring in self._proxy_rings.items():
+            sl = ring[b.minute_id % self.NUM_BUCKETS]
+            if sl.minute_id != b.minute_id:
+                continue
+            for kind, count in sl.failures.items():
+                failures[kind] = failures.get(kind, 0) + count
+            meta = self._proxy_meta.get(proxy_id) or {}
+            channels[short_channel(proxy_id, meta.get("masked_url"))] = {
+                "http": sl.raw_http_total,
+                "ok": sl.raw_http_2xx_3xx,
+                "403": sl.raw_http_403,
+                "429": sl.raw_http_429,
+                "5xx": sl.raw_http_5xx,
+                "terr": sl.transport_errors,
+                "coll": sl.collection_total,
+                "coll_ok": sl.collection_success,
+                "ms_p50": _ms(summarize_histograms([sl.http_latency], HTTP_LATENCY_BOUNDS)["p50"]),
+                "fail": dict(sl.failures),
+                "state": meta.get("state", "healthy"),
+                "rate": meta.get("effective_rate"),
+            }
+        pub_seen = summarize_histograms(b.pub_to_seen.values(), PUB_DELAY_BOUNDS)
+        pub_sent = summarize_histograms([b.pub_to_sent], PUB_DELAY_BOUNDS)
+        due_lag = summarize_histograms([b.scan_due_lag], SCAN_INTERVAL_BOUNDS)
+        scan_time = summarize_histograms([b.scan_duration], SCAN_INTERVAL_BOUNDS)
+        interval = summarize_histograms([b.source_interval], SCAN_INTERVAL_BOUNDS)
+        fanout = summarize_histograms([b.fanout_duration], SUBSECOND_LATENCY_BOUNDS)
+        return {
+            "t": round(epoch),
+            "ts": time.strftime("%m-%d %H:%M", time.gmtime(epoch + 3 * 3600)),
+            "scans": {
+                "ok": b.scans_completed,
+                "fail": b.scans_failed,
+                "fast": b.scans_fast_skipped,
+                "new": b.scans_with_new_items,
+                "gap": b.scans_coverage_gap,
+            },
+            "fail": failures,
+            "ch": channels,
+            "scan_s": {"p50": scan_time["p50"], "p95": scan_time["p95"]},
+            "due_s": {"p50": due_lag["p50"], "p95": due_lag["p95"]},
+            "revisit_s": {"p50": interval["p50"], "p95": interval["p95"]},
+            "fanout_s_p95": fanout["p95"],
+            "lots": {
+                "new": b.items_new,
+                "queued": b.items_queued,
+                "stop": b.items_stop_word,
+                "seller": b.items_seller,
+                "old": b.items_too_old,
+                "title": b.items_title,
+            },
+            "pub_seen_s": {"n": pub_seen["sample_count"], "p50": pub_seen["p50"], "p95": pub_seen["p95"]},
+            "pub_sent_s": {"n": pub_sent["sample_count"], "p50": pub_sent["p50"], "p95": pub_sent["p95"]},
+            "sent": b.bot_api_sent_total,
+            "flood": b.bot_api_retry_after_count,
+            "flood_max_s": round(b.bot_api_flood_max_seconds, 1),
+            "challenge": {
+                kind: {"ok": int(ok), "fail": int(failed), "avg_s": round(seconds / max(ok + failed, 1), 2)}
+                for kind, (ok, failed, seconds) in b.challenges.items()
+            },
+            "loop_max_ms": _ms(b.loop_lag_max),
+            "stalls": b.loop_stalls,
+        }
 
     def set_planned_scan_rate(self, scans_per_second: float | None) -> None:
         self._planned_scan_rate = scans_per_second if scans_per_second and scans_per_second > 0 else None
@@ -1290,6 +1443,47 @@ class RuntimeMetricsRegistry:
 
     def format_stats_report(self, max_len: int = 3800) -> str:
         return "\n\n".join(self.format_stats_messages(max_len=max_len))
+
+
+def _ms(seconds: float | None) -> int | None:
+    return None if seconds is None else int(round(seconds * 1000))
+
+
+def short_channel(proxy_id: str, masked_url: str | None = None) -> str:
+    """`direct` or the proxy's ip:port, for log lines."""
+    if proxy_id == "direct" or str(masked_url or "").startswith("direct"):
+        return "direct"
+    return sanitize_proxy_credentials(masked_url or proxy_id).split("@", 1)[-1].split("://", 1)[-1] or proxy_id
+
+
+def format_minute_line(row: dict[str, Any]) -> str:
+    """The minute's vitals in one line of bot.log."""
+    scans = row["scans"]
+    total = scans["ok"] + scans["fail"]
+    fails = sorted(row["fail"].items(), key=lambda pair: -pair[1])[:3]
+    parts = [f"сканы {scans['ok']}/{total} ({_pct(scans['ok'], total)})"]
+    if fails:
+        parts.append(" ".join(f"{kind}×{count}" for kind, count in fails))
+    lots = row["lots"]
+    parts.append(f"лоты {lots['new']}→{lots['queued']}, отпр {row['sent']}")
+    if row["pub_sent_s"]["p50"] is not None:
+        parts.append(f"pub→sent {row['pub_sent_s']['p50']:g}/{row['pub_sent_s']['p95']:g}с")
+    if row["due_s"]["p95"] is not None:
+        parts.append(f"опоздание p95 {row['due_s']['p95']:g}с")
+    if "rps_need" in row:
+        parts.append(f"rps {row['rps_need']:g}/{row['rps_have']:g}")
+    if "outbox" in row:
+        parts.append(f"outbox {row['outbox']}")
+    parts.append(f"loop {row['loop_max_ms']} мс")
+    if row["stalls"]:
+        parts.append(f"зависаний {row['stalls']}")
+    if row["flood"]:
+        parts.append(f"flood {row['flood']} (до {row['flood_max_s']:g} с)")
+    if "rss_mb" in row:
+        parts.append(f"{row['rss_mb']:g} МБ")
+    if "cpu_pct" in row:
+        parts.append(f"cpu {row['cpu_pct']:g}%")
+    return " · ".join(parts)
 
 
 def _num(value: int | float) -> str:

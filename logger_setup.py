@@ -1,130 +1,324 @@
+"""
+Logging system. All files are written by one background thread, so a log call never touches
+the disk from the event loop.
+
+  bot.log               human timeline: what the bot did, one line per event (MSK time)
+  logs/errors.log       WARNING and above: only what needs attention, with tracebacks
+  logs/user_actions.log user clicks and messages
+  logs/events.jsonl     machine-readable copy of everything, rotated to .gz
+  logs/metrics.jsonl    one row per minute; survives restarts
+  logs/crash.log        native crashes (segfault in onnx/cv2)
+
+Levels: ERROR = bug, WARNING = needs attention, INFO = what happened, DEBUG = routine detail
+(goes to events.jsonl only while debug mode is on). Avito's 403 is routine, not a warning.
+Every scan gets a 4-char trace id that follows it through parser, anti-bot, fanout and delivery.
+"""
+
+import atexit
+import contextvars
+import faulthandler
+import gzip
 import logging
 import os
+import queue
+import re
+import secrets
+import shutil
 import sys
-from logging.handlers import RotatingFileHandler
+import threading
+import time
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+
+import orjson
+
+from runtime_metrics import sanitize_proxy_credentials
 
 # Базовая директория логов
 LOGS_DIR = Path(os.getenv("LOGS_DIR", str(Path(__file__).resolve().parent / "logs")))
 
 USER_ACTIONS_LOG = LOGS_DIR / "user_actions.log"
-PARSER_LOG = LOGS_DIR / "parser.log"
 ERRORS_LOG = LOGS_DIR / "errors.log"
+EVENTS_LOG = LOGS_DIR / "events.jsonl"
+METRICS_LOG = LOGS_DIR / "metrics.jsonl"
+CRASH_LOG = LOGS_DIR / "crash.log"
 COMBINED_LOG = Path(os.getenv("COMBINED_LOG", str(Path(__file__).resolve().parent / "bot.log")))
 
 # Логгер для действий пользователей
 user_logger = logging.getLogger("user_action")
+metrics_logger = logging.getLogger("metrics.minute")
+
+MSK_OFFSET_SECONDS = 3 * 3600
+QUEUE_SIZE = 20000
+EVENTS_MAX_MB = 8
+EVENTS_BACKUPS = 6
+PROJECT_LOGGERS = ("monitoring", "scheduler", "parser", "collector", "proxy_pool", "anti_bot", "reports", "handlers")
+
+_LEVEL_TAGS = {"DEBUG": "DBG", "INFO": "   ", "WARNING": "WRN", "ERROR": "ERR", "CRITICAL": "CRT"}
+_LEVEL_LETTERS = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
+_COMPONENTS = (
+    ("monitoring", "scan"), ("collector", "scan"), ("parser", "net"), ("proxy_pool", "proxy"),
+    ("anti_bot", "antibot"), ("scheduler", "send"), ("reports", "report"), ("handlers", "ui"),
+    ("middlewares", "ui"), ("database", "db"), ("aiogram", "tg"), ("bot", "core"), ("trial_gate", "ui"),
+)
+_TOKEN_RE = re.compile(r"\b(?:bot)?\d{8,12}:[\w-]{30,}\b")
+
+_trace: contextvars.ContextVar[str] = contextvars.ContextVar("log_trace", default="")
+_listener: Optional[QueueListener] = None
+_crash_file = None
+_debug_timer: Optional[threading.Timer] = None
+_debug_until = 0.0
+dropped_records = 0
 
 
-def setup_logging():
-    """
-    Инициализирует раздельное многофайловое логирование:
-    1. logs/user_actions.log — каждое действие пользователя (кнопки, ссылки, FSM, ошибки пользователя)
-    2. logs/parser.log — сетевая активность парсера, мониторинг, обход защит
-    3. logs/errors.log — все ошибки и предупреждения (WARNING, ERROR, CRITICAL) со всего проекта
-    4. bot.log — общий консольный лог (для обратной совместимости и docker logs)
-    5. sys.stdout — вывод в терминал
-    """
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    COMBINED_LOG.parent.mkdir(parents=True, exist_ok=True)
-    # Повторная инициализация не должна оставлять открытые файлы и дублировать записи.
-    for name in ("", "user_action", "parser", "scheduler", "anti_bot", "anti_bot.manager"):
-        current_logger = logging.getLogger(name)
-        for handler in list(current_logger.handlers):
-            current_logger.removeHandler(handler)
-            handler.close()
+def new_trace() -> str:
+    """Starts a new trace in the current task and returns its id."""
+    trace_id = secrets.token_hex(2)
+    _trace.set(trace_id)
+    return trace_id
 
-    # Общий форматтер
-    std_formatter = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    # Форматтер для логов пользователей (читаемый таймлайн)
-    user_formatter = logging.Formatter(
-        fmt="%(asctime)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
 
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+def set_trace(trace_id: str = "") -> None:
+    _trace.set(trace_id or "")
 
-    # Очищаем существующие обработчики
-    for h in list(root_logger.handlers):
-        root_logger.removeHandler(h)
 
-    # Проверяем, не перенаправлен ли stdout напрямую в bot.log (например, systemd StandardOutput=append:.../bot.log)
-    is_stdout_same_as_combined = False
+def get_trace() -> str:
+    return _trace.get()
+
+
+def log_event(logger: logging.Logger, level: int, event: str, message: str, **fields) -> None:
+    """A human line for bot.log plus typed fields for events.jsonl. Secrets are masked on write."""
+    if logger.isEnabledFor(level):
+        logger.log(level, message, extra={"ev": event, "fields": fields})
+
+
+def _redact(text: str) -> str:
+    return _TOKEN_RE.sub("<token>", sanitize_proxy_credentials(text))
+
+
+def _msk_stamp(created: float) -> str:
+    return time.strftime("%m-%d %H:%M:%S", time.gmtime(created + MSK_OFFSET_SECONDS))
+
+
+def _component(record: logging.LogRecord) -> str:
+    event = getattr(record, "ev", "")
+    if event:
+        return event.split(".", 1)[0]
+    for prefix, component in _COMPONENTS:
+        if record.name.startswith(prefix):
+            return component
+    return record.name.split(".", 1)[0][:7]
+
+
+def _exception_text(record: logging.LogRecord) -> str:
+    if record.exc_info and not record.exc_text:
+        record.exc_text = logging.Formatter().formatException(record.exc_info)
+    return record.exc_text or ""
+
+
+class HumanFormatter(logging.Formatter):
+    """`10-30 17:08:12 WRN scan    a1f3 message`: columns stay aligned so a tail reads as a table."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        trace = getattr(record, "trace", "") or "····"
+        line = (
+            f"{_msk_stamp(record.created)} {_LEVEL_TAGS.get(record.levelname, record.levelname[:3])} "
+            f"{_component(record):<7} {trace} {record.getMessage()}"
+        )
+        exception = _exception_text(record)
+        if exception:
+            line += "\n" + exception
+        return _redact(line)
+
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line; `t` comes first so readers can skip old lines without parsing them."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        row = {
+            "t": round(record.created, 2),
+            "ts": _msk_stamp(record.created),
+            "l": _LEVEL_LETTERS.get(record.levelname, "I"),
+            "c": _component(record),
+        }
+        trace = getattr(record, "trace", "")
+        if trace:
+            row["id"] = trace
+        event = getattr(record, "ev", "")
+        fields = getattr(record, "fields", None)
+        if event:
+            row["ev"] = event
+        if fields:
+            row["f"] = fields
+        # A typed event carries its data in the fields; the text is repeated only where it gets read.
+        if not fields or record.levelno >= logging.WARNING:
+            row["msg"] = record.getMessage()[:500]
+        exception = _exception_text(record)
+        if exception:
+            row["exc"] = exception[-4000:]
+        return _redact(orjson.dumps(row, default=str).decode("utf-8"))
+
+
+class MetricsFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _redact(orjson.dumps(getattr(record, "fields", {}), default=str).decode("utf-8"))
+
+
+class _NameFilter(logging.Filter):
+    def __init__(self, *, only: tuple[str, ...] = (), exclude: tuple[str, ...] = ()):
+        super().__init__()
+        self.only, self.exclude = only, exclude
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self.only and record.name not in self.only:
+            return False
+        return record.name not in self.exclude
+
+
+class _ErrorsFilter(logging.Filter):
+    """A failed user action is the bot's error; a user-level warning is not."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == metrics_logger.name:
+            return False
+        return record.name != user_logger.name or record.levelno >= logging.ERROR
+
+
+class _Handoff(QueueHandler):
+    """Runs on the caller's thread: takes the trace id and leaves everything else to the writer thread."""
+
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        record.trace = _trace.get()
+        return record
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        global dropped_records
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            dropped_records += 1  # a log record is never worth blocking the event loop
+
+
+def _gzip_rotator(source: str, dest: str) -> None:
+    with open(source, "rb") as raw, gzip.open(dest, "wb", compresslevel=6) as packed:
+        shutil.copyfileobj(raw, packed)
+    os.remove(source)
+
+
+def _rotating(path: Path, max_mb: float, backups: int) -> RotatingFileHandler:
+    return RotatingFileHandler(path, maxBytes=int(max_mb * 1024 * 1024), backupCount=backups, encoding="utf-8")
+
+
+def _stdout_is_combined_log() -> bool:
+    # systemd StandardOutput=append:.../bot.log
     try:
         if COMBINED_LOG.exists() and hasattr(sys.stdout, "fileno"):
             stdout_stat = os.fstat(sys.stdout.fileno())
             log_stat = COMBINED_LOG.stat()
-            if stdout_stat.st_ino == log_stat.st_ino and stdout_stat.st_dev == log_stat.st_dev:
-                is_stdout_same_as_combined = True
+            return stdout_stat.st_ino == log_stat.st_ino and stdout_stat.st_dev == log_stat.st_dev
     except Exception:
         pass
+    return False
 
-    # 1. Вывод в консоль (stdout) — только если stdout не дублирует bot.log
-    if not is_stdout_same_as_combined:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(std_formatter)
-        console_handler.setLevel(logging.INFO)
-        root_logger.addHandler(console_handler)
 
-    # 2. Общий файл bot.log (все события)
-    combined_handler = RotatingFileHandler(
-        COMBINED_LOG,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=2,
-        encoding="utf-8"
+def stop_logging() -> None:
+    """Writes out the queue and closes the files."""
+    global _listener
+    listener, _listener = _listener, None
+    if listener is None:
+        return
+    listener.stop()
+    for handler in listener.handlers:
+        handler.close()
+
+
+atexit.register(stop_logging)
+
+
+def setup_logging():
+    """Starts the writer thread and its files; safe to call again."""
+    global _crash_file, _listener
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    COMBINED_LOG.parent.mkdir(parents=True, exist_ok=True)
+    # parser.log was merged into bot.log and events.jsonl.
+    for stale in LOGS_DIR.glob("parser.log*"):
+        stale.unlink(missing_ok=True)
+
+    stop_logging()
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+        handler.close()
+
+    human = HumanFormatter()
+    timeline = _NameFilter(exclude=(user_logger.name, metrics_logger.name))
+    handlers: list[logging.Handler] = []
+
+    def add(handler: logging.Handler, formatter: logging.Formatter, level: int, name_filter: logging.Filter) -> None:
+        handler.setFormatter(formatter)
+        handler.setLevel(level)
+        handler.addFilter(name_filter)
+        handlers.append(handler)
+
+    if not _stdout_is_combined_log():
+        add(logging.StreamHandler(sys.stdout), human, logging.INFO, timeline)
+    add(_rotating(COMBINED_LOG, 5, 2), human, logging.INFO, timeline)
+    add(_rotating(ERRORS_LOG, 3, 2), human, logging.WARNING, _ErrorsFilter())
+    add(
+        _rotating(USER_ACTIONS_LOG, 5, 2),
+        logging.Formatter(fmt="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"),
+        logging.INFO,
+        _NameFilter(only=(user_logger.name,)),
     )
-    combined_handler.setFormatter(std_formatter)
-    combined_handler.setLevel(logging.INFO)
-    root_logger.addHandler(combined_handler)
 
-    # 3. Файл только для ошибок (logs/errors.log)
-    errors_handler = RotatingFileHandler(
-        ERRORS_LOG,
-        maxBytes=3 * 1024 * 1024,
-        backupCount=2,
-        encoding="utf-8"
-    )
-    errors_handler.setFormatter(std_formatter)
-    errors_handler.setLevel(logging.WARNING)
-    root_logger.addHandler(errors_handler)
+    events_handler = _rotating(EVENTS_LOG, EVENTS_MAX_MB, EVENTS_BACKUPS)
+    events_handler.namer = lambda name: f"{name}.gz"
+    events_handler.rotator = _gzip_rotator
+    add(events_handler, JsonFormatter(), logging.DEBUG, _NameFilter(exclude=(metrics_logger.name,)))
 
-    # 4. Файл действий пользователей (logs/user_actions.log)
-    user_actions_handler = RotatingFileHandler(
-        USER_ACTIONS_LOG,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=2,
-        encoding="utf-8"
-    )
-    user_actions_handler.setFormatter(user_formatter)
-    user_actions_handler.setLevel(logging.INFO)
+    add(_rotating(METRICS_LOG, 5, 1), MetricsFormatter(), logging.INFO, _NameFilter(only=(metrics_logger.name,)))
 
-    user_logger.setLevel(logging.INFO)
-    # Не дублируем логи юзеров в общий root_logger дважды, но отправляем в user_actions.log
-    user_logger.propagate = True
-    user_logger.addHandler(user_actions_handler)
-
-    # 5. Файл мониторинга и парсера (logs/parser.log)
-    parser_handler = RotatingFileHandler(
-        PARSER_LOG,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=2,
-        encoding="utf-8"
-    )
-    parser_handler.setFormatter(std_formatter)
-    parser_handler.setLevel(logging.INFO)
-
-    for logger_name in ("parser", "scheduler", "anti_bot"):
-        pl = logging.getLogger(logger_name)
-        pl.addHandler(parser_handler)
+    record_queue: queue.Queue = queue.Queue(QUEUE_SIZE)
+    root_logger.addHandler(_Handoff(record_queue))
+    _listener = QueueListener(record_queue, *handlers, respect_handler_level=True)
+    _listener.start()
 
     # Подавляем шумные технические логи aiogram
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
     logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
+    user_logger.setLevel(logging.INFO)
+    metrics_logger.setLevel(logging.INFO)
+
+    # A segfault in a native library leaves no Python traceback without this.
+    if _crash_file is None:
+        _crash_file = open(CRASH_LOG, "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_file)
+
+
+def write_metrics_row(row: dict) -> None:
+    metrics_logger.info("", extra={"fields": row})
+
+
+def debug_mode_remaining() -> float:
+    return max(0.0, _debug_until - time.time())
+
+
+def set_debug_mode(minutes: float) -> None:
+    """Detailed events for a while. Project loggers only: aiosqlite at DEBUG would flood the disk."""
+    global _debug_timer, _debug_until
+    if _debug_timer is not None:
+        _debug_timer.cancel()
+        _debug_timer = None
+    enabled = minutes > 0
+    _debug_until = time.time() + minutes * 60 if enabled else 0.0
+    for name in PROJECT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.DEBUG if enabled else logging.NOTSET)
+    if enabled:
+        _debug_timer = threading.Timer(minutes * 60, set_debug_mode, args=(0,))
+        _debug_timer.daemon = True
+        _debug_timer.start()
 
 
 def log_user_event(
@@ -169,28 +363,28 @@ def log_user_event(
         user_logger.info(log_line)
 
 
+def _scrub_log_file(path: Path, needle: str) -> None:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", errors="ignore") as source:
+        lines = source.readlines()
+    kept = [line for line in lines if needle not in line.lower()]
+    if len(kept) != len(lines):
+        with opener(path, "wt", encoding="utf-8") as target:
+            target.writelines(kept)
+
+
 def sanitize_logs_for_user(pattern: str):
     """
-    Удаляет строки с упоминанием пользователя из всех файлов логов.
+    Удаляет строки с упоминанием пользователя из всех файлов логов, включая ротированные.
     """
     clean = pattern.strip().lstrip("@").lower()
     if not clean or len(clean) < 3:
         return
-    log_files = [
-        USER_ACTIONS_LOG,
-        ERRORS_LOG,
-        PARSER_LOG,
-        COMBINED_LOG,
-    ]
+    log_files = [*LOGS_DIR.glob("*.log*"), *LOGS_DIR.glob("*.jsonl*"), *COMBINED_LOG.parent.glob(f"{COMBINED_LOG.name}*")]
     for lf in log_files:
-        if lf.exists() and lf.is_file():
+        if lf.is_file():
             try:
-                with open(lf, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()
-                filtered = [l for l in lines if clean not in l.lower()]
-                if len(filtered) != len(lines):
-                    with open(lf, "w", encoding="utf-8") as f:
-                        f.writelines(filtered)
+                _scrub_log_file(lf, clean)
             except Exception as e:
                 logging.getLogger(__name__).warning(f"Не удалось очистить лог {lf}: {e}")
 
@@ -200,7 +394,6 @@ def cleanup_logs(max_total_mb: int = 40, keep_days: int = 3) -> int:
     Автоматическая очистка старых ротированных логов (*.log.1, *.log.2).
     Удаляет файлы старше keep_days или самые старые ротации при превышении max_total_mb.
     """
-    import time
     removed_count = 0
     now = time.time()
     cutoff = now - (keep_days * 86400)
@@ -245,4 +438,3 @@ def cleanup_logs(max_total_mb: int = 40, keep_days: int = 3) -> int:
         pass
 
     return removed_count
-

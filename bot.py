@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import subprocess
 import sys
 
 from aiohttp import web
@@ -27,10 +28,19 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Настройка многофайлового логирования (user_actions.log, parser.log, errors.log, bot.log)
-from logger_setup import setup_logging
+# Настройка логирования: описание файлов и уровней в logger_setup.py
+from logger_setup import log_event, setup_logging
 setup_logging()
 logger = logging.getLogger("bot")
+
+
+def release_version() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=5, cwd=config.BASE_DIR
+        ).stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 async def start_health_server():
@@ -151,7 +161,16 @@ async def main():
             config.STARS_SUBSCRIPTION_DAYS,
         )
         background_tasks = start_background_services(bot)
-        logger.info("Бот успешно запущен и готов к работе!")
+        version = release_version()
+        log_event(
+            logger,
+            logging.INFO,
+            "app.start",
+            f"Бот запущен · версия {version} · сеть {config.NET_MODE} · python {sys.version.split()[0]}",
+            version=version,
+            net_mode=config.NET_MODE,
+            pid=os.getpid(),
+        )
         await dp.start_polling(bot)
     finally:
         logger.info("Завершение работы бота...")
@@ -165,7 +184,7 @@ async def main():
             await bot.session.close()
         if web_runner:
             await web_runner.cleanup()
-        logger.info("Бот остановлен.")
+        log_event(logger, logging.INFO, "app.stop", "Бот остановлен", clean=True)
 
 
 if __name__ == "__main__":

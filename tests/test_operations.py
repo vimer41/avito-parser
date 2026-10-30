@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import time
@@ -147,20 +148,20 @@ class TestStarsRuntimeConfig(unittest.TestCase):
 
 class TestDiagnosticMetrics(unittest.TestCase):
     def test_scan_counts_latencies_and_safe_output(self):
-        raw = "\n".join([
+        minute = {"scans": {"ok": 2, "fail": 1}, "scan_s": {"p95": 5.0}, "sent": 4, "stalls": 1, "flood": 0,
+                  "ch": {"direct": {"403": 2, "429": 1}}}
+        metrics = "\n".join(["cut line", json.dumps(minute)])
+        log = "\n".join([
             "secret-proxy-url=http://user:password@localhost", "user-private-text=fixture",
-            "Scan result: ok=1 elapsed_ms=100 items=10 blocked=0",
-            "Scan result: ok=1 elapsed_ms=300 items=5 blocked=0",
-            "Scan result: ok=0 elapsed_ms=500 items=0 blocked=1",
-            "HTTP 429", "Live Telegram probe completed by admin=123456",
+            "Live Telegram probe completed by admin=123456",
         ])
-        result = scan_summary(raw)
+        result = scan_summary(metrics, log)
         self.assertEqual(result["attempts"], 3)
         self.assertEqual(result["successes"], 2)
-        self.assertEqual(result["blocked_attempts"], 1)
         self.assertEqual(result["success_rate"], .6667)
-        self.assertEqual(result["success_latency_p95_ms"], 300)
+        self.assertEqual(result["scan_latency_p95_s_median"], 5.0)
         self.assertEqual(result["http_429_entries"], 1)
+        self.assertEqual(result["ad_deliveries"], 4)
         self.assertEqual(result["real_admin_probe_entries"], 1)
         self.assertNotIn("password", str(result))
         self.assertNotIn("private-text", str(result))
@@ -169,4 +170,4 @@ class TestDiagnosticMetrics(unittest.TestCase):
         result = scan_summary("Starting process without any scans yet")
         self.assertEqual(result["attempts"], 0)
         self.assertIsNone(result["success_rate"])
-        self.assertIsNone(result["success_latency_p50_ms"])
+        self.assertIsNone(result["scan_latency_p95_s_median"])

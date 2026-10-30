@@ -132,7 +132,8 @@
 ├── source_cache.py            # Общие снимки и single-flight калибровка новых радаров
 ├── freshness.py               # Разбор возраста с отдельным состоянием «неизвестен»
 ├── middlewares.py             # Контроль доступа, учет 6ч триала, автосброс FSM
-├── logger_setup.py            # Раздельное логирование (user_actions, parser, errors, bot.log)
+├── logger_setup.py            # Логи: фоновая запись, bot.log, errors.log, events.jsonl, metrics.jsonl
+├── log_report.py              # Отчёт для отладки и разбор отдельного скана, радара или чата
 │
 ├── handlers/                  # Модули Telegram-хэндлеров
 │   ├── common.py              # /start, профиль, тарифы, Stars-оплата, помощь

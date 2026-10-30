@@ -12,17 +12,22 @@ from typing import Optional
 
 import config
 import database
+import logger_setup
 from collector import collect_source, settled_item_ids
+from logger_setup import get_trace, log_event, new_trace, set_trace, write_metrics_row
 from parser import AvitoParser
 from proxy_pool import get_proxy_pool
 from request_budget import get_network_block_state
-from runtime_metrics import METRICS
+from runtime_metrics import METRICS, format_minute_line, short_channel
 from scan_planner import DeadlineScheduler, calculate_interval_plan
 from seen_cache import InMemorySeenStore
 
 logger = logging.getLogger(__name__)
 MONITORING_STATS: dict = {}
 MAX_SCAN_WORKERS = 256
+SLOW_SCAN_MS = 15000
+LOOP_PROBE_SECONDS = 0.25
+LOOP_STALL_SECONDS = 1.0
 
 
 def group_sources(searches: list[dict]) -> dict[str, list[dict]]:
@@ -58,6 +63,62 @@ def source_interval(radars: list[dict], key: str = "") -> float:
     # Stable per URL so the planner does not reschedule every second, yet URLs of one tariff do not tick in step.
     jitter = (zlib.crc32(key.encode("utf-8")) % 1000) / 10000.0
     return round(float(base) * (1.0 - jitter), 2)
+
+
+def source_label(radars) -> str:
+    title = str(radars[0].get("title") or "радар")[:40] if radars else "?"
+    return f"{title} +{len(radars) - 1}" if len(radars) > 1 else title
+
+
+def log_scan_failure(task, failure, attempts: list[str], elapsed_ms: float, http_requests: int) -> None:
+    kind = failure.kind if failure else ("unknown" if attempts else "no_channel")
+    label = source_label(task.radars)
+    detail = failure.detail if failure else ""
+    log_event(
+        logger,
+        logging.INFO,
+        "scan.fail",
+        f"✗ «{label}» {kind}{f' ({detail})' if detail else ''} · {elapsed_ms / 1000:.1f} с · {', '.join(attempts) or 'нет попыток'}",
+        src=label,
+        rids=[radar.get("id") for radar in task.radars][:5],
+        kind=kind,
+        status=failure.status if failure else None,
+        detail=detail,
+        attempts=attempts,
+        ms=int(elapsed_ms),
+        http=http_requests,
+    )
+
+
+def log_scan_success(task, collection, channel: str, elapsed_ms: float, http_requests: int, fast_skipped: bool) -> None:
+    label = source_label(task.radars)
+    log_event(
+        logger,
+        logging.INFO if elapsed_ms >= SLOW_SCAN_MS else logging.DEBUG,
+        "scan.ok",
+        f"✓ «{label}» {len(collection.items)} лотов, стр. {collection.pages} · {channel} · {int(elapsed_ms)} мс"
+        + (" · без изменений" if fast_skipped else ""),
+        src=label,
+        ch=channel,
+        ms=int(elapsed_ms),
+        items=len(collection.items),
+        pages=collection.pages,
+        http=http_requests,
+        fast=fast_skipped,
+        gap=bool(collection.coverage_gap),
+    )
+
+
+async def watch_event_loop() -> None:
+    """Measures how late the loop wakes up. A stall here means something blocked every coroutine."""
+    while True:
+        started = time.monotonic()
+        await asyncio.sleep(LOOP_PROBE_SECONDS)
+        lag = time.monotonic() - started - LOOP_PROBE_SECONDS
+        stalled = lag >= LOOP_STALL_SECONDS
+        METRICS.record_loop_lag(lag, stall=stalled)
+        if stalled:
+            log_event(logger, logging.WARNING, "loop.stall", f"Event loop завис на {lag:.1f} с", s=round(lag, 2))
 
 
 async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
@@ -99,6 +160,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
     consecutive_failures = 0
     alert_sent = False
     last_ok_at = time.monotonic()
+    started_at = time.monotonic()
 
     def catalog_down() -> bool:
         # 403s on single scans are routine; alert admins only when nothing succeeded for a long time.
@@ -155,7 +217,9 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             if item is None:
                 fanout_queue.task_done()
                 break
-            task, collection, worker_id = item
+            task, collection, worker_id, scan_trace = item
+            set_trace(scan_trace)
+            fanout_t0 = time.monotonic()
             try:
                 await scheduler.process_collected_group_fanout(
                     task.key,
@@ -171,6 +235,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 logger.exception("Сбой fanout-обработки источника %s", task.key[:60])
             finally:
                 now_mono = time.monotonic()
+                METRICS.record_fanout_batch(now_mono - fanout_t0)
                 planner.complete(
                     task,
                     now_mono,
@@ -217,6 +282,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     pass
                 continue
 
+            new_trace()
             revisit_seconds = None
             state_before = planner.sources.get(task.key)
             if state_before and state_before.last_success is not None:
@@ -284,6 +350,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             collection = None
             last_failure = None
             total_http_reqs = 0
+            attempts: list[str] = []
             scan_t0 = time.monotonic()
             max_age = max((min(30, max(1, int(r.get("max_age_minutes") or 5))) for r in task.radars), default=5)
             has_pro_catchup = (
@@ -330,12 +397,16 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     if collection is not None:
                         break
                     last_failure = proxy_parser.last_failure
+                    attempts.append(
+                        f"{short_channel(client.proxy_id, client.masked_url)}: {last_failure.kind if last_failure else 'unknown'}"
+                    )
                     if last_failure and not last_failure.retryable:
                         break
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception("Сбой HTTP-сбора на прокси %s", client.proxy_id)
+                    attempts.append(f"{short_channel(client.proxy_id, client.masked_url)}: exception")
                 finally:
                     lease.release()
 
@@ -359,16 +430,11 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 is_catchup=has_pro_catchup,
                 proxy_id=scan_client.proxy_id if scan_client is not None else "direct",
                 masked_url=scan_client.masked_url if scan_client is not None else "direct",
-                failure_kind=last_failure.kind if (not ok and last_failure) else None,
+                failure_kind=None if ok else (last_failure.kind if last_failure else ("unknown" if attempts else "no_channel")),
             )
 
             if not ok:
-                logger.info(
-                    "Scan result: ok=0 elapsed_ms=%d items=0 blocked=%d failure=%s",
-                    int(elapsed_ms),
-                    int(pool.healthy_count() == 0),
-                    last_failure,
-                )
+                log_scan_failure(task, last_failure, attempts, elapsed_ms, max(1, total_http_reqs))
                 is_direct_run = getattr(pool, "is_direct_only", False) or (
                     bool(getattr(pool, "clients", []))
                     and len(pool.clients) == 1
@@ -400,13 +466,13 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     await notify_health(False)
                 continue
 
-            logger.info(
-                "Scan result: ok=1 elapsed_ms=%d items=%d blocked=0 pages=%d coverage_gap=%d fast_skip=%d",
-                collection.elapsed_ms,
-                len(collection.items),
-                collection.pages,
-                int(collection.coverage_gap),
-                int(fast_skipped),
+            log_scan_success(
+                task,
+                collection,
+                short_channel(scan_client.proxy_id, scan_client.masked_url) if scan_client is not None else "direct",
+                elapsed_ms,
+                max(1, total_http_reqs),
+                fast_skipped,
             )
             stats["successful_scans"] += 1
             stats["coverage_gaps"] += int(gap)
@@ -438,7 +504,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 changed.set()
             else:
                 if planner.mark_http_finished_fanout_pending(task, time.monotonic()):
-                    await fanout_queue.put((task, collection, worker_id))
+                    await fanout_queue.put((task, collection, worker_id, get_trace()))
                 else:
                     planner.complete(
                         task,
@@ -575,16 +641,24 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 else:
                     planner.update_capacity_mode(cap["available_rps"], cap["required_rps"], now)
                 request_cost = float(metrics_snap["avg_http_requests_per_scan"] or 1.0)
-                logger.log(
-                    logging.WARNING if MONITORING_STATS["overloaded"] else logging.INFO,
-                    "📊 Мониторинг (режим=%s, URL=%s, прокси=%s/%s, покрытие=%.1fс): %s",
-                    planner.capacity_mode,
-                    len(groups),
-                    healthy_proxies,
-                    len(proxy_snaps),
-                    planner_snap["full_coverage_age_seconds"],
-                    cap,
-                )
+                for row in METRICS.pop_minute_rows():
+                    row.update(
+                        mode=planner.capacity_mode,
+                        urls=len(groups),
+                        radars=len(searches),
+                        rps_need=round(cap["required_rps"], 2),
+                        rps_have=round(cap["available_rps"], 2),
+                        channels=f"{healthy_proxies}/{len(proxy_snaps)}",
+                        coverage_s=round(planner_snap["full_coverage_age_seconds"] or 0.0, 1),
+                        outbox=metrics_snap["outbox"]["pending_depth"],
+                        outbox_oldest_s=metrics_snap["outbox"]["oldest_pending_age_seconds"],
+                        fanout_q=fanout_queue.qsize(),
+                        uptime_s=int(now - started_at),
+                        log_drops=logger_setup.dropped_records,
+                        **METRICS.process_stats(),
+                    )
+                    write_metrics_row(row)
+                    log_event(logger, logging.INFO, "minute", format_minute_line(row))
                 alerts = METRICS.evaluate_minute_alerts(
                     active_unique_urls=len(groups),
                     proxy_snapshots=proxy_snaps,
@@ -608,7 +682,10 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
 
             await asyncio.sleep(1)
 
-    tasks = [asyncio.create_task(dispatch(), name="scan-dispatcher")]
+    tasks = [
+        asyncio.create_task(dispatch(), name="scan-dispatcher"),
+        asyncio.create_task(watch_event_loop(), name="loop-watchdog"),
+    ]
     tasks.extend(
         asyncio.create_task(fanout_worker(index), name=f"fanout-worker-{index}")
         for index in range(1, max(1, int(config.FANOUT_WORKERS)) + 1)

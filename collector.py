@@ -8,7 +8,7 @@ from typing import Awaitable, Callable, Optional
 
 import config
 from freshness import publication_age_seconds
-from parser import AvitoItem, AvitoParser, FetchFailure
+from parser import AvitoItem, AvitoParser, FetchFailure, page_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +103,7 @@ async def collect_source(
             page_items = await asyncio.to_thread(parser.parse_items, html)
             catalog_missing = not page_items and not await asyncio.to_thread(parser.has_catalog, html)
         if catalog_missing:
-            if is_real_parser:
-                logger.warning("SSR-каталог не найден на странице %s (логин, заглушка или смена вёрстки)", page_url[:80])
-            parser.last_failure = FetchFailure("catalog_missing")
+            parser.last_failure = FetchFailure("catalog_missing", detail=page_fingerprint(html) if is_real_parser else "")
             if pages == 0:
                 return None
             gap = True
@@ -151,7 +149,7 @@ async def collect_source(
     elapsed_ms = int((time.monotonic() - started) * 1000)
     parser.last_coverage_gap = gap
     if gap:
-        logger.warning(
+        logger.debug(
             "Покрытие источника ограничено: pages=%s items=%s limit=%s; продолжение не проверено",
             pages,
             len(items_by_id),

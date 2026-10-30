@@ -45,6 +45,8 @@ from anti_bot.generate_qrator_variants import (
     load_f_base,
     load_s_base,
 )
+from logger_setup import log_event
+from runtime_metrics import METRICS
 from anti_bot.pow_budget import (
     DEFAULT_POW_MAX_ITERATIONS,
     DEFAULT_POW_TIMEOUT,
@@ -165,7 +167,7 @@ def solve_qrator_challenge(
     """
     check_cancelled(cancel_event)
     qrator_html = getattr(response, "text", "") or ""
-    logger.info("🛡 Обнаружен челлендж QRATOR. Запуск протокола обхода...")
+    logger.debug("🛡 Обнаружен челлендж QRATOR. Запуск протокола обхода...")
     sequence_start = time.monotonic()
 
     # 1. Загрузка fingerprint-скрипта
@@ -293,7 +295,7 @@ def solve_qrator_challenge(
         return False
 
     check_cancelled(cancel_event)
-    logger.info("🍪 QRATOR выдал токен; доступ подтвердит только повторный запрос целевой страницы")
+    logger.debug("🍪 QRATOR выдал токен; доступ подтвердит только повторный запрос целевой страницы")
     return True
 
 
@@ -367,17 +369,17 @@ def solve_pow_challenge(
             allow_redirects=False,
         )
         if get_resp.status_code != 200:
-            logger.error(f"firewallPow/get ответил статусом {get_resp.status_code}")
+            logger.warning(f"firewallPow/get ответил статусом {get_resp.status_code}")
             return False
 
         get_json = get_resp.json()
         challenge_jwt = get_json.get("success", {}).get("result", {}).get("challenge_jwt")
         if not challenge_jwt:
-            logger.error("firewallPow/get: challenge_jwt не найден в ответе")
+            logger.warning("firewallPow/get: challenge_jwt не найден в ответе")
             return False
 
         # 2. Вычисление SHA-256 PoW
-        logger.info("🧩 firewallPow/get получен, вычисляем SHA-256 PoW...")
+        logger.debug("🧩 firewallPow/get получен, вычисляем SHA-256 PoW...")
         verify_payload = build_verify_payload(
             challenge_jwt, timeout=pow_timeout, max_iterations=max_iterations, cancel_event=cancel_event,
         )
@@ -393,7 +395,7 @@ def solve_pow_challenge(
         )
         check_cancelled(cancel_event)
         if verify_resp.status_code != 200:
-            logger.error(f"firewallPow/verify ответил статусом {verify_resp.status_code}")
+            logger.warning(f"firewallPow/verify ответил статусом {verify_resp.status_code}")
             return False
 
         verify_json = verify_resp.json()
@@ -406,10 +408,10 @@ def solve_pow_challenge(
                 session.cookies.delete("pow_challenge")
             except Exception:
                 pass
-            logger.info(f"🧩 Сервер принял PoW (unblock_ttl: {unblock_ttl} сек); проверяем целевую страницу")
+            logger.debug(f"🧩 Сервер принял PoW (unblock_ttl: {unblock_ttl} сек); проверяем целевую страницу")
             return True
         else:
-            logger.warning(f"PoW отклонен сервером: {verify_resp.text[:200]}")
+            logger.info(f"PoW отклонен сервером: {verify_resp.text[:200]}")
             return False
 
     except PowSearchError:
@@ -496,7 +498,7 @@ def solve_geetest_if_available(
         m = re.search(r"const\s+captchaId\s*=\s*['\"]([^'\"]+)['\"]", text)
         captcha_id = m.group(1) if m else GEETEST_CAPTCHA_ID
 
-        logger.info(
+        logger.debug(
             f"🤖 Запуск автономного решателя GeeTest v4 (id: {captcha_id}, "
             f"{'GeeTest напрямую с сервера' if GEETEST_DIRECT else 'через канал сканирования'})..."
         )
@@ -573,10 +575,10 @@ def solve_geetest_if_available(
 
         v_body = verify_resp.json()
         if v_body.get("success", {}).get("result", {}).get("verified") is True:
-            logger.info("🧩 Авито принял решение GeeTest; проверяем целевую страницу")
+            logger.debug("🧩 Авито принял решение GeeTest; проверяем целевую страницу")
             return True
 
-        logger.warning("GeeTest: Авито отклонил решение капчи")
+        logger.debug("GeeTest: Авито отклонил решение капчи")
         return False
 
     except PowSearchError:
@@ -596,6 +598,27 @@ def solve_geetest_if_available(
 # 4. ОБЩИЙ ДИСПЕТЧЕР ЗАЩИТЫ
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _timed_solve(kind: str, solver, *args, **kwargs) -> bool:
+    """One line per challenge: which one, solved or not, how long the solver held its thread."""
+    started = time.monotonic()
+    solved = False
+    try:
+        solved = bool(solver(*args, **kwargs))
+        return solved
+    finally:
+        seconds = time.monotonic() - started
+        METRICS.record_challenge(kind, solved=solved, seconds=seconds)
+        log_event(
+            logger,
+            logging.INFO,
+            f"antibot.{kind}",
+            f"{'✓' if solved else '✗'} {kind} {seconds:.1f} с",
+            kind=kind,
+            solved=solved,
+            s=round(seconds, 2),
+        )
+
+
 def handle_anti_bot_challenge(
     session: requests.Session,
     response: Any,
@@ -612,16 +635,15 @@ def handle_anti_bot_challenge(
     check_cancelled(cancel_event)
     # 1. QRATOR 302/429
     if is_qrator_challenge_response(response):
-        return solve_qrator_challenge(session, response, page_url, cancel_event=cancel_event)
+        return _timed_solve("qrator", solve_qrator_challenge, session, response, page_url, cancel_event=cancel_event)
 
     # 2. Firewall PoW (439, 429 или в куках)
     pow_challenge = extract_pow_challenge(response, session)
     if pow_challenge:
-        logger.info("🧩 Обнаружен челлендж Firewall PoW, запускаем решение...")
-        return solve_pow_challenge(session, pow_challenge, referer=page_url, cancel_event=cancel_event)
+                return _timed_solve("pow", solve_pow_challenge, session, pow_challenge, referer=page_url, cancel_event=cancel_event)
 
     # 3. GeeTest v4 Captcha
     if is_geetest_challenge(response):
-        return solve_geetest_if_available(session, response, page_url, cancel_event=cancel_event)
+        return _timed_solve("geetest", solve_geetest_if_available, session, response, page_url, cancel_event=cancel_event)
 
     return False

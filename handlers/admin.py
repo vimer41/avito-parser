@@ -9,6 +9,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 import config
 import database
+import logger_setup
 import ui
 from runtime_metrics import FAILURE_LABELS
 
@@ -875,32 +876,38 @@ async def cmd_admin_logs_menu(event):
     else:
         message = event
 
+    debug_left = logger_setup.debug_mode_remaining()
     menu_text = (
-        "📋 <b>ВЫГРУЗКА ЛОГОВ СИСТЕМЫ AVITO RADAR</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Выберите файл для скачивания или выгрузите полный ZIP-архив:\n\n"
-        "• 📦 <b>Все логи (ZIP)</b> — полный архив всех лог-файлов проекта\n"
-        "• 📄 <b>bot.log</b> — общий консольный лог (все события)\n"
-        "• 👥 <b>user_actions.log</b> — детальная хронология действий пользователей\n"
-        "• ⚠️ <b>errors.log</b> — журнал ошибок и исключений (WARNING / ERROR)\n"
-        "• 🕷 <b>parser.log</b> — сетевая активность парсера и мониторинга"
+        f"{ui.e('logs')} <b>Логи</b>\n\n"
+        "<b>Отчёт для отладки</b> — главное за час одним файлом: причины сбоев, каналы, ошибки. "
+        "Его достаточно прислать разработчику.\n"
+        "<b>Подробно на 10 мин</b> — в events.jsonl пишутся все шаги сканов.\n\n"
+        "• bot.log — что делал бот, по строке на событие\n"
+        "• errors.log — только то, что требует внимания\n"
+        "• user_actions.log — действия пользователей\n"
+        "• events.jsonl — все события для разбора\n"
+        "• metrics.jsonl — показатели по минутам"
     )
+    if debug_left > 0:
+        menu_text += f"\n\n{ui.e('time')} Подробный режим: ещё {int(debug_left // 60) + 1} мин."
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [ui.btn("Отчёт для отладки", "stats", callback_data="admin_log_get:report", style="primary")],
+        [ui.btn("Выключить подробный режим" if debug_left > 0 else "Подробно на 10 мин", "scope",
+                callback_data="admin_log_debug")],
+        [ui.btn("Все логи (ZIP)", "box", callback_data="admin_log_get:all_zip")],
         [
-            InlineKeyboardButton(text="📦 Скачать ВСЕ логи (ZIP-архив)", callback_data="admin_log_get:all_zip")
+            InlineKeyboardButton(text="bot.log", callback_data="admin_log_get:bot"),
+            InlineKeyboardButton(text="errors.log", callback_data="admin_log_get:errors")
         ],
         [
-            InlineKeyboardButton(text="📄 bot.log", callback_data="admin_log_get:bot"),
-            InlineKeyboardButton(text="👥 user_actions.log", callback_data="admin_log_get:user_actions")
+            InlineKeyboardButton(text="user_actions.log", callback_data="admin_log_get:user_actions"),
+            InlineKeyboardButton(text="events.jsonl", callback_data="admin_log_get:events")
         ],
+        [InlineKeyboardButton(text="metrics.jsonl", callback_data="admin_log_get:metrics")],
         [
-            InlineKeyboardButton(text="⚠️ errors.log", callback_data="admin_log_get:errors"),
-            InlineKeyboardButton(text="🕷 parser.log", callback_data="admin_log_get:parser")
-        ],
-        [
-            InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup"),
-            InlineKeyboardButton(text="👑 В админку", callback_data="admin_refresh")
+            ui.btn("Скачать БД", "db", callback_data="admin_backup"),
+            ui.btn("В админку", "admin", callback_data="admin_refresh")
         ]
     ])
 
@@ -914,6 +921,54 @@ async def cmd_admin_logs_menu(event):
     await message.answer(menu_text, reply_markup=kb, parse_mode="HTML")
 
 
+def _debug_live_state() -> dict:
+    """The current picture for the debug report: no user data and no proxy passwords."""
+    from monitoring import MONITORING_STATS
+
+    keys = ("requested_rps", "planned_rps", "available_rps", "overloaded", "healthy_proxies", "fanout_queue_depth",
+            "outbox", "successful_scans", "failed_scans", "fast_skipped_scans", "coverage_gaps")
+    state = {key: MONITORING_STATS.get(key) for key in keys}
+    state["net_mode"] = config.NET_MODE
+    state["debug_left_s"] = int(logger_setup.debug_mode_remaining())
+    state["channels"] = [
+        {key: proxy.get(key) for key in ("masked_url", "state", "effective_rate", "quarantine_reason", "quarantine_remaining")}
+        for proxy in MONITORING_STATS.get("proxies") or []
+    ]
+    return state
+
+
+async def _send_debug_report(message: Message, minutes: int) -> None:
+    from datetime import datetime
+    from aiogram.types import BufferedInputFile
+    import log_report
+
+    report = await asyncio.to_thread(log_report.build_report, minutes, _debug_live_state())
+    name = f"avito_report_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    await message.answer_document(
+        BufferedInputFile(report.encode("utf-8"), filename=name),
+        caption=f"{ui.e('stats')} Отчёт за {minutes} мин.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("report"))
+async def cmd_admin_report(message: Message):
+    if not config.is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    minutes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 60
+    await _send_debug_report(message, max(1, min(minutes, 2880)))
+
+
+@router.callback_query(F.data == "admin_log_debug")
+async def cb_admin_log_debug(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    logger_setup.set_debug_mode(0 if logger_setup.debug_mode_remaining() > 0 else 10)
+    await cmd_admin_logs_menu(call)
+
+
 @router.callback_query(F.data.startswith("admin_log_get:"))
 async def cb_admin_log_get(call: CallbackQuery):
     user_id = call.from_user.id
@@ -923,6 +978,10 @@ async def cb_admin_log_get(call: CallbackQuery):
 
     target = call.data.split(":")[1]
     await call.answer("Формирую файл логов...")
+
+    if target == "report":
+        await _send_debug_report(call.message, 60)
+        return
 
     import io
     import os
@@ -953,7 +1012,7 @@ async def cb_admin_log_get(call: CallbackQuery):
             # Файлы из папки logs/
             logs_dir = base_dir / "logs"
             if logs_dir.exists() and logs_dir.is_dir():
-                for p in logs_dir.glob("*.log*"):
+                for p in sorted(logs_dir.iterdir()):
                     if p.is_file():
                         sz = p.stat().st_size
                         if sz > 0:
@@ -992,7 +1051,8 @@ async def cb_admin_log_get(call: CallbackQuery):
         "bot": (base_dir / "bot.log", "📄 bot.log (общий консольный лог)"),
         "user_actions": (base_dir / "logs" / "user_actions.log", "👥 user_actions.log (активность пользователей)"),
         "errors": (base_dir / "logs" / "errors.log", "⚠️ errors.log (журнал ошибок и сбоев)"),
-        "parser": (base_dir / "logs" / "parser.log", "🕷 parser.log (лог парсера и запросов к Авито)"),
+        "events": (logger_setup.EVENTS_LOG, "🧾 events.jsonl (все события для разбора)"),
+        "metrics": (logger_setup.METRICS_LOG, "📈 metrics.jsonl (показатели по минутам)"),
     }
 
     if target not in log_map:
@@ -1023,7 +1083,7 @@ async def cb_admin_log_get(call: CallbackQuery):
     else:
         with open(log_path, "rb") as f:
             file_bytes = f.read()
-        send_name = f"{log_path.stem}_{timestamp}.log"
+        send_name = f"{log_path.stem}_{timestamp}{log_path.suffix}"
         file_to_send = BufferedInputFile(file_bytes, filename=send_name)
         caption = (
             f"{desc}\n\n"
