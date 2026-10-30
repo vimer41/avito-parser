@@ -876,6 +876,13 @@ async def init_db():
             m_row = await cur.fetchone()
             if m_row is not None and str(m_row[0]) in config.NET_MODES:
                 config.NET_MODE = str(m_row[0])
+        async with db.execute("SELECT value FROM bot_settings WHERE key = 'stars_prices'") as cur:
+            p_row = await cur.fetchone()
+        if p_row is not None:
+            try:
+                config.apply_stars_prices(*json.loads(str(p_row[0])))
+            except (TypeError, ValueError):
+                logger.warning("Некорректные цены Stars в bot_settings: оставляю цены из настроек окружения")
         logger.info("База данных успешно инициализирована")
 
 

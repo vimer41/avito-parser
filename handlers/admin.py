@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import logging
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
@@ -22,6 +23,7 @@ class AdminStates(StatesGroup):
     waiting_for_proxy = State()
     waiting_for_emoji_pack = State()
     waiting_for_emoji_slot = State()
+    waiting_for_stars_prices = State()
 
 
 @router.callback_query(F.data == "admin_probe")
@@ -662,9 +664,77 @@ async def cmd_admin_home(event):
          ui.btn("Логи", "logs", callback_data="admin_logs_menu")],
         [ui.btn("Отчёт за сутки", "note", callback_data="admin_daily_report"),
          ui.btn("Премиум-эмодзи", "palette", callback_data="admin_emoji")],
-        [ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
+        [ui.btn("Цены в Stars", "star", callback_data="admin_prices"),
+         ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
     )
     await _show(event, text, kb)
+
+
+# ── Цены в Telegram Stars ──────────────────────────────────────────────
+
+def _stars_prices_screen() -> tuple[str, InlineKeyboardMarkup]:
+    prices = "\n".join(f"{config.plan_title(plan)}: <b>{config.stars_price(plan)}</b> ⭐" for plan in config.PAID_PLANS)
+    text = (
+        f"{ui.e('star')} <b>Цены в Stars</b> за 30 дней\n\n{prices}\n\n"
+        "<blockquote>Новые цены действуют сразу. Счета со старой ценой оплатить нельзя: клиент откроет тариф заново. "
+        "Цены в рублях на экране тарифов не меняются.</blockquote>"
+    )
+    return text, ui.kb(
+        [ui.btn("Изменить цены", "write", callback_data="admin_prices_edit", style="primary")],
+        [ui.btn("В админку", "admin", callback_data="admin_refresh")],
+    )
+
+
+@router.callback_query(F.data == "admin_prices")
+async def cb_admin_prices(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await state.clear()
+    await call.answer()
+    await _show(call, *_stars_prices_screen())
+
+
+@router.callback_query(F.data == "admin_prices_edit")
+async def cb_admin_prices_edit(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_stars_prices)
+    await call.answer()
+    current = " ".join(str(config.stars_price(plan)) for plan in config.PAID_PLANS)
+    await _show(
+        call,
+        f"{ui.e('write')} <b>Новые цены в Stars</b>\n\n"
+        "Пришлите три числа через пробел: Базовый, Средний, Полный. Каждый следующий тариф дороже предыдущего.\n\n"
+        f"Сейчас: <code>{current}</code>",
+        ui.kb([ui.btn("Отмена", "cancel", callback_data="admin_prices")]),
+    )
+
+
+@router.message(AdminStates.waiting_for_stars_prices)
+async def msg_admin_stars_prices(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        return
+    from handlers.searches import route_menu_text
+    if await route_menu_text(message, state):
+        return
+    parts = (message.text or "").replace(",", " ").split()
+    try:
+        prices = [int(part) for part in parts]
+        if len(prices) != 3:
+            raise ValueError
+        config.apply_stars_prices(*prices)
+    except ValueError:
+        await message.answer(
+            f"Нужны три целых числа по возрастанию, не больше {config.STARS_PRICE_MAX}. Например: <code>199 449 899</code>",
+            parse_mode="HTML", reply_markup=ui.kb([ui.btn("Отмена", "cancel", callback_data="admin_prices")]),
+        )
+        return
+    await database.set_bot_setting("stars_prices", json.dumps(prices))
+    await state.clear()
+    logger.info("Цены Stars изменены: admin=%s prices=%s", message.from_user.id, prices)
+    await _show(message, *_stars_prices_screen())
 
 
 @router.message(Command("users"))

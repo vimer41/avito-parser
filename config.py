@@ -295,11 +295,20 @@ STARS_PRICE_LITE = int(os.getenv("STARS_PRICE_BASIC", "199"))
 STARS_PRICE_STANDART = int(os.getenv("STARS_PRICE_MEDIUM", "449"))
 STARS_PRICE_PRO = int(os.getenv("STARS_PRICE_FULL", "899"))
 STARS_PRICE_TEST = int(os.getenv("STARS_PRICE_TEST", "10"))
+STARS_PRICE_MAX = 100000
 STARS_SUBSCRIPTION_DAYS = 30
 if min(STARS_PRICE_LITE, STARS_PRICE_STANDART, STARS_PRICE_PRO, STARS_PRICE_TEST) <= 0:
     raise ValueError("Telegram Stars prices must be positive integers")
 if not STARS_PRICE_LITE < STARS_PRICE_STANDART < STARS_PRICE_PRO:
     raise ValueError("Tariff prices must grow: Базовый < Средний < Полный")
+
+
+def apply_stars_prices(lite: int, standart: int, pro: int) -> None:
+    """Live prices set by an admin (bot_settings.stars_prices); they win over the env defaults."""
+    global STARS_PRICE_LITE, STARS_PRICE_STANDART, STARS_PRICE_PRO
+    if not all(type(price) is int for price in (lite, standart, pro)) or not 0 < lite < standart < pro <= STARS_PRICE_MAX:
+        raise ValueError("Tariff prices must grow: Базовый < Средний < Полный")
+    STARS_PRICE_LITE, STARS_PRICE_STANDART, STARS_PRICE_PRO = lite, standart, pro
 
 
 def stars_price(plan: str) -> int:
