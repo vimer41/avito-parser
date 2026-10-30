@@ -18,84 +18,6 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-DOCS_HUB_TEXT = (
-    "<b>ДОКУМЕНТЫ И РЕГЛАМЕНТЫ СЕРВИСА AVITO RADAR</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "<i>Редакция от 26.10.2026 г. · Код верификации: mekbuda</i>\n\n"
-    "Официальные условия предоставления услуг, политика обработки данных и правила расчётов.\n\n"
-    "• <b>Характер услуги:</b> нематериальная цифровая услуга по автоматизированному мониторингу открытых объявлений.\n"
-    "• <b>Лимит операции:</b> не более 10 000 ₽ за одну транзакцию.\n"
-    "• <b>Регламент возвратов:</b> рассмотрение запроса в течение 24 часов.\n"
-    "• <b>Служба поддержки:</b> bernardgofov@gmail.com\n\n"
-    "<i>Выберите необходимый документ для ознакомления:</i>"
-)
-
-AGREEMENT_TEXT = (
-    "<b>ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ</b>\n"
-    "<i>Публичная оферта сервиса Avito Radar</i>\n"
-    "<i>Редакция от 26.10.2026 г. · Код верификации: mekbuda</i>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "<b>1. Общие положения</b>\n"
-    "1.1. Настоящее Соглашение регулирует порядок использования сервиса Avito Radar (Telegram-бот).\n"
-    "1.2. Сервис оказывает нематериальную цифровая услугу — автоматизированный программный мониторинг и оповещение о появлении публично доступных объявлений на платформе avito.ru по критериям пользователя.\n"
-    "1.3. Сервис не является представителем или аффилированным лицом Avito, не выступает стороной сделок купли-продажи и не несёт ответственности за действия продавцов.\n\n"
-    "<b>2. Тарифные планы и расчёты</b>\n"
-    "2.1. Доступ к функционалу сервиса предоставляется на условиях цифровой подписки на 30 дней без автоматического продления (без автосписаний).\n"
-    "2.2. Услуга признаётся оказанной в полном объёме с момента предоставления доступа к выбранному тарифному плану в интерфейсе бота.\n"
-    "2.3. Максимальная сумма разовой платёжной операции составляет не более 10 000 ₽ (или эквивалент в Telegram Stars).\n\n"
-    "<b>3. Порядок возврата средств</b>\n"
-    "3.1. Запросы на возврат средств принимаются через встроенную тикет-систему бота (/paysupport) или по электронной почте: <b>bernardgofov@gmail.com</b>.\n"
-    "3.2. Срок рассмотрения заявления на возврат денежных средств составляет не более <b>24 часов</b> с момента подачи обращения.\n"
-    "3.3. При подтверждении возврата доступ к услугам сервиса аннулируется, а средства возвращаются пользователю тем же способом, которым была совершена оплата.\n\n"
-    "<b>4. Контакты и верификация</b>\n"
-    "• Официальный email: <b>bernardgofov@gmail.com</b>\n"
-    "• Поддержка в Telegram: встроенная тикет-система бота (/support, /paysupport)\n"
-    "• Проверочный код верификации: <code>mekbuda</code>"
-)
-
-PRIVACY_TEXT = (
-    "<b>ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ</b>\n"
-    "<i>Политика обработки данных сервиса Avito Radar</i>\n"
-    "<i>Редакция от 26.10.2026 г. · Код верификации: mekbuda</i>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "<b>1. Общие положения</b>\n"
-    "1.1. Настоящая Политика определяет порядок обработки технических данных пользователей Telegram-бота Avito Radar.\n"
-    "1.2. Сервис собирает исключительно минимально необходимый объём данных для обеспечения доставки уведомлений и работы поисковых радаров.\n\n"
-    "<b>2. Состав обрабатываемых данных</b>\n"
-    "2.1. В рамках работы сервиса обрабатываются исключительно идентификаторы платформы Telegram:\n"
-    "• Числовой Telegram User ID (для привязки настроек радаров и подписки);\n"
-    "• Общедоступное имя пользователя (username) и имя аккаунта Telegram;\n"
-    "• Параметры поисковых ссылок, фильтров и стоп-слов, добавленных пользователем.\n"
-    "2.2. Сервис НЕ собирает паспортные данные, номера телефонов, реквизиты банковских карт и персональные сведения, не относящиеся к Telegram-аккаунту.\n\n"
-    "<b>3. Безопасность и использование данных</b>\n"
-    "3.1. Данные используются исключительно для маршрутизации уведомлений и технической поддержки.\n"
-    "3.2. Личные данные не передаются третьим лицам и не используются для сторонней рекламы.\n"
-    "3.3. Максимальный лимит расчётных операций: 10 000 ₽ за одну транзакцию.\n\n"
-    "<b>4. Контакты службы поддержки</b>\n"
-    "• Официальная почта для обращений: <b>bernardgofov@gmail.com</b>\n"
-    "• Поддержка в боте: команда /support\n"
-    "• Код подтверждения сервиса: <code>mekbuda</code>"
-)
-
-
-def get_docs_keyboard() -> InlineKeyboardMarkup:
-    return ui.kb(
-        [ui.btn("Пользовательское соглашение", "docs", callback_data="doc_agreement")],
-        [ui.btn("Политика конфиденциальности", "lock", callback_data="doc_privacy")],
-        [ui.btn("Условия подписки и возврата", "card", callback_data="payment_terms")],
-        [ui.home_btn()],
-    )
-
-
-def get_doc_nav_keyboard() -> InlineKeyboardMarkup:
-    return ui.kb(
-        [ui.btn("« К списку документов", callback_data="open_docs_menu")],
-        [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
-         ui.btn("Поддержка", "support", callback_data="support_start_ticket")],
-        [ui.home_btn()],
-    )
-
-
 def get_main_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     """Нижняя клавиатура: кнопки присылают свой текст, поэтому эмодзи в них обычные."""
     label = {key: ui.MENU[key][0] for key in ui.MENU}
@@ -116,8 +38,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
          ui.btn("Профиль", "profile", callback_data="refresh_profile")],
         [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
          ui.btn("Инструкция", "help", callback_data="open_help_menu")],
-        [ui.btn("Поддержка", "support", callback_data="support_start_ticket"),
-         ui.btn("Документы", "docs", callback_data="open_docs_menu")],
+        [ui.btn("Поддержка", "support", callback_data="support_start_ticket")],
     )
 
 
@@ -387,10 +308,7 @@ async def cmd_subscription_menu(event):
             f"{config.plan_title(plan)} — {config.rub_price(plan)} ₽{mark}", plan,
             callback_data=f"buy_tariff:{plan}", style="primary" if plan == "standart" and not current else None,
         )])
-    rows.append([
-        ui.btn("Условия", "docs", callback_data="payment_terms"),
-        ui.btn("Вопрос по оплате", "support", callback_data="payment_support"),
-    ])
+    rows.append([ui.btn("Вопрос по оплате", "support", callback_data="payment_support")])
     rows.append([ui.home_btn()])
     await ui.show(event, text, ui.kb(*rows))
 
@@ -424,7 +342,7 @@ async def cb_select_tariff(call: CallbackQuery):
         f"• Проверка каждого радара раз в <b>{config.plan_interval(plan)} с</b>\n"
         "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n\n"
         f"<i>{PLAN_PERKS[plan]}</i>\n\n"
-        "Разовая оплата без автосписаний, доступ включается сразу. Оплачивая, вы соглашаетесь с /terms.\n\n"
+        "Разовая оплата без автосписаний, доступ включается сразу.\n\n"
         "<b>Способ оплаты:</b>"
     )
 
@@ -457,31 +375,10 @@ async def cb_pay_method(call: CallbackQuery):
     await call.answer(f"Оплата {title} скоро появится.{stars_hint}", show_alert=True)
 
 
-@router.callback_query(F.data == "other_payment_methods")
+@router.callback_query(F.data.in_({"other_payment_methods", "payment_terms", "open_docs_menu", "doc_agreement", "doc_privacy"}))
 async def cb_other_payment_methods(call: CallbackQuery):
-    # The separate "other payment methods" screen is gone; old buttons open the tariff list.
+    # The "other payment methods" and document screens are gone; old buttons open the tariff list.
     await cmd_subscription_menu(call)
-
-
-# ── Документы и регламенты ─────────────────────────────────────────────
-
-@router.message(F.text.in_(ui.menu_texts("docs")))
-@router.message(Command("docs"))
-@router.callback_query(F.data == "open_docs_menu")
-async def cmd_docs_hub(event):
-    await ui.show(event, f"{ui.e('docs')} {DOCS_HUB_TEXT}", get_docs_keyboard())
-
-
-@router.message(Command("agreement", "offer", "contract"))
-@router.callback_query(F.data == "doc_agreement")
-async def cmd_doc_agreement(event):
-    await ui.show(event, f"{ui.e('docs')} {AGREEMENT_TEXT}", get_doc_nav_keyboard())
-
-
-@router.message(Command("privacy", "policy"))
-@router.callback_query(F.data == "doc_privacy")
-async def cmd_doc_privacy(event):
-    await ui.show(event, f"{ui.e('lock')} {PRIVACY_TEXT}", get_doc_nav_keyboard())
 
 
 # ── Служба поддержки и контакты ───────────────────────────────────────
@@ -502,8 +399,7 @@ async def cmd_support(event, state: Optional[FSMContext] = None):
     )
     await ui.show(event, text, ui.kb(
         [ui.btn("Написать в поддержку", "write", callback_data="support_start_ticket", style="primary")],
-        [ui.btn("Документы", "docs", callback_data="open_docs_menu"),
-         ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu")],
+        [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu")],
         [ui.home_btn()],
     ))
 

@@ -62,8 +62,6 @@ async def route_menu_text(message: Message, state: FSMContext) -> bool:
         await common.cmd_profile(message)
     elif text in ui.menu_texts("help"):
         await common.cmd_help(message)
-    elif text in ui.menu_texts("docs"):
-        await common.cmd_docs_hub(message)
     elif text in ui.menu_texts("support"):
         await common.cmd_support(message)
     elif text in ui.menu_texts("admin") and config.is_admin(message.from_user.id):

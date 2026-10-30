@@ -247,35 +247,10 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await database.is_user_allowed(self.user_id))
         self.assertIn("Деньги не списаны", self.methods("SendMessage")[-1].text)
 
-    async def test_legal_documents_and_verification_code(self):
-        await self.dispatch_message(text="/agreement")
-        text = self.methods("SendMessage")[-1].text
-        self.assertIn("ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ", text)
-        self.assertIn("mekbuda", text)
-        self.assertIn("26.10.2026", text)
-        self.assertIn("10 000 ₽", text)
-        self.assertIn("24 часов", text)
-        self.assertIn("bernardgofov@gmail.com", text)
-
-        await self.dispatch_message(text="/privacy")
-        text = self.methods("SendMessage")[-1].text
-        self.assertIn("ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ", text)
-        self.assertIn("mekbuda", text)
-        self.assertIn("bernardgofov@gmail.com", text)
-
-        await self.dispatch_message(text="/terms")
-        text = self.methods("SendMessage")[-1].text
-        self.assertIn("УСЛОВИЯ ПОДПИСКИ", text)
-        self.assertIn("mekbuda", text)
-        self.assertIn("10 000 ₽", text)
-        self.assertIn("24 часов", text)
-        self.assertIn("doc_agreement", self.callback_values())
-        self.assertIn("doc_privacy", self.callback_values())
-
-        await self.dispatch_message(text="/docs")
-        text = self.methods("SendMessage")[-1].text
-        self.assertIn("ДОКУМЕНТЫ", text)
-        self.assertIn("doc_agreement", self.callback_values())
-        self.assertIn("doc_privacy", self.callback_values())
-        self.assertIn("payment_terms", self.callback_values())
+    async def test_old_document_buttons_open_the_tariff_list(self):
+        for callback in ("open_docs_menu", "doc_agreement", "doc_privacy", "payment_terms"):
+            await self.dispatch_callback(callback)
+        self.assertIn("buy_tariff:standart", self.callback_values())
+        self.assertNotIn("payment_terms", self.callback_values())
+        self.assertNotIn("open_docs_menu", self.callback_values())
 

@@ -17,40 +17,6 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-@router.message(Command("terms"))
-@router.callback_query(F.data == "payment_terms")
-async def payment_terms(event):
-    message = event.message if isinstance(event, CallbackQuery) else event
-    text = (
-        "<b>УСЛОВИЯ ПОДПИСКИ И ОПЛАТЫ</b>\n"
-        "<i>Редакция от 29.10.2026 г. · Код верификации: mekbuda</i>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "".join(
-            f"• <b>{config.plan_title(plan)}:</b> {config.rub_price(plan)} ₽ или {config.stars_price(plan)} ⭐ / 30 дней, "
-            f"радаров — до {config.plan_radars(plan)}, проверка раз в {config.plan_interval(plan)} с.\n"
-            for plan in config.PAID_PLANS
-        ) + "\n"
-        "<b>Правила предоставления услуги:</b>\n"
-        "• Услуга является нематериальной цифровой услугой по программному мониторингу открытых объявлений.\n"
-        "• Разовая оплата за 30 дней доступа, <b>без автосписаний</b>. Подписка включается сразу после подтверждения транзакции.\n"
-        "• Неиспользованный оплаченный срок сохраняется: 30 дней суммируются к текущей дате окончания.\n"
-        "• Максимальная сумма разовой расчётной операции: не более 10 000 ₽ (или эквивалент в Telegram Stars).\n"
-        "• Скорость и доступность объявлений зависят от площадки Авито, сетевых ограничений и нагрузки сервера.\n\n"
-        "<b>Возврат средств и поддержка:</b>\n"
-        "• Заявления на возврат средств рассматриваются в течение <b>24 часов</b>.\n"
-        "• Для оформления запроса используйте команду <b>/paysupport</b> или email: <b>bernardgofov@gmail.com</b>.\n"
-        "• При подтверждении возврата доступ деактивируется, средства возвращаются тем же способом, которым была совершена оплата.\n\n"
-        "Совершая оплату, вы подтверждаете согласие с настоящими Условиями и Пользовательским соглашением."
-    )
-    await ui.show(event, f"{ui.e('card')} {text}", ui.kb(
-        [ui.btn("Соглашение", "docs", callback_data="doc_agreement"),
-         ui.btn("Конфиденциальность", "lock", callback_data="doc_privacy")],
-        [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
-         ui.btn("Вопрос по оплате", "support", callback_data="payment_support")],
-        [ui.home_btn()],
-    ))
-
-
 @router.callback_query(F.data.startswith(("demo_tariff:", "pay_request:")))
 async def legacy_checkout(call: CallbackQuery):
     # Old messages must not resurrect card/crypto payments or demo activation.
@@ -76,7 +42,7 @@ async def buy_stars(call: CallbackQuery, bot: Bot, state: FSMContext):
         plan_title = "AVITO RADAR · ТЕСТ · 1 день" if plan == "test" else f"AVITO RADAR · {config.plan_title(plan)} · 30 дней"
         plan_desc = "Тестовая проверка оплаты Telegram Stars (1 день)." if plan == "test" else (
             f"Радаров — до {config.plan_radars(plan)}, проверка раз в {config.plan_interval(plan)} с. "
-            "Разовая подписка, без автосписания. Условия: /terms. Поддержка и возврат: /paysupport."
+            "Разовая подписка, без автосписания. Поддержка и возврат: /paysupport."
         )
         label = "Тестовый доступ (1 день)" if plan == "test" else "Подписка на 30 дней"
         await bot.send_invoice(
