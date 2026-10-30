@@ -11,7 +11,7 @@ import config
 import database
 from collector import SourceCollection, settled_item_ids
 from parser import AvitoItem
-from proxy_pool import ProxyClient
+from proxy_pool import ProxyClient, ProxyPool
 from seen_cache import InMemorySeenStore
 
 
@@ -141,6 +141,90 @@ class TestTokenBucketPacing(unittest.TestCase):
             client.effective_rate = 1.0
             self.assertEqual(client._reserve_pacing_delay(), 0.0)
             self.assertAlmostEqual(client._reserve_pacing_delay(), 1.0)
+
+
+class TestChannelRouting(unittest.TestCase):
+    """Load goes to proxies that actually answer; the server and weak proxies are a reserve."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        pfile = Path(self.temp_dir.name) / "proxies.txt"
+        pfile.write_text(
+            "http://u1:p1@192.0.2.1:8001\nhttp://u2:p2@192.0.2.2:8002\nhttp://u3:p3@192.0.2.3:8003\n",
+            encoding="utf-8",
+        )
+        net_mode = patch.object(config, "NET_MODE", "both")
+        net_mode.start()
+        self.addCleanup(net_mode.stop)
+        self.pool = ProxyPool(proxy_pool_file=pfile, fallback_proxy_url="", allow_direct=True, monotonic_fn=self.clock)
+        self.good, self.other, self.weak = self.pool.clients[:3]
+        self.direct = next(client for client in self.pool.clients if client.is_direct)
+
+    def answer(self, client, *statuses):
+        for status in statuses:
+            client.record_raw_http_response(status, 0.1)
+
+    def pick(self, seconds_between=2.0):
+        lease = self.pool.acquire_client()
+        lease.release()
+        self.clock.now += seconds_between
+        return lease.client
+
+    def settle_channels(self):
+        """Everyone has a measured history and was used just now, so no probe is due."""
+        self.answer(self.good, *[200] * 10)
+        self.answer(self.other, *[200] * 10)
+        self.answer(self.weak, *[200, 403] * 5)
+        self.answer(self.direct, *[200, 403] * 5)
+        for client in self.pool.clients:
+            client.last_acquired_at = self.clock.now
+        self.clock.now += 2.0
+
+    def test_new_channels_count_as_good_but_server_stays_reserve(self):
+        self.answer(self.direct, *[200] * 10)
+        self.direct.last_acquired_at = self.clock.now
+        picked = {self.pick(0.0) for _ in range(3)}
+        self.assertEqual(picked, {self.good, self.other, self.weak})
+
+    def test_proven_proxies_rotate_and_weak_ones_wait(self):
+        self.settle_channels()
+        picked = [self.pick(1.0) for _ in range(8)]
+        self.assertEqual(set(picked), {self.good, self.other})
+        self.assertLessEqual(abs(picked.count(self.good) - picked.count(self.other)), 1)
+
+    def test_load_above_preferred_rate_spills_to_the_better_reserve(self):
+        self.settle_channels()
+        self.answer(self.direct, 200, 200)  # 60 % ok beats the weak proxy's 50 %
+        self.clock.now += 2.0
+        picked = [self.pick(0.1) for _ in range(3)]
+        self.assertEqual(picked[:2].count(self.direct), 0)
+        self.assertIs(picked[2], self.direct)
+
+    def test_timeouts_drop_a_proxy_and_a_probe_brings_it_back(self):
+        self.settle_channels()
+        for _ in range(4):
+            self.good.record_raw_http_response(None, 0.0, is_transport_error=True)
+        self.good._state, self.good.quarantined_until = "healthy", 0.0
+        self.assertLess(self.good.recent_health(), config.PROXY_GOOD_HEALTH)
+        self.assertIs(self.pick(1.0), self.other)
+        self.clock.now += config.PROXY_PROBE_INTERVAL
+        self.weak.last_acquired_at = self.direct.last_acquired_at = self.clock.now
+        self.assertIs(self.pick(1.0), self.good)
+
+        self.good.transport_failure_streak = 0
+        self.answer(self.good, 200)
+        self.clock.now += config.PROXY_PROBE_RETRY
+        self.assertIs(self.pick(1.0), self.good)  # a success brings the next probe forward
+        self.answer(self.good, *[200] * 6)
+        self.assertGreaterEqual(self.good.recent_health(), config.PROXY_GOOD_HEALTH)
+
+    def test_only_available_channel_is_used_whatever_its_score(self):
+        self.settle_channels()
+        lease = self.pool.acquire_client(exclude_ids={self.good.proxy_id, self.other.proxy_id, self.direct.proxy_id})
+        self.assertIs(lease.client, self.weak)
+        lease.release()
 
 
 class TestBatchedRadarEligibility(unittest.IsolatedAsyncioTestCase):

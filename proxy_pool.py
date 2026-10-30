@@ -179,6 +179,7 @@ class ProxyClient:
         self.transport_failure_streak: int = 0
         self.recovery_success_streak: int = 0
         self._half_open_probe_active: bool = False
+        self.last_acquired_at: float = -math.inf
 
         # Pacing & concurrency state (protected by threading.Lock so both event loop and challenge thread are safe)
         self._pacing_lock = threading.Lock()
@@ -351,6 +352,33 @@ class ProxyClient:
             return 0, 0.0
         bad = sum(1 for status in statuses if status in (403, 429, 439))
         return len(statuses), bad / len(statuses)
+
+    def recent_health(self) -> float:
+        """Share of successful answers among the last PROXY_HEALTH_WINDOW requests; a timeout counts as a failure."""
+        window = max(1, int(config.PROXY_HEALTH_WINDOW))
+        recent = list(self._history_10m)[-window:]
+        if len(recent) < min(3, window):
+            return 1.0  # a new channel gets its chance
+        ok = sum(1 for _, status, transport in recent if not transport and status is not None and 200 <= status < 400)
+        return ok / len(recent)
+
+    def routing_score(self, now: float) -> float:
+        """Higher goes first: unproven channel due for a probe, proven proxy, server or weak proxy, overloaded proxy."""
+        health = self.recent_health()
+        good = health >= float(config.PROXY_GOOD_HEALTH)
+        idle = now - self.last_acquired_at
+        if not good or self.is_direct:
+            last = self._history_10m[-1] if self._history_10m else None
+            last_ok = last is not None and not last[2] and last[1] is not None and 200 <= last[1] < 400
+            if idle >= float(config.PROXY_PROBE_RETRY if last_ok else config.PROXY_PROBE_INTERVAL):
+                return 2.0
+        # Every proven proxy scores the same, so the load rotates among them; the server is never one of them.
+        score = 1.0 if good and not self.is_direct else min(health, float(config.PROXY_GOOD_HEALTH) * 0.99)
+        with self._pacing_lock:
+            busy = self.in_flight >= self.max_in_flight
+        if busy or idle < 1.0 / float(config.PROXY_PREFERRED_RATE):
+            score -= float(config.PROXY_HOT_PENALTY)
+        return score
 
     def record_raw_http_response(
         self,
@@ -753,8 +781,9 @@ class ProxyPool:
 
     def acquire_client(self, *, exclude_ids: set[str] | None = None) -> ProxyLease | None:
         """
-        Выбирает здоровый или half-open прокси-клиент с минимальным временем готовности,
-        учитывая лимит max_in_flight и исключая уже опробованные в этом скане прокси.
+        Выбирает здоровый или half-open прокси-клиент: сначала по измеренному качеству
+        (routing_score), затем по времени готовности с учётом лимита max_in_flight,
+        исключая уже опробованные в этом скане прокси.
         """
         now = self._monotonic()
         excluded = exclude_ids or set()
@@ -764,7 +793,7 @@ class ProxyPool:
                 return None
 
             n = len(all_clients)
-            candidates: list[tuple[int, float, int, ProxyClient]] = []
+            candidates: list[tuple[float, float, int, ProxyClient]] = []
             for offset in range(n):
                 idx = (self._rr_cursor + offset) % n
                 client = all_clients[idx]
@@ -776,15 +805,16 @@ class ProxyPool:
                     # A busy fast channel usually frees up sooner than a throttled idle one becomes ready.
                     queued = max(0, client.in_flight - client.max_in_flight + 1)
                     starts_at = max(now, client._next_request_at) + queued * float(config.PROXY_BUSY_PENALTY)
-                candidates.append((starts_at, offset, client))
+                candidates.append((-client.routing_score(now), starts_at, offset, client))
 
             if not candidates:
                 return None
 
-            candidates.sort(key=lambda item: (item[0], item[1]))
-            _, chosen_offset, chosen = candidates[0]
+            candidates.sort(key=lambda item: item[:3])
+            _, _, chosen_offset, chosen = candidates[0]
             self._rr_cursor = (self._rr_cursor + chosen_offset + 1) % n
 
+            chosen.last_acquired_at = now
             with chosen._pacing_lock:
                 chosen.in_flight += 1
                 if chosen._state == "half_open":

@@ -119,6 +119,17 @@ PROXY_RATE_WINDOW = positive_int_setting("PROXY_RATE_WINDOW", "20")
 PROXY_RATE_CUT_RATIO = positive_float_setting("PROXY_RATE_CUT_RATIO", "0.25")
 # Channel choice: an extra in-flight request on a busy channel is assumed to cost this many seconds of waiting.
 PROXY_BUSY_PENALTY = positive_float_setting("PROXY_BUSY_PENALTY", "1.0")
+# Channel choice by measured quality: a proxy is proven when at least PROXY_GOOD_HEALTH of its last
+# PROXY_HEALTH_WINDOW requests succeeded. Proven proxies rotate; the rest get load only as a spill-over.
+PROXY_HEALTH_WINDOW = positive_int_setting("PROXY_HEALTH_WINDOW", "10")
+PROXY_GOOD_HEALTH = positive_float_setting("PROXY_GOOD_HEALTH", "0.7")
+# A proven IP stays preferred up to this rate; above it the score drops by PROXY_HOT_PENALTY and load spills over.
+PROXY_PREFERRED_RATE = positive_float_setting("PROXY_PREFERRED_RATE", "0.5")
+PROXY_HOT_PENALTY = positive_float_setting("PROXY_HOT_PENALTY", "0.5")
+# An unproven channel still gets one request per PROXY_PROBE_INTERVAL s, or per PROXY_PROBE_RETRY s right
+# after a success, so that a proxy back from an outage is proven again within a minute.
+PROXY_PROBE_INTERVAL = positive_float_setting("PROXY_PROBE_INTERVAL", "60")
+PROXY_PROBE_RETRY = positive_float_setting("PROXY_PROBE_RETRY", "5")
 CHALLENGE_WORKERS = positive_int_setting("CHALLENGE_WORKERS", "1")
 COOKIE_SAVE_INTERVAL = non_negative_float_setting("COOKIE_SAVE_INTERVAL", "30")
 
