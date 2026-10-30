@@ -3,6 +3,7 @@ Debug report from logs/events.jsonl and logs/metrics.jsonl: one compact text fil
 what is needed to diagnose the bot without reading raw logs.
 
     python log_report.py [--minutes 60]     the report (the same as the button in the admin panel)
+    python log_report.py --ready 24         can the bot be sold: a verdict with its evidence
     python log_report.py --trace a1f3       everything that happened to one scan
     python log_report.py --radar 12         recent events of a radar
     python log_report.py --chat 986832959   recent deliveries to a chat
@@ -26,6 +27,14 @@ ERROR_GROUPS = 15
 SAMPLE_TRACEBACK_CHARS = 1500
 TAIL_EVENTS = 25
 BUCKET_MINUTES = 5
+# Above this age of the worst link, or at this share of failed scans, a minute counts as a work outage.
+OUTAGE_COVERAGE_S = 180
+OUTAGE_FAIL_SHARE = 0.1
+COVERED_S = 120  # a link is covered when its last good scan is younger than this
+LONG_STALL_MS = 5000
+SAFE_RPS_PER_IP = 0.5
+GOOD_CHANNEL_OK = 0.7
+ENOUGH_LOTS = 20
 
 
 def _files_oldest_first(path: Path, since: float) -> list[Path]:
@@ -137,6 +146,22 @@ def channel_history(name: str, hours: int = 24) -> Optional[dict]:
     return stats
 
 
+def _outages(metrics: list[dict]) -> list[list[dict]]:
+    """Runs of 2+ minutes when scans failed or some link went unchecked; an hourly average hides them."""
+    runs: list[list[dict]] = []
+    current: list[dict] = []
+    for row in metrics:
+        ok, failed = _sum([row], "scans", "ok"), _sum([row], "scans", "fail")
+        if (ok + failed and failed / (ok + failed) >= OUTAGE_FAIL_SHARE) or (row.get("coverage_s") or 0) > OUTAGE_COVERAGE_S:
+            current.append(row)
+        elif current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    return [run for run in runs if len(run) >= 2]
+
+
 def findings(metrics: list[dict], events: list[dict]) -> list[str]:
     """What stands out, so the reader starts with the likely cause and not with the tables."""
     if not metrics:
@@ -169,6 +194,10 @@ def findings(metrics: list[dict], events: list[dict]) -> list[str]:
     starts = [row for row in events if row.get("ev") == "app.start"]
     if len(starts) > 1:
         notes.append(f"Бот перезапускался {len(starts)} раз за период.")
+    outages = _outages(metrics)
+    if outages:
+        worst = max(outages, key=len)
+        notes.append(f"Провалов работы: {len(outages)}, всего {sum(map(len, outages))} мин, самый долгий {len(worst)} мин с {worst[0].get('ts')}.")
     if not notes:
         notes.append("Явных проблем не видно.")
     return notes
@@ -188,10 +217,10 @@ def _restarts(events: list[dict]) -> list[str]:
     return lines
 
 
-def _timeline(metrics: list[dict]) -> list[str]:
+def _timeline(metrics: list[dict], bucket: int = BUCKET_MINUTES) -> list[str]:
     lines = ["время  сканы ok/всего  причины  лоты→очередь  отпр  pub→sent p50  опозд p95  rps нужно/есть  outbox  loop мс  rss"]
-    for start in range(0, len(metrics), BUCKET_MINUTES):
-        chunk = metrics[start : start + BUCKET_MINUTES]
+    for start in range(0, len(metrics), bucket):
+        chunk = metrics[start : start + bucket]
         ok, failed = _sum(chunk, "scans", "ok"), _sum(chunk, "scans", "fail")
         lines.append(
             f"{chunk[0].get('ts', '')[-5:]}  {ok}/{ok + failed} ({_pct(ok, ok + failed)})  {_top(_merge(chunk, 'fail'), 3)}  "
@@ -290,7 +319,7 @@ def _compact(row: dict) -> str:
 def _crash_tail() -> list[str]:
     if not CRASH_LOG.is_file() or CRASH_LOG.stat().st_size == 0:
         return []
-    return CRASH_LOG.read_text(encoding="utf-8", errors="replace")[-1500:].splitlines()
+    return CRASH_LOG.read_text(encoding="utf-8", errors="replace")[-6000:].splitlines()
 
 
 def _section(title: str, lines: list[str]) -> list[str]:
@@ -325,6 +354,198 @@ def build_report(minutes: int = 60, live_state: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+def _percentile(values: list[float], share: float) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(len(ordered) * share))] if ordered else 0.0
+
+
+def _grade(value: float, good: float, fair: float) -> str:
+    """Higher is better when good > fair, lower is better otherwise."""
+    if good >= fair:
+        return "✅" if value >= good else "⚠️" if value >= fair else "❌"
+    return "✅" if value <= good else "⚠️" if value <= fair else "❌"
+
+
+def _lots(events: list[dict]) -> list[dict]:
+    return [row.get("f") or {} for row in events if row.get("ev") == "lot.new"]
+
+
+def _bot_waits(lots: list[dict]) -> list[float]:
+    """How long a lot already visible on Avito waited for the bot's next look."""
+    return [min(lot["gap"], lot["age"]) for lot in lots if lot.get("fresh") and not lot.get("promo")]
+
+
+def _safe_capacity_share(metrics: list[dict]) -> float:
+    """Share of minutes when proven proxies alone cover the load at the safe per-IP rate, with a 20 % reserve."""
+    covered = total = 0
+    for row in metrics:
+        need = row.get("rps_need")
+        if not need:
+            continue
+        total += 1
+        good = sum(
+            1 for name, stats in (row.get("ch") or {}).items()
+            if name != "direct" and stats.get("http", 0) >= 3 and stats.get("ok", 0) / stats["http"] >= GOOD_CHANNEL_OK
+        )
+        covered += good * SAFE_RPS_PER_IP >= need * 1.2
+    return covered / total if total else 0.0
+
+
+def readiness_checks(metrics: list[dict], events: list[dict], hours: int) -> list[str]:
+    """Each line starts with ✅ ⚠️ ❌ or ⏳ (not enough data). Avito's own delay is not graded: the bot cannot change it."""
+    checks = []
+
+    def add(mark: str, name: str, value: str, norm: str) -> None:
+        checks.append(f"{mark} {name}: {value} (норма: {norm})")
+
+    seen = len(metrics) / (hours * 60)
+    crashes = sum("УПАЛ" in line for line in _restarts(events))
+    mark = "⏳" if seen < 0.8 else "❌" if crashes else _grade(seen, 0.99, 0.95)
+    add(mark, "Работа без перерывов", f"{seen:.1%} времени, падений {crashes}", "99 % и 0 падений")
+
+    coverage = [row["coverage_s"] for row in metrics if row.get("coverage_s") is not None]
+    if coverage:
+        share, worst = sum(1 for age in coverage if age <= COVERED_S) / len(coverage), max(coverage)
+        mark = _grade(share, 0.99, 0.95)
+        add("⚠️" if mark == "✅" and worst > 300 else mark, "Все ссылки под присмотром",
+            f"{share:.1%} минут, худшая слепая зона {worst:.0f} с", f"99 % минут за {COVERED_S} с, зона до 300 с")
+    else:
+        add("⏳", "Все ссылки под присмотром", "нет данных", "99 % минут")
+
+    ok, failed = _sum(metrics, "scans", "ok"), _sum(metrics, "scans", "fail")
+    add(_grade(ok / (ok + failed), 0.97, 0.93) if ok + failed else "⏳", "Успешные сканы", f"{_pct(ok, ok + failed)} из {ok + failed}", "97 %")
+
+    waits = _bot_waits(_lots(events))
+    value = f"p95 {_percentile(waits, 0.95):.0f} с по {len(waits)} лотам"
+    add(_grade(_percentile(waits, 0.95), 45, 90) if len(waits) >= ENOUGH_LOTS else "⏳", "Бот замечает лот", value, f"p95 до 45 с, от {ENOUGH_LOTS} лотов")
+
+    sent, lost = _sum(metrics, "sent"), _sum(metrics, "lost", "expired") + _sum(metrics, "lost", "failed")
+    flood = _sum(metrics, "flood")
+    mark = _grade(lost / (sent + lost), 0.005, 0.02) if sent + lost else "⏳"
+    add("⚠️" if mark == "✅" and flood else mark, "Доставка", f"отправлено {sent}, потеряно {lost}, flood-wait {flood}", "потери до 0,5 %, без flood-wait")
+
+    long_stalls = sum(1 for row in metrics if (row.get("loop_max_ms") or 0) >= LONG_STALL_MS)
+    add(_grade(long_stalls, 0, 2), "Зависания бота", f"{long_stalls} минут с паузой от {LONG_STALL_MS // 1000} с", "0")
+
+    capacity = _safe_capacity_share(metrics)
+    add(_grade(capacity, 0.95, 0.8) if metrics else "⏳", "Запас хороших прокси", f"хватает {capacity:.0%} минут",
+        f"95 % минут при {SAFE_RPS_PER_IP} запр/с на IP и запасе 20 %")
+    return checks
+
+
+def readiness_verdict(checks: list[str]) -> str:
+    marks = {line.split(" ", 1)[0] for line in checks}
+    if "❌" in marks:
+        return "🔴 Продавать рано: есть проваленные пункты."
+    if "⏳" in marks:
+        return "🟡 Данных мало: вердикт будет точным после суток работы и 20+ лотов."
+    if "⚠️" in marks:
+        return "🟡 Можно продавать осторожно: есть пункты на грани."
+    return "🟢 Можно продавать: все пункты в норме."
+
+
+def _lot_timing(events: list[dict]) -> list[str]:
+    lots = _lots(events)
+    if not lots:
+        return []
+    organic = [lot for lot in lots if not lot.get("promo")]
+    fresh = [lot for lot in organic if lot.get("fresh")]
+    old = [lot for lot in organic if not lot.get("fresh")]
+
+    def split(group: list[dict], title: str) -> list[str]:
+        if not group:
+            return []
+        ages = [lot["age"] for lot in group]
+        bot = [min(lot["gap"], lot["age"]) for lot in group]
+        hidden = [lot["age"] - min(lot["gap"], lot["age"]) for lot in group]
+        return [
+            f"{title} ({len(group)}): от публикации до бота p50 {_percentile(ages, 0.5):.0f} с, p95 {_percentile(ages, 0.95):.0f} с",
+            f"  Авито не показывал: p50 {_percentile(hidden, 0.5):.0f} с, p95 {_percentile(hidden, 0.95):.0f} с",
+            f"  бот не смотрел: p50 {_percentile(bot, 0.5):.0f} с, p95 {_percentile(bot, 0.95):.0f} с",
+        ]
+
+    by_radar = Counter(lot.get("rid") for lot in old)
+    return [
+        f"Новых лотов с точным временем: {len(lots)}, реклама {len(lots) - len(organic)}.",
+        *split(fresh, "Свежие"),
+        *split(old, "Старше лимита радара"),
+        *([f"Старые по радарам: {_top(by_radar, 5)}"] if by_radar else []),
+    ]
+
+
+def _channel_load(metrics: list[dict]) -> list[str]:
+    lines = ["канал: запр/мин · ok · 403/429 · обрывы · каталог ok · на паузе"]
+    for name, stats in sorted(_channels(metrics).items()):
+        minutes = [row["ch"][name] for row in metrics if name in (row.get("ch") or {})]
+        http = stats.get("http", 0)
+        blocks = stats.get("403", 0) + stats.get("429", 0)
+        paused = sum(1 for minute in minutes if minute.get("state") == "quarantined")
+        lines.append(
+            f"{name}: {http / max(len(minutes), 1):.1f} · {_pct(stats.get('ok', 0), http)} · {_pct(blocks, http)} · "
+            f"{stats.get('terr', 0)} · {_pct(stats.get('coll_ok', 0), stats.get('coll', 0))} · {paused} мин из {len(minutes)}"
+        )
+    return lines
+
+
+def _source_table(metrics: list[dict]) -> list[str]:
+    merged: dict[str, dict] = {}
+    for row in metrics:
+        for key, stats in (row.get("src") or {}).items():
+            target = merged.setdefault(key, Counter())
+            target.update({field: stats.get(field, 0) for field in ("ok", "fail", "retry", "blocked")})
+            target["q"], target["to"] = stats.get("q"), stats.get("to")
+    if not merged:
+        return []
+    lines = ["радар «запрос» → адрес на Авито: сканов · провалов · повторов · блоков"]
+    for key, stats in sorted(merged.items(), key=lambda pair: -pair[1]["fail"]):
+        scans = stats["ok"] + stats["fail"]
+        lines.append(f"#{key} «{stats['q']}» → {stats['to']}: {scans} · {_pct(stats['fail'], scans)} · {stats['retry']} · {stats['blocked']}")
+    return lines
+
+
+def _outage_lines(metrics: list[dict]) -> list[str]:
+    lines = []
+    for run in _outages(metrics):
+        ok, failed = _sum(run, "scans", "ok"), _sum(run, "scans", "fail")
+        dead = [
+            name for name, stats in sorted(_channels(run).items())
+            if stats.get("http", 0) >= 5 and stats.get("ok", 0) / stats["http"] < 0.1
+        ]
+        lines.append(
+            f"{run[0].get('ts')} … {str(run[-1].get('ts'))[-5:]} · {len(run)} мин · провалов {failed} из {ok + failed} · "
+            f"слепая зона до {_worst(run, 'coverage_s')} с · {_top(_merge(run, 'fail'), 3)}"
+            + (f" · не отвечали: {', '.join(dead)}" if dead else "")
+        )
+    return lines
+
+
+def build_readiness(hours: int = 24, live_state: Optional[dict] = None) -> str:
+    """The sale decision on one page: verdict first, then the numbers behind each point."""
+    now = time.time()
+    events = read_rows(EVENTS_LOG, now - hours * 3600)
+    metrics = read_rows(METRICS_LOG, now - hours * 3600)
+    checks = readiness_checks(metrics, events, hours)
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(now + 3 * 3600))
+    lines = [f"# Avito Radar: готовность к продаже за {hours} ч, {stamp} МСК", f"Минутных строк: {len(metrics)}, событий: {len(events)}.", ""]
+    lines += _section("Вердикт", [readiness_verdict(checks)])
+    lines += _section("Критерии", checks)
+    lines += _section("Скорость лота", _lot_timing(events))
+    lines += _section("Провалы работы", _outage_lines(metrics))
+    lines += _section("По часам", _timeline(metrics, 60))
+    lines += _section("Каналы", _channel_load(metrics))
+    lines += _section("Ссылки", _source_table(metrics))
+    lines += _section("Воронка лотов", [_funnel(metrics)])
+    lines += _section("Антибот", _challenges(metrics))
+    lines += _section("Запуски", _restarts(events))
+    if live_state:
+        lines += _section("Состояние сейчас", [json.dumps(live_state, ensure_ascii=False, default=str)])
+    lines += _section("Ошибки и предупреждения", _error_groups(events))
+    crash = _crash_tail()
+    if crash:
+        lines += _section("crash.log", crash)
+    return "\n".join(lines)
+
+
 def select(rows: list[dict], trace: str = "", radar: int = 0, chat: int = 0, text: str = "") -> list[dict]:
     def matches(row: dict) -> bool:
         fields = row.get("f") or {}
@@ -344,12 +565,16 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8")
     args = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     args.add_argument("--minutes", type=int, default=60)
+    args.add_argument("--ready", type=int, default=0)
     args.add_argument("--trace", default="")
     args.add_argument("--radar", type=int, default=0)
     args.add_argument("--chat", type=int, default=0)
     args.add_argument("--grep", default="")
     args.add_argument("--limit", type=int, default=200)
     options = args.parse_args()
+    if options.ready:
+        print(build_readiness(options.ready))
+        return
     if not (options.trace or options.radar or options.chat or options.grep):
         print(build_report(options.minutes))
         return

@@ -881,6 +881,7 @@ async def cmd_admin_logs_menu(event):
         f"{ui.e('logs')} <b>Логи</b>\n\n"
         "<b>Отчёт для отладки</b> — главное за час одним файлом: причины сбоев, каналы, ошибки. "
         "Его достаточно прислать разработчику.\n"
+        "<b>Готовность к продаже</b> — вердикт за сутки: скорость, надёжность, прокси, ссылки.\n"
         "<b>Подробно на 10 мин</b> — в events.jsonl пишутся все шаги сканов.\n\n"
         "• bot.log — что делал бот, по строке на событие\n"
         "• errors.log — только то, что требует внимания\n"
@@ -893,6 +894,7 @@ async def cmd_admin_logs_menu(event):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [ui.btn("Отчёт для отладки", "stats", callback_data="admin_log_get:report", style="primary")],
+        [ui.btn("Готовность к продаже", "ok", callback_data="admin_log_get:ready", style="success")],
         [ui.btn("Выключить подробный режим" if debug_left > 0 else "Подробно на 10 мин", "scope",
                 callback_data="admin_log_debug")],
         [ui.btn("Все логи (ZIP)", "box", callback_data="admin_log_get:all_zip")],
@@ -951,6 +953,30 @@ async def _send_debug_report(message: Message, minutes: int) -> None:
     )
 
 
+async def _send_readiness_report(message: Message, hours: int) -> None:
+    from datetime import datetime
+    from aiogram.types import BufferedInputFile
+    import log_report
+
+    report = await asyncio.to_thread(log_report.build_readiness, hours, _debug_live_state())
+    verdict = report.split("## Вердикт\n", 1)[-1].split("\n", 1)[0]
+    name = f"avito_ready_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    await message.answer_document(
+        BufferedInputFile(report.encode("utf-8"), filename=name),
+        caption=f"{ui.e('stats')} Готовность за {hours} ч.\n{html.escape(verdict)}",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("ready"))
+async def cmd_admin_ready(message: Message):
+    if not config.is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    hours = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 24
+    await _send_readiness_report(message, max(1, min(hours, 72)))
+
+
 @router.message(Command("report"))
 async def cmd_admin_report(message: Message):
     if not config.is_admin(message.from_user.id):
@@ -981,6 +1007,9 @@ async def cb_admin_log_get(call: CallbackQuery):
 
     if target == "report":
         await _send_debug_report(call.message, 60)
+        return
+    if target == "ready":
+        await _send_readiness_report(call.message, 24)
         return
 
     import io

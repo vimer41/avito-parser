@@ -301,6 +301,16 @@ def write_metrics_row(row: dict) -> None:
     metrics_logger.info("", extra={"fields": row})
 
 
+def arm_stall_dump(seconds: float) -> None:
+    """All thread stacks go to crash.log unless re-armed in time. faulthandler's C thread works while the GIL is held."""
+    if _crash_file is not None:
+        faulthandler.dump_traceback_later(seconds, file=_crash_file)
+
+
+def disarm_stall_dump() -> None:
+    faulthandler.cancel_dump_traceback_later()
+
+
 def debug_mode_remaining() -> float:
     return max(0.0, _debug_until - time.time())
 

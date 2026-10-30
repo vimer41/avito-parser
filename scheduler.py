@@ -23,7 +23,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboar
 import config
 import database
 import ui
-from freshness import freshness_status, publication_age_seconds
+from freshness import freshness_status, normalize_timestamp, publication_age_seconds
 from request_budget import get_network_block_state, RequestDeferred, RequestBudgetExceeded
 from logger_setup import get_trace, log_event, set_trace
 from runtime_metrics import METRICS
@@ -34,6 +34,7 @@ from source_cache import SOURCE_SNAPSHOTS, SourceSnapshot
 logger = logging.getLogger(__name__)
 
 LAST_SCAN_TIMESTAMP = 0
+MAX_LOT_LOGS_PER_SCAN = 20
 NOTIFICATION_WAKEUP_EVENT = asyncio.Event()
 
 
@@ -755,6 +756,33 @@ def parse_created_epoch(radar: dict) -> Optional[float]:
         return None
 
 
+def log_new_lots(radar_id: int, items: list, collection: SourceCollection, previous_scan_at: float, fresh: dict) -> None:
+    """
+    Where a lot's age went. It was not in the previous successful scan, so Avito hid it at least until then
+    (`age` minus `gap`), and `gap` is how long the bot was not looking. Kept at INFO: the speed verdict needs every lot.
+    """
+    if previous_scan_at <= 0:
+        return
+    for item in items[:MAX_LOT_LOGS_PER_SCAN]:
+        published = normalize_timestamp(item.timestamp)
+        if published is None:
+            continue
+        seen_at = collection.discovery_times.get(item.item_id, collection.captured_at)
+        age = max(0.0, seen_at - published)
+        log_event(
+            logger,
+            logging.INFO,
+            "lot.new",
+            f"Новый лот, {age:.0f} с после публикации · радар #{radar_id}",
+            rid=radar_id,
+            item=item.item_id,
+            age=round(age, 1),
+            gap=round(max(0.0, seen_at - previous_scan_at), 1),
+            fresh=bool(fresh.get(item.item_id)),
+            promo=bool(item.is_promotion),
+        )
+
+
 async def process_collected_group_fanout(
     clean_url: str,
     radars_for_url: List[dict],
@@ -901,6 +929,7 @@ async def process_collected_group_fanout(
 
         unknown_ids = {item_id for item_id, status in ages.items() if status is None}
         fresh_items = [item for item in new_items if ages[item.item_id] is True]
+        log_new_lots(radar_id, new_items, collection, previous_processed_at, normal_fresh_flags)
 
         deliverable_items = []
         stop_word_hits = seller_hits = 0

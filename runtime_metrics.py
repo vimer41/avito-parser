@@ -231,6 +231,8 @@ class MinuteBucket:
     text_only_sent_count: int = 0
     catchup_sent_count: int = 0
     catchup_omitted_count: int = 0
+    outbox_expired_count: int = 0
+    outbox_failed_count: int = 0
 
     def reset(self, minute_id: int) -> None:
         self.minute_id = minute_id
@@ -274,6 +276,8 @@ class MinuteBucket:
         self.text_only_sent_count = 0
         self.catchup_sent_count = 0
         self.catchup_omitted_count = 0
+        self.outbox_expired_count = 0
+        self.outbox_failed_count = 0
 
 
 def calculate_capacity_report(
@@ -503,6 +507,7 @@ class RuntimeMetricsRegistry:
             "capacity_deficit": AlertRuleState(),
         }
         self._pending_depth_history: list[int] = []
+        self._source_stats: dict[str, dict[str, Any]] = {}
         self._alert_cooldown_seconds: float = 300.0
         self._last_capacity_report: dict[str, Any] = {}
         # Scans per second the planner aims for (sum of 1/interval over URLs); None = uniform SCAN_INTERVAL_* range.
@@ -771,10 +776,22 @@ class RuntimeMetricsRegistry:
         b.deliver_at_to_sent_all.observe(d_sec)
 
     def record_outbox_expired(self, count: int = 1) -> None:
-        pass
+        self._bucket().outbox_expired_count += int(count)
 
     def record_outbox_failed(self, count: int = 1) -> None:
-        pass
+        self._bucket().outbox_failed_count += int(count)
+
+    def record_source_scan(self, key: str, *, ok: bool, attempts: list[str], query: str = "", target: str = "") -> None:
+        """Per-link totals for the readiness report; they leave with pop_source_stats, not with every minute row."""
+        stats = self._source_stats.setdefault(key, {"ok": 0, "fail": 0, "retry": 0, "blocked": 0})
+        stats["ok" if ok else "fail"] += 1
+        stats["retry"] += len(attempts)
+        stats["blocked"] += sum(1 for attempt in attempts if attempt.endswith("forbidden"))
+        stats.update(q=query, to=target)
+
+    def pop_source_stats(self) -> dict[str, dict[str, Any]]:
+        stats, self._source_stats = self._source_stats, {}
+        return stats
 
     def record_scan_attempt(
         self,
@@ -928,6 +945,8 @@ class RuntimeMetricsRegistry:
             "pub_seen_s": {"n": pub_seen["sample_count"], "p50": pub_seen["p50"], "p95": pub_seen["p95"]},
             "pub_sent_s": {"n": pub_sent["sample_count"], "p50": pub_sent["p50"], "p95": pub_sent["p95"]},
             "sent": b.bot_api_sent_total,
+            "send_s_p95": summarize_histograms([b.queued_to_sent_all], SUBSECOND_LATENCY_BOUNDS)["p95"],
+            "lost": {"expired": b.outbox_expired_count, "failed": b.outbox_failed_count},
             "flood": b.bot_api_retry_after_count,
             "flood_max_s": round(b.bot_api_flood_max_seconds, 1),
             "challenge": {

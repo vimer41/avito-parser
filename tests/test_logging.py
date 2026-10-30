@@ -270,8 +270,89 @@ class TestReport(LogFixture):
         self.assertEqual(stats["fail"]["forbidden"], 2)
         self.assertIsNone(log_report.channel_history("10.0.0.1:3000"))
 
+    def healthy_minute(self, stamp, **overrides):
+        channel = {"http": 15, "ok": 14, "403": 1, "429": 0, "5xx": 0, "terr": 0, "coll": 15, "coll_ok": 14,
+                   "ms_p50": 500, "fail": {}, "state": "healthy", "rate": 1.5}
+        row = self.minute(
+            stamp, scans={"ok": 60, "fail": 0, "fast": 40, "new": 20, "gap": 0}, fail={}, flood=0, stalls=0, loop_max_ms=100,
+            ch={f"10.0.0.{i}:3000": dict(channel) for i in range(5)}, rps_need=1.4, rps_have=7.0, coverage_s=25.0,
+            sent=3, lost={"expired": 0, "failed": 0},
+        )
+        row.update(overrides)
+        return row
+
+    def write_day(self, make_row, minutes=1440):
+        now = int(time.time())
+        for index in range(minutes):
+            write_metrics_row(make_row(now - 60 * (minutes - index)))
+
+    def lots(self, count, **fields):
+        logger = logging.getLogger("scheduler")
+        for index in range(count):
+            lot = {"rid": 7, "item": str(index), "age": 130.0, "gap": 20.0, "fresh": True, "promo": False, **fields}
+            log_event(logger, logging.INFO, "lot.new", "лот", **lot)
+
+    def test_healthy_day_can_be_sold_and_splits_avito_delay_from_the_bot(self):
+        self.write_day(self.healthy_minute)
+        self.lots(30)
+        self.lots(4, fresh=False, age=900.0)
+        self.lots(2, promo=True, age=5000.0, fresh=False)
+        self.flush()
+
+        report = log_report.build_readiness(24, {"net_mode": "both"})
+        self.assertIn("🟢 Можно продавать", report)
+        self.assertIn("✅ Бот замечает лот: p95 20 с по 30 лотам", report)
+        self.assertIn("Свежие (30): от публикации до бота p50 130 с", report)
+        self.assertIn("Авито не показывал: p50 110 с", report)
+        self.assertIn("бот не смотрел: p50 20 с", report)
+        self.assertIn("Старше лимита радара (4)", report)
+        self.assertIn("реклама 2", report)
+
+    def test_outage_fails_the_verdict_and_names_the_dead_channels(self):
+        def row(stamp):
+            offset = (int(time.time()) - stamp) // 60
+            if not 100 <= offset < 220:
+                return self.healthy_minute(stamp)
+            dead = {"http": 6, "ok": 0, "403": 0, "429": 0, "5xx": 0, "terr": 6, "coll": 2, "coll_ok": 0,
+                    "ms_p50": 50, "fail": {"timeout": 2}, "state": "half_open", "rate": 1.5}
+            return self.healthy_minute(
+                stamp, scans={"ok": 40, "fail": 20, "fast": 30, "new": 10, "gap": 0}, fail={"forbidden": 20}, coverage_s=900.0,
+                ch={"31.12.95.90:3000": dead},
+            )
+
+        self.write_day(row)
+        self.lots(30)
+        self.flush()
+
+        report = log_report.build_readiness(24)
+        self.assertIn("🔴 Продавать рано", report)
+        self.assertIn("120 мин · провалов 2400 из 7200", report)
+        self.assertIn("не отвечали: 31.12.95.90:3000", report)
+        self.assertIn("❌ Все ссылки под присмотром", report)
+        hour_note = log_report.findings(log_report.read_rows(log_report.METRICS_LOG, 0), [])
+        self.assertTrue(any("Провалов работы: 1, всего 120 мин" in note for note in hour_note))
+
+    def test_short_history_gives_no_verdict_yet(self):
+        self.write_day(self.healthy_minute, minutes=120)
+        self.flush()
+        report = log_report.build_readiness(24)
+        self.assertIn("🟡 Данных мало", report)
+        self.assertIn("⏳ Бот замечает лот", report)
+
+    def test_link_table_merges_source_rows_worst_first(self):
+        now = int(time.time())
+        first = {"172": {"ok": 8, "fail": 2, "retry": 5, "blocked": 4, "q": "technics sl-1200", "to": "/moskva/audio_i_video +context"},
+                 "165": {"ok": 10, "fail": 0, "retry": 0, "blocked": 0, "q": "hasselblad 500", "to": "/moskva/fototehnika"}}
+        write_metrics_row(self.healthy_minute(now - 660, src=first))
+        write_metrics_row(self.healthy_minute(now - 60, src={"172": {"ok": 0, "fail": 10, "retry": 9, "blocked": 9, "q": "technics sl-1200", "to": "/moskva/audio_i_video +context"}}))
+        self.flush()
+        table = log_report.build_readiness(1).split("## Ссылки\n", 1)[1].splitlines()
+        self.assertEqual(table[1], "#172 «technics sl-1200» → /moskva/audio_i_video +context: 20 · 60% · 14 · 13")
+        self.assertTrue(table[2].startswith("#165 «hasselblad 500» → /moskva/fototehnika: 10 · 0%"))
+
     def test_old_rows_are_skipped_and_empty_logs_do_not_fail(self):
         self.assertIn("Нет минутных метрик", log_report.build_report(5))
+        self.assertIn("🟡 Данных мало", log_report.build_readiness(1))
         now = time.time()
         (self.logs / "metrics.jsonl").write_text(
             json.dumps(self.minute(int(now - 7200))) + "\n" + "обрезанная строка\n" + json.dumps(self.minute(int(now)))[:40] + "\n",
@@ -389,6 +470,10 @@ class TestProductionScanLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fanout_trace, [good[1]])
         self.assertNotEqual(failed[1], good[1])
 
+        sources = monitoring.METRICS.pop_source_stats()
+        self.assertGreaterEqual(sources["1"]["fail"], 1)
+        self.assertEqual(sources["1"]["blocked"], sources["1"]["retry"])
+        self.assertEqual((sources["2"]["q"], sources["2"]["to"]), ("good", "/search"))
         row = write_row.call_args.args[0]
         self.assertEqual((row["urls"], row["radars"], row["outbox"]), (2, 2, 3))
         self.assertEqual(row["channels"], "0/0")

@@ -9,6 +9,7 @@ import time
 import zlib
 from collections import defaultdict
 from typing import Optional
+from urllib.parse import parse_qs, urlsplit
 
 import config
 import database
@@ -28,6 +29,9 @@ MAX_SCAN_WORKERS = 256
 SLOW_SCAN_MS = 15000
 LOOP_PROBE_SECONDS = 0.25
 LOOP_STALL_SECONDS = 1.0
+STALL_DUMP_SECONDS = 4.0
+STALL_DUMP_REARM_SECONDS = 1.0
+SOURCE_STATS_SECONDS = 600
 
 
 def group_sources(searches: list[dict]) -> dict[str, list[dict]]:
@@ -68,6 +72,20 @@ def source_interval(radars: list[dict], key: str = "") -> float:
 def source_label(radars) -> str:
     title = str(radars[0].get("title") or "радар")[:40] if radars else "?"
     return f"{title} +{len(radars) - 1}" if len(radars) > 1 else title
+
+
+def record_source_result(task, client, ok: bool, attempts: list[str]) -> None:
+    """Totals per link: the address Avito really serves it from shows why some links fail more often."""
+    cache = getattr(getattr(client, "_bound_parser", None), "_canonical_cache", None)
+    target = cache.get(task.key, task.key) if isinstance(cache, dict) else task.key
+    parts = urlsplit(target)
+    METRICS.record_source_scan(
+        str(task.radars[0].get("id")) if task.radars else task.key[:60],
+        ok=ok,
+        attempts=attempts,
+        query=parse_qs(urlsplit(task.key).query).get("q", [""])[0][:60],
+        target=parts.path + (" +context" if "context=" in parts.query else ""),
+    )
 
 
 def log_scan_failure(task, failure, attempts: list[str], elapsed_ms: float, http_requests: int) -> None:
@@ -111,14 +129,21 @@ def log_scan_success(task, collection, channel: str, elapsed_ms: float, http_req
 
 async def watch_event_loop() -> None:
     """Measures how late the loop wakes up. A stall here means something blocked every coroutine."""
-    while True:
-        started = time.monotonic()
-        await asyncio.sleep(LOOP_PROBE_SECONDS)
-        lag = time.monotonic() - started - LOOP_PROBE_SECONDS
-        stalled = lag >= LOOP_STALL_SECONDS
-        METRICS.record_loop_lag(lag, stall=stalled)
-        if stalled:
-            log_event(logger, logging.WARNING, "loop.stall", f"Event loop завис на {lag:.1f} с", s=round(lag, 2))
+    armed_at = 0.0
+    try:
+        while True:
+            started = time.monotonic()
+            if started - armed_at >= STALL_DUMP_REARM_SECONDS:
+                logger_setup.arm_stall_dump(STALL_DUMP_SECONDS)
+                armed_at = started
+            await asyncio.sleep(LOOP_PROBE_SECONDS)
+            lag = time.monotonic() - started - LOOP_PROBE_SECONDS
+            stalled = lag >= LOOP_STALL_SECONDS
+            METRICS.record_loop_lag(lag, stall=stalled)
+            if stalled:
+                log_event(logger, logging.WARNING, "loop.stall", f"Event loop завис на {lag:.1f} с", s=round(lag, 2))
+    finally:
+        logger_setup.disarm_stall_dump()
 
 
 async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
@@ -412,6 +437,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
 
             elapsed_ms = (time.monotonic() - scan_t0) * 1000.0
             ok = collection is not None
+            record_source_result(task, scan_client, ok, attempts)
             if ok and await nothing_new_for_fanout(seen_store, task, collection, has_pro_catchup):
                 collection = dataclasses.replace(collection, fast_skipped=True)
             gap = bool(collection.coverage_gap) if collection is not None else False
@@ -520,7 +546,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         nonlocal request_cost
         startup = True
         no_proxy_notified = False
-        last_report = last_cleanup = last_terminal_cleanup = time.monotonic()
+        last_report = last_cleanup = last_terminal_cleanup = last_sources = time.monotonic()
         previous_requests = budget.snapshot()["requests"]
         previous_scans = 0
         outbox_metrics = await database.get_outbox_metrics()
@@ -641,7 +667,11 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 else:
                     planner.update_capacity_mode(cap["available_rps"], cap["required_rps"], now)
                 request_cost = float(metrics_snap["avg_http_requests_per_scan"] or 1.0)
-                for row in METRICS.pop_minute_rows():
+                rows = METRICS.pop_minute_rows()
+                if rows and now - last_sources >= SOURCE_STATS_SECONDS:
+                    rows[-1]["src"] = METRICS.pop_source_stats()
+                    last_sources = now
+                for row in rows:
                     row.update(
                         mode=planner.capacity_mode,
                         urls=len(groups),
