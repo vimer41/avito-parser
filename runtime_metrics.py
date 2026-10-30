@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+from html import escape as html_escape
 import math
 import re
 import time
@@ -28,6 +29,23 @@ PUB_DELAY_BOUNDS: tuple[float, ...] = (
 )
 
 TARIFF_KEYS: tuple[str, ...] = ("pro", "standart", "lite", "base")
+
+# Why a scan or a proxy probe failed (FetchFailure.kind), in words an admin understands.
+FAILURE_LABELS = {
+    "timeout": "таймаут (прокси медленный или мёртвый)",
+    "network": "сетевая ошибка (прокси недоступен или неверные данные)",
+    "forbidden": "Авито заблокировал IP (403)",
+    "rate_limit": "Авито ограничил частоту (429)",
+    "challenge": "антибот-проверка не пройдена",
+    "cooldown": "канал на паузе после блокировки",
+    "catalog_missing": "страница без каталога (логин/заглушка)",
+    "proxy_auth": "прокси не принял логин/пароль (407) — проверьте данные или привязку по IP",
+    "proxy_forbidden": "провайдер прокси блокирует Авито (403 на CONNECT) — нужен другой провайдер или тариф",
+    "proxy_refused": "прокси не отвечает на этом порту (закрыт или неверный адрес)",
+    "proxy_dns": "адрес прокси не найден",
+    "proxy_error": "прокси вернул ошибку",
+    "unknown": "неизвестная ошибка",
+}
 
 _URL_CREDENTIALS_RE = re.compile(
     r"(?i)\b(https?|socks5h?)://([^\s/@:]+):([^\s/@]+)@([^\s/]+)"
@@ -139,6 +157,8 @@ class ProxyMinuteSlice:
     collection_success: int = 0
     challenges_solved: int = 0
     final_blocks: int = 0
+    scans_new: int = 0
+    failures: dict[str, int] = field(default_factory=dict)
     http_latency: HistogramSlice = field(default_factory=lambda: HistogramSlice(HTTP_LATENCY_BOUNDS))
 
     def reset(self, minute_id: int) -> None:
@@ -153,6 +173,8 @@ class ProxyMinuteSlice:
         self.collection_success = 0
         self.challenges_solved = 0
         self.final_blocks = 0
+        self.scans_new = 0
+        self.failures.clear()
         self.http_latency.reset()
 
 
@@ -443,6 +465,7 @@ class RuntimeMetricsRegistry:
     ) -> None:
         self._monotonic = monotonic_fn
         self._wall_clock = wall_clock_fn
+        self._started_at = wall_clock_fn()
         self._buckets: list[MinuteBucket] = [MinuteBucket() for _ in range(self.NUM_BUCKETS)]
         self._proxy_rings: dict[str, list[ProxyMinuteSlice]] = {}
         self._proxy_meta: dict[str, dict[str, Any]] = {}
@@ -519,6 +542,8 @@ class RuntimeMetricsRegistry:
                 "configured_rate": config.PROXY_RATE_LIMIT,
                 "effective_rate": config.PROXY_RATE_LIMIT,
                 "quarantined_until": 0.0,
+                "quarantine_reason": "",
+                "quarantine_remaining": 0.0,
             }
         mid = self._current_minute_id()
         idx = mid % self.NUM_BUCKETS
@@ -536,6 +561,8 @@ class RuntimeMetricsRegistry:
         configured_rate: float,
         effective_rate: float,
         quarantined_until: float = 0.0,
+        quarantine_reason: str = "",
+        quarantine_remaining: float = 0.0,
     ) -> None:
         self._proxy_slice(proxy_id, masked_url)
         self._proxy_meta[proxy_id] = {
@@ -545,6 +572,8 @@ class RuntimeMetricsRegistry:
             "configured_rate": float(configured_rate),
             "effective_rate": float(effective_rate),
             "quarantined_until": float(quarantined_until),
+            "quarantine_reason": sanitize_proxy_credentials(quarantine_reason),
+            "quarantine_remaining": float(quarantine_remaining or 0.0),
         }
 
     def record_http_request(
@@ -584,10 +613,16 @@ class RuntimeMetricsRegistry:
         fast_skipped: bool = False,
         unchanged: bool = False,
         has_new_items: bool = False,
+        failure_kind: str | None = None,
     ) -> None:
         b = self._bucket()
         sl = self._proxy_slice(proxy_id, masked_url)
         sl.collection_total += 1
+        if success and has_new_items:
+            sl.scans_new += 1
+        if not success:
+            kind = failure_kind or "unknown"
+            sl.failures[kind] = sl.failures.get(kind, 0) + 1
         if challenge_solved:
             sl.challenges_solved += 1
         if final_block:
@@ -724,6 +759,7 @@ class RuntimeMetricsRegistry:
         is_catchup: bool = False,
         proxy_id: str = "direct",
         masked_url: str = "direct",
+        failure_kind: str | None = None,
     ) -> None:
         if revisit_seconds is not None and revisit_seconds > 0:
             self.record_source_interval(revisit_seconds)
@@ -738,6 +774,8 @@ class RuntimeMetricsRegistry:
             http_requests_count=max(0, int(http_requests)),
             duration_seconds=max(0.0, float(elapsed_ms) / 1000.0),
             fast_skipped=fast_skipped,
+            has_new_items=success and not fast_skipped,
+            failure_kind=failure_kind,
         )
 
     def record_catchup_omitted(self, omitted_count: int) -> None:
@@ -807,6 +845,10 @@ class RuntimeMetricsRegistry:
 
             raw_10 = sum(s.raw_http_total for s in slices_10)
             c403_429_10 = sum(s.raw_http_403 + s.raw_http_429 for s in slices_10)
+            failures_60: dict[str, int] = {}
+            for s in slices_60:
+                for kind, count in s.failures.items():
+                    failures_60[kind] = failures_60.get(kind, 0) + count
 
             lat_summary = summarize_histograms([s.http_latency for s in slices_60], HTTP_LATENCY_BOUNDS)
 
@@ -817,6 +859,8 @@ class RuntimeMetricsRegistry:
                 "configured_rate": meta["configured_rate"],
                 "effective_rate": meta["effective_rate"],
                 "quarantined_until": meta["quarantined_until"],
+                "quarantine_reason": meta.get("quarantine_reason", ""),
+                "quarantine_remaining": meta.get("quarantine_remaining", 0.0),
                 "raw_http_total_60m": raw_60,
                 "raw_http_2xx_3xx_60m": ok_60,
                 "raw_http_success_ratio_60m": round(ok_60 / raw_60, 4) if raw_60 > 0 else None,
@@ -831,6 +875,10 @@ class RuntimeMetricsRegistry:
                 "collection_success_ratio_60m": round(coll_ok_60 / coll_total_60, 4) if coll_total_60 > 0 else None,
                 "challenges_solved_60m": chal_60,
                 "final_blocks_60m": fblk_60,
+                "scans_new_60m": sum(s.scans_new for s in slices_60),
+                "failures_60m": failures_60,
+                "collection_total_10m": sum(s.collection_total for s in slices_10),
+                "collection_success_10m": sum(s.collection_success for s in slices_10),
                 "p50_latency_seconds": lat_summary["p50"],
                 "p95_latency_seconds": lat_summary["p95"],
                 "latency_samples": lat_summary["sample_count"],
@@ -881,6 +929,8 @@ class RuntimeMetricsRegistry:
                         configured_rate=float(ps.get("configured_rate") or config.PROXY_RATE_LIMIT),
                         effective_rate=float(ps.get("effective_rate") or ps.get("current_rps") or config.PROXY_RATE_LIMIT),
                         quarantined_until=float(ps.get("quarantined_until") or 0.0),
+                        quarantine_reason=str(ps.get("quarantine_reason") or ""),
+                        quarantine_remaining=float(ps.get("quarantine_remaining") or 0.0),
                     )
         buckets = self._active_buckets(window_minutes)
         cost_summary = summarize_histograms([b.http_cost_per_scan for b in buckets], HTTP_COST_BOUNDS)
@@ -1106,120 +1156,257 @@ class RuntimeMetricsRegistry:
         sla = snap["delivery_sla"]
         pipe = snap["scan_pipeline"]
         bapi = snap["bot_api"]
+        proxies = snap["proxies"]
+        buckets_10 = self._active_buckets(10)
 
-        def _fmt_hist(h: dict[str, Any], unit: str = "с") -> str:
-            if not h or h.get("sample_count", 0) == 0:
-                return "no data (n=0)"
-            return f"p50={h['p50']}{unit}, p95={h['p95']}{unit} (n={h['sample_count']})"
+        scans_ok = pipe["scans_completed"]
+        scans_bad = pipe["scans_failed"]
+        scans_all = scans_ok + scans_bad
+        scans_ok_10 = sum(b.scans_completed for b in buckets_10)
+        scans_bad_10 = sum(b.scans_failed for b in buckets_10)
+        blocks_10 = sum(p["raw_http_403_429_10m"] for p in proxies)
+        quarantined = [p for p in proxies if p["state"] == "quarantined"]
 
-        cov = (
-            f"{sched['full_coverage_age_seconds']:.1f} с"
-            if sched["full_coverage_age_seconds"] is not None
-            else "no data"
-        )
-        fskip_ratio = (
-            f"{pipe['fast_skip_ratio'] * 100:.1f}%"
-            if pipe["fast_skip_ratio"] is not None
-            else "no data"
-        )
+        # Plain-language verdict first, so a glance answers "is everything fine?".
+        problems: list[str] = []
+        if scans_all >= 20 and scans_bad / scans_all > 0.10:
+            problems.append(f"много неудачных сканов: {_pct(scans_bad, scans_all)}")
+        if cap["deficit_now"] > 0:
+            problems.append(f"не хватает скорости сети: {_dec(cap['deficit_now'], 2)} запр/с")
+        if quarantined:
+            problems.append(f"на паузе каналов: {len(quarantined)} из {len(proxies)}")
+        if outbox["pending_depth"] > config.OUTBOX_ALERT_DEPTH:
+            problems.append(f"очередь уведомлений растёт: {outbox['pending_depth']}")
+        deliver = sla["deliver_at_to_sent_seconds"]
+        if deliver["sample_count"] and deliver["p95"] is not None and deliver["p95"] > float(config.DELIVERY_SLA_ALERT_SECONDS):
+            problems.append(f"уведомления уходят медленно: до {_dur(deliver['p95'])}")
+        if sched["unique_sources"] and scans_all == 0:
+            problems.append("за час не было ни одного скана")
 
-        header_lines = [
-            "📊 <b>СТАТИСТИКА МОНИТОРИНГА AVITO RADAR (окно 60 мин)</b>",
+        if problems:
+            verdict = ["🔴 <b>Есть проблемы</b>"] + [f"• {p}" for p in problems]
+        elif scans_all == 0:
+            verdict = ["⚪️ <b>Данных пока нет</b> — сканов ещё не было"]
+        else:
+            verdict = ["🟢 <b>Всё работает нормально</b>"]
+
+        if cap["available_rate_now"] > 0:
+            if cap["deficit_now"] > 0:
+                net_line = (
+                    f"Нужно <b>{_dec(cap['required_rate_target'], 2)}</b> запр/с, сеть даёт "
+                    f"<b>{_dec(cap['available_rate_now'], 2)}</b> — не хватает"
+                )
+            else:
+                spare = 1.0 - cap["required_rate_target"] / cap["available_rate_now"]
+                net_line = (
+                    f"Нужно <b>{_dec(cap['required_rate_target'], 2)}</b> запр/с, сеть даёт "
+                    f"<b>{_dec(cap['available_rate_now'], 2)}</b> — запас {max(0.0, spare) * 100:.0f}%"
+                )
+        else:
+            net_line = "Рабочих каналов нет — сканирование стоит"
+
+        new_ratio = _pct(pipe["scans_with_new_items"], scans_ok) if scans_ok else "—"
+        lines = [
+            "📊 <b>Мониторинг</b> · последний час",
+            f"Бот работает {_dur(self._wall_clock() - self._started_at)}",
             "",
-            "🧭 <b>Планировщик и покрытие:</b>",
-            f"• Уникальных URL: <code>{sched['unique_sources']}</code> | Просрочено: <code>{sched['overdue_sources']}</code> | Backoff: <code>{sched['backoff_sources']}</code>",
-            f"• Режим емкости: <code>{cap['capacity_mode']}</code> (интервал <code>{cap['recommended_interval_low']:.1f}-{cap['recommended_interval_high']:.1f} с</code>)",
-            f"• Возраст полного покрытия всех URL: <code>{cov}</code>",
-            f"• Фактический интервал URL: <code>{_fmt_hist(pipe['source_interval_seconds'])}</code>",
-            f"• Длительность скана: <code>{_fmt_hist(pipe['scan_duration_seconds'])}</code>",
-            f"• Сканов: ok=<code>{pipe['scans_completed']}</code>, fast-skip=<code>{pipe['scans_fast_skipped']}</code> ({fskip_ratio}), новые=<code>{pipe['scans_with_new_items']}</code>, сбои=<code>{pipe['scans_failed']}</code>",
-            f"• Fanout БД: <code>{_fmt_hist(pipe['fanout_duration_seconds'])}</code>",
+            *verdict,
             "",
-            "🌐 <b>Емкость пула прокси:</b>",
-            f"• Прокси: всего=<code>{cap['total_proxies']}</code>, здоровых=<code>{cap['healthy_proxies']}</code>, карантин=<code>{cap['quarantined_proxies']}</code>",
-            f"• Цена 1 скана (HTTP): mean=<code>{cap['rolling_mean_http_requests_per_scan']:.2f}</code>, p95=<code>{cap['p95_http_requests_per_scan']:.2f}</code> ({'cold-start' if cap['cold_start_cost_used'] else 'measured'})",
-            f"• Требуется: <code>{cap['required_rate_target']:.2f} req/s</code> (средний интервал URL <code>{cap['recommended_interval_high']:.1f} с</code>)",
-            f"• Доступно: сейчас=<code>{cap['available_rate_now']:.2f} req/s</code>, с резервом 20%=<code>{cap['available_rate_with_reserve']:.2f} req/s</code>",
-            f"• Дефицит: сейчас=<code>{cap['deficit_now']:.2f} req/s</code>, с резервом=<code>{cap['deficit_with_reserve']:.2f} req/s</code>",
-            f"• Требуемый PROXY_RATE_LIMIT: hard=<code>{cap['required_configured_rate_hard']:.2f}</code>, target=<code>{cap['required_configured_rate_target']:.2f}</code>",
-            f"• Следующий безопасный шаг: <code>{cap['next_safe_manual_step'] if cap['next_safe_manual_step'] is not None else 'недоступен'}</code>",
-            f"• Рекомендация: {cap['recommendation_ru']}",
-            "",
-            "📬 <b>Очередь и SLA доставки:</b>",
-            f"• Outbox: pending=<code>{outbox['pending_depth']}</code>, leased=<code>{outbox['leased_depth']}</code>, макс. возраст=<code>{outbox['oldest_pending_age_seconds']:.1f} с</code>",
-            f"• SLA deliver_at → sent (все): <code>{_fmt_hist(sla['deliver_at_to_sent_seconds'])}</code>",
-            f"• Полный queued → sent (все): <code>{_fmt_hist(sla['queued_to_sent_seconds'])}</code>",
-            f"• Догон после паузы (catch-up): sent=<code>{bapi['catchup_sent_count']}</code>, пропущено=<code>{bapi['catchup_omitted_count']}</code>, deliver_at→sent: <code>{_fmt_hist(sla['catchup_deliver_at_to_sent_seconds'])}</code>",
-            f"• Лот без точного sortTimeStamp: <code>{sla['pub_timestamp_missing_count']}</code>",
+            "🔎 <b>Сканирование</b>",
+            f"Ссылок в работе: <b>{sched['unique_sources']}</b>"
+            + (f", опаздывают: {sched['overdue_sources']}" if sched["overdue_sources"] else ""),
+            f"Каждая ссылка проверяется: {_hist_text(pipe['source_interval_seconds'])}",
+            f"Сканов: <b>{_num(scans_ok)}</b> успешно, <b>{_num(scans_bad)}</b> с ошибкой"
+            + (f" ({_pct(scans_bad, scans_all)})" if scans_all else ""),
+            f"Нашли новые лоты: {_num(pipe['scans_with_new_items'])} ({new_ratio} сканов)",
+            f"Один скан длится: {_hist_text(pipe['scan_duration_seconds'])}",
+            f"Запросов на скан: {_dec(cap['rolling_mean_http_requests_per_scan'], 1)}"
+            + (" (оценка)" if cap["cold_start_cost_used"] else ""),
+            f"За 10 мин: сканов {_num(scans_ok_10 + scans_bad_10)}, ошибок {_num(scans_bad_10)}, блоков 403/429 {_num(blocks_10)}",
         ]
+        failures = _merge_failures(proxies)
+        if failures:
+            lines.append("Почему падали сканы:")
+            for kind, count in failures[:5]:
+                lines.append(f"  · {FAILURE_LABELS.get(kind, kind)} — {_num(count)}")
 
+        lines += [
+            "",
+            "🌐 <b>Сеть</b>",
+            f"Каналов: {cap['total_proxies']}, рабочих {cap['healthy_proxies']}"
+            + (f", на паузе {cap['quarantined_proxies']}" if cap["quarantined_proxies"] else ""),
+            net_line,
+        ]
+        if cap["deficit_now"] > 0 or cap["quarantined_proxies"]:
+            lines.append(f"<blockquote>{cap['recommendation_ru']}</blockquote>")
+
+        lines += [
+            "",
+            "📬 <b>Доставка</b>",
+            f"Отправлено уведомлений: <b>{_num(bapi['sent_total'])}</b>",
+        ]
+        pub_hist = _merge_tariff_hist(sla["by_tariff"], "pub_to_seen_seconds")
+        if pub_hist:
+            lines.append(f"От публикации на Авито до бота: {pub_hist}")
+        lines.append(f"Из очереди в Telegram: {_hist_text(sla['queued_to_sent_seconds'])}")
+        tariff_parts = []
         for t_key in TARIFF_KEYS:
-            ts = sla["by_tariff"][t_key]
-            header_lines.append(
-                f"• Тариф <b>{config.plan_title(t_key)}</b>: "
-                f"deliver→sent <code>{_fmt_hist(ts['deliver_at_to_sent_seconds'])}</code> | "
-                f"queued→sent <code>{_fmt_hist(ts['queued_to_sent_seconds'])}</code> | "
-                f"seen→queued <code>{_fmt_hist(ts['seen_to_queued_seconds'])}</code> | "
-                f"pub→seen <code>{_fmt_hist(ts['pub_to_seen_seconds'])}</code>"
+            h = sla["by_tariff"][t_key]["queued_to_sent_seconds"]
+            if h["sample_count"]:
+                tariff_parts.append(f"{config.plan_title(t_key)} ~{_dur(h['mean'])}")
+        if tariff_parts:
+            lines.append("По тарифам: " + " · ".join(tariff_parts))
+        queue = f"В очереди: {outbox['pending_depth']}"
+        if outbox["pending_depth"]:
+            queue += f", самое старое {_dur(outbox['oldest_pending_age_seconds'])}"
+        lines.append(queue)
+        if bapi["retry_after_count"]:
+            lines.append(f"Telegram просил подождать: {bapi['retry_after_count']} раз")
+        if bapi["catchup_sent_count"] or bapi["catchup_omitted_count"]:
+            lines.append(
+                f"Догон после паузы: отправлено {bapi['catchup_sent_count']}, "
+                f"пропущено {bapi['catchup_omitted_count']}"
             )
 
-        header_lines.extend([
-            "",
-            "🤖 <b>Telegram Bot API:</b>",
-            f"• Отправлено: <code>{bapi['sent_total']}</code> | RetryAfter: <code>{bapi['retry_after_count']}</code>",
-            f"• Время вызова Bot API: <code>{_fmt_hist(bapi['service_time_seconds'])}</code>",
-            f"• Воркеры доставки: активных=<code>{bapi['configured_workers']}</code>, расчетно требуется=<code>{bapi['required_workers_estimate']}</code>",
-            f"• Фото: file_id=<code>{bapi['photo_file_id_hit_count']}</code>, direct_url=<code>{bapi['photo_url_direct_count']}</code>, upload=<code>{bapi['photo_cdn_upload_count']}</code>, fallback_text=<code>{bapi['photo_fallback_text_count']}</code>, text_only=<code>{bapi['text_only_sent_count']}</code>",
-        ])
+        messages = ["\n".join(lines)]
 
-        main_msg = "\n".join(header_lines)
-        messages = [main_msg]
-
-        proxies = snap["proxies"]
         if proxies:
-            proxy_lines = ["🔌 <b>Состояние прокси-клиентов (60 мин):</b>"]
-            for p in proxies:
-                raw_ratio = (
-                    f"{p['raw_http_success_ratio_60m'] * 100:.1f}%"
-                    if p["raw_http_success_ratio_60m"] is not None
-                    else "no data"
-                )
-                coll_ratio = (
-                    f"{p['collection_success_ratio_60m'] * 100:.1f}%"
-                    if p["collection_success_ratio_60m"] is not None
-                    else "no data"
-                )
-                p95_lat = f"{p['p95_latency_seconds']}с" if p["p95_latency_seconds"] is not None else "no data"
-                line = (
-                    f"• <code>{p['proxy_id']}</code> ({sanitize_proxy_credentials(p['masked_url'])}) "
-                    f"[{p['state']}] rate=<code>{p['effective_rate']:.2f}/{p['configured_rate']:.2f}</code> "
-                    f"raw_ok=<code>{raw_ratio}</code> (n={p['raw_http_total_60m']}) "
-                    f"coll_ok=<code>{coll_ratio}</code> "
-                    f"403/429=<code>{p['raw_http_403_60m']}/{p['raw_http_429_60m']}</code> "
-                    f"blocks=<code>{p['final_blocks_60m']}</code> p95=<code>{p95_lat}</code>"
-                )
-                proxy_lines.append(line)
-
-            current_chunk: list[str] = []
+            cards = ["🔌 <b>Каналы</b> · последний час"]
+            for p in sorted(proxies, key=_channel_sort_key):
+                cards.append("")
+                cards.extend(_channel_card(p))
+            current: list[str] = []
             current_len = 0
-            for line in proxy_lines:
-                if current_chunk and current_len + len(line) + 1 > max_len:
-                    messages.append("\n".join(current_chunk))
-                    current_chunk = [line]
-                    current_len = len(line)
-                else:
-                    current_chunk.append(line)
-                    current_len += len(line) + 1
-            if current_chunk:
-                if len(messages[-1]) + 2 + current_len <= max_len:
-                    messages[-1] = messages[-1] + "\n\n" + "\n".join(current_chunk)
-                else:
-                    messages.append("\n".join(current_chunk))
+            for line in cards:
+                if current and current_len + len(line) + 1 > max_len:
+                    messages.append("\n".join(current))
+                    current, current_len = [], 0
+                current.append(line)
+                current_len += len(line) + 1
+            if current:
+                messages.append("\n".join(current))
 
         return messages
 
     def format_stats_report(self, max_len: int = 3800) -> str:
         return "\n\n".join(self.format_stats_messages(max_len=max_len))
 
+
+def _num(value: int | float) -> str:
+    return f"{int(value):,}".replace(",", " ")
+
+
+def _dec(value: float, digits: int) -> str:
+    return f"{value:.{digits}f}".replace(".", ",")
+
+
+def _pct(part: int | float, total: int | float) -> str:
+    if not total:
+        return "—"
+    value = part / total * 100
+    return f"{_dec(value, 1)}%" if value < 10 else f"{_dec(value, 0)}%"
+
+
+def _dur(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    seconds = max(0.0, float(seconds))
+    if seconds < 10:
+        return f"{_dec(seconds, 1)} с"
+    if seconds < 60:
+        return f"{_dec(seconds, 0)} с"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} мин"
+    hours, rest = divmod(int(seconds), 3600)
+    return f"{hours} ч {rest // 60} мин"
+
+
+def _hist_text(h: dict[str, Any]) -> str:
+    if not h or not h.get("sample_count"):
+        return "нет данных"
+    return f"в среднем {_dur(h['mean'])}, почти всегда до {_dur(h['p95'])}"
+
+
+def _merge_tariff_hist(by_tariff: dict[str, dict[str, Any]], key: str) -> str:
+    total = sum(by_tariff[t][key]["sample_count"] for t in TARIFF_KEYS)
+    if not total:
+        return ""
+    mean = sum((by_tariff[t][key]["mean"] or 0.0) * by_tariff[t][key]["sample_count"] for t in TARIFF_KEYS) / total
+    p95 = max(by_tariff[t][key]["p95"] or 0.0 for t in TARIFF_KEYS)
+    return f"в среднем {_dur(mean)}, почти всегда до {_dur(p95)}"
+
+
+def _merge_failures(proxies: list[dict[str, Any]]) -> list[tuple[str, int]]:
+    merged: dict[str, int] = {}
+    for p in proxies:
+        for kind, count in p.get("failures_60m", {}).items():
+            merged[kind] = merged.get(kind, 0) + count
+    return sorted(merged.items(), key=lambda kv: -kv[1])
+
+
+def _is_direct_channel(p: dict[str, Any]) -> bool:
+    return p["proxy_id"] == "direct" or str(p.get("masked_url") or "").startswith("direct")
+
+
+def _channel_name(p: dict[str, Any]) -> str:
+    if _is_direct_channel(p):
+        return "Сервер (без прокси)"
+    url = sanitize_proxy_credentials(p.get("masked_url") or p["proxy_id"])
+    return url.split("@", 1)[-1].split("://", 1)[-1] or p["proxy_id"]
+
+
+def _channel_sort_key(p: dict[str, Any]) -> tuple[int, str]:
+    return (0 if _is_direct_channel(p) else 1, _channel_name(p))
+
+
+def _channel_card(p: dict[str, Any]) -> list[str]:
+    raw = p["raw_http_total_60m"]
+    blocks = p["raw_http_403_60m"] + p["raw_http_429_60m"]
+    raw_10 = p["raw_http_total_10m"]
+    blocks_10 = p["raw_http_403_429_10m"]
+    if p["state"] == "quarantined":
+        icon, status = "🔴", "на паузе"
+        if p.get("quarantine_remaining"):
+            status += f" ещё {_dur(p['quarantine_remaining'])}"
+    elif p["state"] == "draining":
+        icon, status = "⚪️", "отключается"
+    elif raw == 0 and p["collection_total_60m"] == 0:
+        icon, status = "⚪️", "простаивает"
+    elif (raw_10 and blocks_10 / raw_10 > 0.10) or p["effective_rate"] < p["configured_rate"] - 1e-6:
+        icon, status = "🟡", "Авито притормаживает"
+    elif p["state"] == "half_open":
+        icon, status = "🟡", "проверяется после паузы"
+    else:
+        icon, status = "🟢", "работает"
+
+    card = [f"{icon} <b>{html_escape(_channel_name(p))}</b> — {status}"]
+    if p.get("quarantine_reason") and p["state"] == "quarantined":
+        card.append(f"Причина: {html_escape(p['quarantine_reason'])}")
+    if raw:
+        card.append(
+            f"Запросов {_num(raw)} (~{raw / 60:.0f}/мин), успешных {_pct(p['raw_http_2xx_3xx_60m'], raw)}"
+        )
+        card.append(
+            f"Блоки 403/429: {_num(blocks)}"
+            + (f" ({_pct(blocks, raw)})" if blocks else "")
+            + f", за 10 мин {_num(blocks_10)}"
+        )
+        if p["transport_errors_60m"] or p["raw_http_5xx_60m"]:
+            card.append(f"Обрывы связи: {_num(p['transport_errors_60m'])}, ошибки Авито 5xx: {_num(p['raw_http_5xx_60m'])}")
+        if p["latency_samples"]:
+            card.append(f"Ответ Авито: обычно до {_dur(p['p50_latency_seconds'])}, медленные до {_dur(p['p95_latency_seconds'])}")
+    coll = p["collection_total_60m"]
+    if coll:
+        card.append(
+            f"Сканов {_num(coll)}, удачных {_pct(p['collection_success_60m'], coll)}, с новыми лотами {_num(p['scans_new_60m'])}"
+        )
+        fails = sorted(p.get("failures_60m", {}).items(), key=lambda kv: -kv[1])
+        if fails:
+            card.append("Ошибки: " + ", ".join(f"{FAILURE_LABELS.get(k, k)} — {v}" for k, v in fails[:3]))
+    rate = f"Скорость {_dec(p['effective_rate'], 2)} из {_dec(p['configured_rate'], 2)} запр/с"
+    if p["effective_rate"] < p["configured_rate"] - 1e-6:
+        rate += " (снижена из-за блоков)"
+    card.append(rate)
+    return card
 
 METRICS = RuntimeMetricsRegistry()

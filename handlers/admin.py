@@ -10,6 +10,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 import config
 import database
 import ui
+from runtime_metrics import FAILURE_LABELS
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -1290,20 +1291,6 @@ PROXY_FORMAT_HELP = (
     "Несколько прокси — каждый с новой строки."
 )
 
-FAILURE_LABELS = {
-    "timeout": "таймаут (прокси медленный или мёртвый)",
-    "network": "сетевая ошибка (прокси недоступен или неверные данные)",
-    "forbidden": "Авито заблокировал IP (403)",
-    "rate_limit": "Авито ограничил частоту (429)",
-    "challenge": "антибот-проверка не пройдена",
-    "cooldown": "канал на паузе после блокировки",
-    "catalog_missing": "страница без каталога (логин/заглушка)",
-    "proxy_auth": "прокси не принял логин/пароль (407) — проверьте данные или привязку по IP",
-    "proxy_forbidden": "провайдер прокси блокирует Авито (403 на CONNECT) — нужен другой провайдер или тариф",
-    "proxy_refused": "прокси не отвечает на этом порту (закрыт или неверный адрес)",
-    "proxy_dns": "адрес прокси не найден",
-    "proxy_error": "прокси вернул ошибку",
-}
 
 NET_BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🌐 К настройкам сети", callback_data="admin_net")],

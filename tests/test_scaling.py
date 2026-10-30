@@ -494,7 +494,7 @@ class TestRuntimeMetricsAndCapacity(unittest.TestCase):
         self.assertAlmostEqual(by_t["base"]["queued_to_sent_seconds"]["p95"], 2.5, delta=0.5)
 
         report = m.format_stats_report()
-        self.assertIn("СТАТИСТИКА МОНИТОРИНГА AVITO RADAR", report)
+        self.assertIn("Мониторинг", report)
         self.assertNotIn("top_secret_pass", report)
         self.assertNotIn("secret_user", report)
 

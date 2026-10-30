@@ -252,6 +252,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     coverage_gap=gap,
                     revisit_seconds=revisit_seconds,
                     due_lag_seconds=due_lag_seconds,
+                    failure_kind=failure.kind if failure else None,
                 )
                 planner.complete(
                     task,
@@ -358,6 +359,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 is_catchup=has_pro_catchup,
                 proxy_id=scan_client.proxy_id if scan_client is not None else "direct",
                 masked_url=scan_client.masked_url if scan_client is not None else "direct",
+                failure_kind=last_failure.kind if (not ok and last_failure) else None,
             )
 
             if not ok:

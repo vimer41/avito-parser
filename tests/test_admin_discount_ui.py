@@ -178,8 +178,9 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
 
         # Admin gets stats report
         await self.dispatch_message(text="/stats", user_id=config.ADMIN_ID)
-        stats_text = self.methods("SendMessage")[-1].text
-        self.assertIn("СТАТИСТИКА МОНИТОРИНГА", stats_text)
+        stats_text = " ".join(m.text for m in self.methods("SendMessage")[-2:])
+        self.assertIn("Мониторинг", stats_text)
+        self.assertIn("Каналы", stats_text)
 
         await self.dispatch_message(text="/reload_proxies", user_id=config.ADMIN_ID)
         reload_text = self.methods("SendMessage")[-1].text
