@@ -3,12 +3,14 @@ import logging
 import re
 from typing import Optional
 from aiogram import Router, F
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart, Command
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 
 import config
 import database
+import trial_gate
 import ui
 from logger_setup import log_user_event
 
@@ -119,7 +121,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
-TRIAL_HOURS = 6
+TRIAL_HOURS = config.TRIAL_HOURS
 
 
 def radars_word(count: int) -> str:
@@ -181,9 +183,7 @@ async def cmd_start(event, state: FSMContext):
     )
     markup = main_menu_kb()
     if can_take_trial(user_record, user.id):
-        markup.inline_keyboard.insert(0, [ui.btn(
-            f"Попробовать бесплатно — {TRIAL_HOURS} часов", "trial", callback_data="activate_trial_btn", style="success",
-        )])
+        text, markup = trial_gate.offer()
 
     if isinstance(event, CallbackQuery):
         await ui.show(event, text, markup)
@@ -208,7 +208,7 @@ async def cmd_help(event):
         "• <b>Чёрный список</b>: кнопка под лотом скрывает все объявления продавца.\n"
         "• <b>Область поиска</b>: только заголовок или заголовок с описанием.\n\n"
         f"{ui.e('tariffs')} <b>3. Тарифы</b>\n"
-        f"Пробный период: {radars_word(config.TRIAL_RADARS)} на {TRIAL_HOURS} часов.\n"
+        f"Пробный период за подписку на канал: {radars_word(config.TRIAL_RADARS)} на {TRIAL_HOURS} часов.\n"
         f"{plan_summary('lite')}\n"
         f"{plan_summary('standart')}\n"
         f"{plan_summary('pro')}\n"
@@ -326,7 +326,21 @@ async def cb_night_pick(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "activate_trial_btn")
+async def cb_trial_offer(call: CallbackQuery):
+    text, markup = trial_gate.offer()
+    await ui.show(call, text, markup)
+
+
+@router.callback_query(F.data == "trial_check")
 async def cb_activate_trial(call: CallbackQuery):
+    try:
+        subscribed = await trial_gate.is_subscribed(call.bot, call.from_user.id)
+    except TelegramAPIError:
+        await call.answer("Telegram не ответил. Нажмите кнопку ещё раз через минуту.", show_alert=True)
+        return
+    if not subscribed:
+        await call.answer("Подписка не найдена. Подпишитесь на канал и нажмите кнопку ещё раз.", show_alert=True)
+        return
     res = await database.activate_trial(call.from_user.id)
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Активация триала", res["message"], status="OK" if res["success"] else "WARN")
     if not res["success"]:

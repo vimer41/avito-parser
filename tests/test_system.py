@@ -38,11 +38,13 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         admin_radars = await database.get_user_max_radars(admin_id)
         self.assertEqual(admin_radars, config.MAX_SEARCHES_PER_USER)
 
-        # 2. Новый пользователь (автоматический 6ч триал)
+        # 2. Новый пользователь: доступа нет, пока не возьмёт триал через подписку на канал
         new_user = await database.get_or_create_user(trial_user_id, "new_buyer", "Ivan")
-        self.assertEqual(new_user["trial_used"], 1)
-        self.assertIsNotNone(new_user["subscription_until"])
-        
+        self.assertEqual(new_user["trial_used"], 0)
+        self.assertIsNone(new_user["subscription_until"])
+        self.assertFalse(await database.is_user_allowed(trial_user_id))
+        self.assertTrue((await database.activate_trial(trial_user_id))["success"])
+
         # Доступ активен в течение 6 часов
         is_allowed = await database.is_user_allowed(trial_user_id)
         self.assertTrue(is_allowed)
@@ -108,6 +110,7 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         """Проверка полного удаления пользователя, радаров и данных из БД."""
         u_id = 999888777
         await database.get_or_create_user(u_id, "johnpeterson92", "John")
+        await database.activate_trial(u_id)
         await database.add_search(u_id, "iPhone 15", "https://avito.ru/search", 0)
         searches_before = await database.get_user_searches(u_id)
         self.assertEqual(len(searches_before), 1)
@@ -130,6 +133,8 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         user2 = 1002
         await database.get_or_create_user(user1, "u1", "User One")
         await database.get_or_create_user(user2, "u2", "User Two")
+        await database.activate_trial(user1)
+        await database.activate_trial(user2)
 
         search1_id = await database.add_search(user1, "PlayStation 5", "https://avito.ru/ps5", 0)
         self.assertTrue(await database.is_search_active(search1_id))
@@ -194,6 +199,7 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         """Проверка дефолтных значений скидок (0 = выключено) и настройки свежести радара."""
         user_id = 77665544
         await database.get_or_create_user(user_id, "fresh_user", "Freshman")
+        await database.activate_trial(user_id)
 
         # 1. Создаем радар и проверяем дефолты
         s_id = await database.add_search(user_id, "MacBook Pro", "https://avito.ru/macbook", 0)
@@ -290,6 +296,8 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
 
     async def test_batch_seen_items_query(self):
         """Проверка точечной выборки seen_items по списку item_ids."""
+        await database.get_or_create_user(123456)
+        await database.activate_trial(123456)
         radar_id = await database.add_search(123456, "Тест", "https://www.avito.ru/test")
         await database.mark_items_seen_bulk(radar_id, [("item1", 100), ("item2", 200), ("item3", 300)])
 

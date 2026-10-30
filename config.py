@@ -139,6 +139,9 @@ PAID_PLANS: tuple[str, ...] = ("lite", "standart", "pro")
 PLAN_TITLES: dict[str, str] = {"lite": "Базовый", "standart": "Средний", "pro": "Полный", "test": "Тест", "base": "Пробный"}
 PLAN_RADARS: dict[str, int] = {"lite": 1, "standart": 2, "pro": 4}
 TRIAL_RADARS = 1
+TRIAL_HOURS = 6
+# The trial is granted for subscribing to this channel; the bot must be its admin to check that.
+TRIAL_CHANNEL = os.getenv("TRIAL_CHANNEL", "@avitoradar1").strip()
 TARIFF_SCAN_INTERVAL: dict[str, float] = {
     "pro": positive_float_setting("TARIFF_INTERVAL_PRO", "20"),
     "standart": positive_float_setting("TARIFF_INTERVAL_STANDART", "30"),

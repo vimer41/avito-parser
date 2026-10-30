@@ -6,6 +6,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import TelegramObject, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 import config
+import trial_gate
 import ui
 import database
 
@@ -116,7 +117,7 @@ class AccessControlMiddleware(BaseMiddleware):
                 "buy_tariff:", "pay_request:", "demo_tariff:", "stars_buy:", "pay_method:",
             )
             allowed_exact = {
-                "open_subscription_menu", "activate_trial_btn", "support_start_ticket", "support_cancel",
+                "open_subscription_menu", "activate_trial_btn", "trial_check", "support_start_ticket", "support_cancel",
                 "start_approved", "refresh_profile", "open_help_menu", "cancel_fsm",
                 "payment_terms", "payment_support", "other_payment_methods",
                 "open_docs_menu", "doc_agreement", "doc_privacy",
@@ -162,19 +163,18 @@ class AccessControlMiddleware(BaseMiddleware):
 
             return await handler(event, data)
 
-        # 4. Если доступ НЕ одобрен (пробный период истёк или доступ закрыт):
-        trial_used = bool(user_record.get("trial_used"))
-        if trial_used:
-            text_for_user = (
-                f"{ui.e('lock')} <b>Доступ закончился</b>\n\n"
-                "Чтобы бот снова присылал новые лоты, выберите тариф. "
-                "Радары и настройки сохранены и заработают сразу после оплаты."
-            )
-        else:
-            text_for_user = (
-                f"{ui.e('lock')} <b>Доступ к боту ограничен</b>\n\n"
-                "Заявка передана администраторам. Как только доступ подтвердят, придёт уведомление."
-            )
+        # 4. Триал ещё не брали: предлагаем его, админов это не касается
+        if not user_record.get("trial_used"):
+            offer_text, offer_kb = trial_gate.offer()
+            await ui.show(event, offer_text, offer_kb)
+            return
+
+        # 5. Если доступ НЕ одобрен (пробный период истёк или доступ закрыт):
+        text_for_user = (
+            f"{ui.e('lock')} <b>Доступ закончился</b>\n\n"
+            "Чтобы бот снова присылал новые лоты, выберите тариф. "
+            "Радары и настройки сохранены и заработают сразу после оплаты."
+        )
 
         user_kb = ui.kb(
             [ui.btn("Выбрать тариф", "tariffs", callback_data="open_subscription_menu", style="primary")],
@@ -186,7 +186,7 @@ class AccessControlMiddleware(BaseMiddleware):
         elif isinstance(event, CallbackQuery):
             await event.answer("Срок действия доступа истёк. Выберите тариф или напишите в поддержку.", show_alert=True)
 
-        # 5. Отправляем запрос администраторам
+        # 6. Отправляем запрос администраторам
         user_msg = f"\n💬 <b>Сообщение:</b> <i>«{html.escape(event.text[:250])}»</i>" if (isinstance(event, Message) and event.text) else ""
         admin_text = (
             "🔔 <b>Пользователь с истёкшим доступом пишет в бот:</b>\n\n"

@@ -24,7 +24,8 @@ class TestReliability(unittest.IsolatedAsyncioTestCase):
         await database.init_db()
         self.user_id = 123456
         await database.get_or_create_user(self.user_id, "fixture", "Fixture")
-        self.radar_id = await database.add_search(self.user_id, "Test", "https://www.avito.ru/search")
+        await database.activate_trial(self.user_id)
+        self.radar_id =await database.add_search(self.user_id, "Test", "https://www.avito.ru/search")
         self.item = AvitoItem(
             "101",
             "Test item",

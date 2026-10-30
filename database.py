@@ -919,17 +919,6 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
-                if not row["trial_used"] and row["subscription_until"] is None and not row["is_allowed"] and user_id not in ADMIN_IDS:
-                    await db.execute("""
-                        UPDATE users 
-                        SET trial_used = 1,
-                            subscription_until = datetime('now', '+6 hours'),
-                            tariff_plan = 'standart'
-                        WHERE user_id = ?
-                    """, (user_id,))
-                    await db.commit()
-                    async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as c2:
-                        return dict(await c2.fetchone())
                 await db.commit()
                 return dict(row)
 
@@ -940,9 +929,10 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
                 (user_id, username, first_name, DEFAULT_SELLER_MESSAGE)
             )
         else:
+            # No access yet: the trial is taken through the channel gate (trial_gate.py).
             await db.execute("""
-                INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan, trial_used, subscription_until)
-                VALUES (?, ?, ?, ?, 0, 'standart', 1, datetime('now', '+6 hours'))
+                INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan)
+                VALUES (?, ?, ?, ?, 0, 'standart')
             """, (user_id, username, first_name, DEFAULT_SELLER_MESSAGE))
         await db.commit()
 

@@ -23,6 +23,7 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
         await database.init_db()
         self.user_id = 123456
         await database.get_or_create_user(self.user_id)
+        await database.activate_trial(self.user_id)
 
     async def asyncTearDown(self):
         self.enabled_patch.stop()
