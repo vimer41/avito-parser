@@ -256,6 +256,20 @@ class TestReport(LogFixture):
         self.assertIn("KeyError", report)
         self.assertLess(len(report), 40000)
 
+    def test_channel_history_sums_one_channel_and_counts_paused_minutes(self):
+        now = int(time.time())
+        paused = {"direct": {"http": 5, "ok": 1, "403": 4, "429": 0, "5xx": 0, "terr": 0, "coll": 5, "coll_ok": 1,
+                             "ms_p50": 500, "fail": {"forbidden": 2}, "state": "quarantined", "rate": 1.5}}
+        write_metrics_row(self.minute(now - 90000))  # older than a day
+        write_metrics_row(self.minute(now - 120))
+        write_metrics_row(self.minute(now - 60, ch=paused))
+        self.flush()
+
+        stats = log_report.channel_history("direct")
+        self.assertEqual((stats["http"], stats["ok"], stats["minutes"], stats["paused"]), (45, 37, 2, 1))
+        self.assertEqual(stats["fail"]["forbidden"], 2)
+        self.assertIsNone(log_report.channel_history("10.0.0.1:3000"))
+
     def test_old_rows_are_skipped_and_empty_logs_do_not_fail(self):
         self.assertIn("Нет минутных метрик", log_report.build_report(5))
         now = time.time()

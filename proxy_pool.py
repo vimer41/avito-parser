@@ -362,6 +362,16 @@ class ProxyClient:
         ok = sum(1 for _, status, transport in recent if not transport and status is not None and 200 <= status < 400)
         return ok / len(recent)
 
+    def routing_role(self) -> str:
+        """The channel's place in routing, for the admin card."""
+        if self.is_direct:
+            return "запасной, берёт нагрузку, когда хорошие прокси заняты"
+        if len(self._history_10m) < 3:
+            return "новый, пока считается хорошим"
+        if self.recent_health() >= float(config.PROXY_GOOD_HEALTH):
+            return "основной, работает в первую очередь"
+        return "слабый, работает как запасной и проверяется раз в минуту"
+
     def routing_score(self, now: float) -> float:
         """Higher goes first: unproven channel due for a probe, proven proxy, server or weak proxy, overloaded proxy."""
         health = self.recent_health()

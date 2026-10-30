@@ -1593,8 +1593,11 @@ async def _remove_proxies(proxy_ids: set[str] | None) -> str:
 async def _render_proxy_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
     from proxy_check import EXIT_IPS
     from proxy_pool import compute_proxy_id, get_proxy_pool
+    from runtime_metrics import METRICS
 
-    states = {snap["proxy_id"]: snap for snap in get_proxy_pool().snapshots()}
+    pool = get_proxy_pool()
+    states = {snap["proxy_id"]: snap for snap in pool.snapshots()}
+    summaries = {summary["proxy_id"]: summary for summary in METRICS.get_proxy_summaries()}
     urls = list(config.PROXY_URLS)
     pages = max(1, (len(urls) + PROXIES_PER_PAGE - 1) // PROXIES_PER_PAGE)
     page = min(max(0, page), pages - 1)
@@ -1607,10 +1610,19 @@ async def _render_proxy_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
         icon = CHANNEL_STATE_ICONS.get(str(snap.get("state")), "⚪")
         ip = EXIT_IPS.get(pid)
         rate = float(snap.get("effective_rate") or 0)
-        lines.append(f"{index}. {icon} {html.escape(_proxy_host(url))}" + (f" · IP {ip}" if ip else "") + f" · <code>{rate:.2f}</code> req/s")
-        buttons.append([InlineKeyboardButton(text=f"🗑 {index}. {_proxy_host(url)}", callback_data=f"admin_net_del:{pid}:{page}")])
+        ratio = summaries.get(pid, {}).get("raw_http_success_ratio_60m")
+        lines.append(
+            f"{index}. {icon} {html.escape(_proxy_host(url))}" + (f" · IP {ip}" if ip else "")
+            + f" · <code>{rate:.2f}</code> req/s" + (f" · ok <code>{ratio:.0%}</code>" if ratio is not None else "")
+        )
+        buttons.append([
+            InlineKeyboardButton(text=f"📊 {index}. {_proxy_host(url)}", callback_data=f"admin_net_stat:{pid}:{page}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"admin_net_del:{pid}:{page}"),
+        ])
     if not urls:
         lines.append("Список пуст.")
+    if any(client.is_direct for client in pool.clients):
+        buttons.append([InlineKeyboardButton(text="📊 Сервер", callback_data=f"admin_net_stat:direct:{page}")])
     if pages > 1:
         buttons.append([
             InlineKeyboardButton(text="◀️", callback_data=f"admin_net_list:{page - 1}" if page > 0 else "admin_noop"),
@@ -1623,6 +1635,59 @@ async def _render_proxy_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
         InlineKeyboardButton(text="➕ Добавить", callback_data="admin_net_add"),
         InlineKeyboardButton(text="🌐 К сети", callback_data="admin_net"),
     ])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _channel_day_lines(stats: dict) -> list[str]:
+    """The channel's last 24 hours from logs/metrics.jsonl."""
+    http, blocks, scans = stats.get("http", 0), stats.get("403", 0) + stats.get("429", 0), stats.get("coll", 0)
+    lines = ["<b>За 24 часа</b>"]
+    if http:
+        lines.append(f"Запросов {http}, успешных {stats.get('ok', 0) / http:.0%}")
+        lines.append(f"Блоки 403/429: {blocks} ({blocks / http:.0%}), обрывы связи: {stats.get('terr', 0)}")
+    if scans:
+        lines.append(f"Сканов {scans}, удачных {stats.get('coll_ok', 0) / scans:.0%}")
+    lines.append(f"На паузе {stats.get('paused', 0)} мин из {stats.get('minutes', 0)}")
+    if stats["fail"]:
+        lines.append("Ошибки: " + ", ".join(f"{FAILURE_LABELS.get(k, k)} — {v}" for k, v in stats["fail"].most_common(3)))
+    return lines
+
+
+async def _render_proxy_card(proxy_id: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    import log_report
+    from proxy_check import EXIT_IPS
+    from proxy_pool import compute_proxy_id, get_proxy_pool
+    from runtime_metrics import METRICS, channel_card
+
+    back = [InlineKeyboardButton(text="« К списку", callback_data=f"admin_net_list:{page}")]
+    is_direct = proxy_id == "direct"
+    url = next((u for u in config.PROXY_URLS if compute_proxy_id(u) == proxy_id), None)
+    if url is None and not is_direct:
+        return "Этого прокси уже нет в списке.", InlineKeyboardMarkup(inline_keyboard=[back])
+
+    lines = [f"📊 <b>{'Сервер (без прокси)' if is_direct else html.escape(_proxy_host(url))}</b>"]
+    if EXIT_IPS.get(proxy_id):
+        lines.append(f"Внешний IP: {EXIT_IPS[proxy_id]}")
+    client = next((c for c in get_proxy_pool().clients if c.proxy_id == proxy_id), None)
+    if client is None:
+        lines.append("Сейчас не в работе: режим сети без этого канала.")
+    else:
+        lines.append(f"Роль: {client.routing_role()}")
+        lines.append(f"Последние {config.PROXY_HEALTH_WINDOW} запросов: {client.recent_health():.0%} успешных")
+
+    summary = next((s for s in METRICS.get_proxy_summaries() if s["proxy_id"] == proxy_id), None)
+    if summary is not None:
+        lines += ["", "<b>За 60 минут</b>", *channel_card(summary)]
+    stats = await asyncio.to_thread(log_report.channel_history, "direct" if is_direct else _proxy_host(url))
+    if stats is not None:
+        lines += ["", *_channel_day_lines(stats)]
+    if summary is None and stats is None:
+        lines += ["", "Статистики пока нет: канал ещё не делал запросов."]
+
+    buttons = [[InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin_net_stat:{proxy_id}:{page}")]]
+    if not is_direct:
+        buttons.append([InlineKeyboardButton(text="🗑 Удалить прокси", callback_data=f"admin_net_del:{proxy_id}:{page}")])
+    buttons.append(back)
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1706,6 +1771,19 @@ async def cb_admin_net_list(call: CallbackQuery):
         page = 0
     await call.answer()
     text, kb = await _render_proxy_list(page)
+    await _show(call, text, kb)
+
+
+@router.callback_query(F.data.startswith("admin_net_stat:"))
+async def cb_admin_net_stat(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    parts = call.data.split(":")
+    proxy_id = parts[1] if len(parts) > 1 else ""
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    await call.answer()
+    text, kb = await _render_proxy_card(proxy_id, page)
     await _show(call, text, kb)
 
 

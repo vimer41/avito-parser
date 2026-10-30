@@ -1427,7 +1427,7 @@ class RuntimeMetricsRegistry:
             cards = ["🔌 <b>Каналы</b> · последний час"]
             for p in sorted(proxies, key=_channel_sort_key):
                 cards.append("")
-                cards.extend(_channel_card(p))
+                cards.extend(channel_card(p))
             current: list[str] = []
             current_len = 0
             for line in cards:
@@ -1553,7 +1553,7 @@ def _channel_sort_key(p: dict[str, Any]) -> tuple[int, str]:
     return (0 if _is_direct_channel(p) else 1, _channel_name(p))
 
 
-def _channel_card(p: dict[str, Any]) -> list[str]:
+def channel_card(p: dict[str, Any]) -> list[str]:
     raw = p["raw_http_total_60m"]
     blocks = p["raw_http_403_60m"] + p["raw_http_429_60m"]
     raw_10 = p["raw_http_total_10m"]

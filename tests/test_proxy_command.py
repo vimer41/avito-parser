@@ -3,6 +3,7 @@
 import tempfile
 import time
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -197,6 +198,47 @@ class TestNetworkScreen(ProxyEnvMixin, DispatcherFixture, unittest.IsolatedAsync
         await self.dispatch_callback("admin_net_delall_yes", config.ADMIN_ID)
         self.assertEqual(config.NET_MODE, "direct")
         self.assertEqual(self.channels(), ["direct"])
+
+    async def test_each_proxy_opens_its_own_statistics_card(self):
+        await self.dispatch_callback("admin_net_add", config.ADMIN_ID)
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "10.1.2.3"})), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True, True))):
+            await self.dispatch_message(text=PROXY_RAW, user_id=config.ADMIN_ID)
+        proxy_id = proxy_pool.compute_proxy_id(PROXY_URL)
+        client = next(c for c in proxy_pool.get_proxy_pool().clients if c.proxy_id == proxy_id)
+        for status in (200, 200, 200, 403):
+            client.record_raw_http_response(status, 0.1)
+
+        await self.dispatch_callback("admin_net_list:0", config.ADMIN_ID)
+        values = self.callback_values()
+        self.assertIn(f"admin_net_stat:{proxy_id}:0", values)
+        self.assertIn("admin_net_stat:direct:0", values)
+
+        day = {"http": 100, "ok": 84, "403": 10, "429": 0, "terr": 6, "coll": 80, "coll_ok": 78,
+               "fail": Counter({"timeout": 6}), "minutes": 60, "paused": 5}
+        with patch("log_report.channel_history", return_value=day) as history:
+            await self.dispatch_callback(f"admin_net_stat:{proxy_id}:0", config.ADMIN_ID)
+        history.assert_called_once_with("10.1.2.3:8080")
+        text = self.methods("EditMessageText")[-1].text
+        self.assertIn("10.1.2.3:8080", text)
+        self.assertIn("Роль: основной", text)
+        self.assertIn("75% успешных", text)
+        self.assertIn("За 60 минут", text)
+        self.assertIn("Запросов 100, успешных 84%", text)
+        self.assertIn("На паузе 5 мин из 60", text)
+        self.assertNotIn("secret", text)
+        self.assertIn(f"admin_net_del:{proxy_id}:0", self.callback_values())
+
+        with patch("log_report.channel_history", return_value=None):
+            await self.dispatch_callback("admin_net_stat:direct:0", config.ADMIN_ID)
+            self.assertIn("Сервер (без прокси)", self.methods("EditMessageText")[-1].text)
+            await self.dispatch_callback("admin_net_stat:p-missing:0", config.ADMIN_ID)
+            self.assertIn("уже нет в списке", self.methods("EditMessageText")[-1].text)
+
+    async def test_non_admin_cannot_open_a_proxy_card(self):
+        await self.dispatch_callback("admin_net_stat:direct:0", 123456)
+        self.assertFalse(self.methods("EditMessageText"))
+        self.assertTrue(self.methods("AnswerCallbackQuery")[-1].show_alert)
 
     async def test_saved_mode_is_restored_on_startup(self):
         await database.set_bot_setting("net_mode", "both")

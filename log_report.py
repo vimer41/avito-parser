@@ -125,6 +125,18 @@ def _channels(metrics: list[dict]) -> dict[str, dict]:
     return merged
 
 
+def channel_history(name: str, hours: int = 24) -> Optional[dict]:
+    """One channel's totals from the minute rows; they survive restarts, unlike METRICS."""
+    rows = read_rows(METRICS_LOG, time.time() - hours * 3600)
+    stats = _channels(rows).get(name)
+    if stats is None:
+        return None
+    minutes = [row["ch"][name] for row in rows if name in (row.get("ch") or {})]
+    stats["minutes"] = len(minutes)
+    stats["paused"] = sum(1 for minute in minutes if minute.get("state") == "quarantined")
+    return stats
+
+
 def findings(metrics: list[dict], events: list[dict]) -> list[str]:
     """What stands out, so the reader starts with the likely cause and not with the tables."""
     if not metrics:
