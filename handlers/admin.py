@@ -1178,19 +1178,9 @@ async def cmd_admin_stats(event):
             await message.answer("⛔ У вас нет прав администратора.")
             return
 
-    from proxy_pool import get_proxy_pool
+    import reports
     from runtime_metrics import METRICS
-    try:
-        pool = get_proxy_pool()
-        ob = await database.get_outbox_metrics()
-        METRICS.update_outbox_state(
-            pending_depth=ob.get("pending", 0),
-            leased_depth=ob.get("leased", 0),
-            oldest_pending_age_seconds=ob.get("oldest_seconds", 0),
-        )
-        METRICS.snapshot(proxy_snapshots=pool.snapshots())
-    except Exception:
-        pass
+    await reports.refresh_live_metrics()
 
     stats_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -1204,6 +1194,37 @@ async def cmd_admin_stats(event):
     for idx, chunk in enumerate(chunks):
         is_last = idx == len(chunks) - 1
         await message.answer(chunk, reply_markup=stats_kb if is_last else None, parse_mode="HTML")
+
+
+@router.message(Command("stats_at"))
+async def cmd_admin_stats_at(message: Message):
+    if not config.is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+    import time
+    import reports
+    from datetime import datetime, timezone
+
+    arg = (message.text or "").partition(" ")[2].strip()
+    if arg.lower() in ("off", "нет", "отмена"):
+        await database.set_bot_setting(reports.STATS_AT_KEY, "")
+        await message.answer("🗓 Отчёт по расписанию отменён.")
+        return
+    due = reports.next_msk_epoch(arg)
+    if due is None:
+        await message.answer(
+            "🗓 Пришлю статистику в указанное время по Москве.\n\n"
+            "Пример: <code>/stats_at 5:00</code>, отмена: <code>/stats_at off</code>",
+            parse_mode="HTML",
+        )
+        return
+    await database.set_bot_setting(reports.STATS_AT_KEY, str(due))
+    msk = datetime.fromtimestamp(due + 3 * 3600, timezone.utc).strftime("%H:%M")
+    left_min = int((due - time.time()) // 60)
+    await message.answer(
+        f"🗓 Пришлю статистику в <b>{msk}</b> МСК (через {left_min // 60} ч {left_min % 60} мин) — всем админам.",
+        parse_mode="HTML",
+    )
 
 
 async def _set_direct_legacy(enabled: bool) -> dict:

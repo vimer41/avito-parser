@@ -47,6 +47,14 @@ class TestReminderRules(unittest.TestCase):
         self.assertEqual(reports.seconds_until_report(now), 3600)
         self.assertEqual(reports.seconds_until_report(now + 7200), 86400 - 3600)
 
+    def test_stats_at_picks_next_msk_moment(self):
+        # 00:18 UTC = 03:18 MSK -> 05:00 MSK is 02:00 UTC the same day, tomorrow once it has passed
+        now = datetime(2026, 10, 30, 0, 18, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(reports.next_msk_epoch("5:00", now), datetime(2026, 10, 30, 2, 0, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(reports.next_msk_epoch("03:00", now), datetime(2026, 10, 31, 0, 0, tzinfo=timezone.utc).timestamp())
+        self.assertIsNone(reports.next_msk_epoch("25:00", now))
+        self.assertIsNone(reports.next_msk_epoch("завтра", now))
+
 
 class TestNightAndDaily(unittest.TestCase):
     def test_night_hours_in_moscow(self):

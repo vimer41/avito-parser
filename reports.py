@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -179,8 +180,75 @@ async def daily_report_worker(bot: Bot) -> None:
             logger.exception("Сбой утреннего отчёта")
 
 
+# One-off /stats report at a time the admin picked (/stats_at 5:00); kept in bot_settings to survive restarts.
+STATS_AT_KEY = "stats_report_at"
+STATS_AT_POLL_SECONDS = 20
+
+
+def next_msk_epoch(raw: str, now: Optional[float] = None) -> Optional[float]:
+    """'5:00' / '05:30' → the next such moment in Moscow time, as a Unix epoch."""
+    match = re.fullmatch(r"\s*(\d{1,2})[:.](\d{2})\s*", raw or "")
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    now = time.time() if now is None else now
+    msk = now + 3 * 3600
+    target = (msk // DAY) * DAY + hour * 3600 + minute * 60
+    if target <= msk:
+        target += DAY
+    return target - 3 * 3600
+
+
+async def refresh_live_metrics() -> None:
+    """Feed the current proxy and outbox state into METRICS before a report is rendered."""
+    from proxy_pool import get_proxy_pool
+
+    try:
+        ob = await database.get_outbox_metrics()
+        METRICS.update_outbox_state(
+            pending_depth=ob.get("pending", 0),
+            leased_depth=ob.get("leased", 0),
+            oldest_pending_age_seconds=ob.get("oldest_seconds", 0),
+        )
+        METRICS.snapshot(proxy_snapshots=get_proxy_pool().snapshots())
+    except Exception:
+        logger.debug("Не удалось обновить живые метрики", exc_info=True)
+
+
+async def send_stats_report(bot: Bot) -> None:
+    await refresh_live_metrics()
+    chunks = METRICS.format_stats_messages()
+    plain = "\n\n".join(re.sub(r"<[^>]+>", "", chunk) for chunk in chunks)
+    logger.info("Отчёт мониторинга по расписанию:\n%s", plain)
+    for admin_id in config.ADMIN_IDS:
+        for chunk in chunks:
+            try:
+                await bot.send_message(admin_id, chunk, parse_mode="HTML")
+            except Exception as exc:
+                logger.warning("Отчёт мониторинга не доставлен %s: %s", admin_id, exc)
+                break
+
+
+async def stats_at_worker(bot: Bot) -> None:
+    while True:
+        await asyncio.sleep(STATS_AT_POLL_SECONDS)
+        try:
+            raw = await database.get_bot_setting(STATS_AT_KEY)
+            if not raw or time.time() < float(raw):
+                continue
+            await database.set_bot_setting(STATS_AT_KEY, "")
+            await send_stats_report(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой отчёта мониторинга по расписанию")
+
+
 def start_report_services(bot: Bot) -> list[asyncio.Task]:
     return [
         asyncio.create_task(reminder_worker(bot), name="subscription-reminders"),
         asyncio.create_task(daily_report_worker(bot), name="daily-report"),
+        asyncio.create_task(stats_at_worker(bot), name="stats-at"),
     ]
