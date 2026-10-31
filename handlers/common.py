@@ -130,7 +130,8 @@ async def cmd_start(event, state: FSMContext):
         "Бот запомнит выдачу и будет присылать каждый новый лот."
     )
     markup = main_menu_kb()
-    if can_take_trial(user_record, user.id):
+    is_new = can_take_trial(user_record, user.id)
+    if is_new:
         text, markup = trial_gate.offer()
 
     if isinstance(event, CallbackQuery):
@@ -138,6 +139,8 @@ async def cmd_start(event, state: FSMContext):
         return
     # A typed /start also refreshes the bottom keyboard (new labels, admin button).
     await event.answer("Меню закреплено внизу экрана.", reply_markup=get_main_keyboard(user.id))
+    if is_new:
+        await event.answer(legal_docs.VERIFICATION_CODE)
     await event.answer(text, reply_markup=markup, parse_mode="HTML")
 
 

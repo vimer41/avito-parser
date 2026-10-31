@@ -70,27 +70,8 @@ async def start_health_server():
 
 
 async def setup_bot_profile(bot: Bot):
-    """
-    Устанавливает официальное описание и презентацию бота в Telegram Bot API.
-    Отображается пользователю в окне чата ДО ТОГО, как он нажмет «Запустить» (/start).
-    """
-    bot_description = (
-        "🔥 AVITO RADAR — новые объявления Авито раньше других.\n\n"
-        "Пришлите ссылку на поиск с Авито — бот будет проверять выдачу 24/7 "
-        "и присылать каждый новый лот с ценой и ссылкой.\n\n"
-        "✔️ Проверка от раза в 20 секунд\n"
-        "✔️ Стоп-слова и чёрный список продавцов\n"
-        "✔️ Поиск по названию или по всему тексту\n\n"
-        "🎁 Нажмите «Старт» — 6 часов бесплатно."
-    )
-
-    bot_short_description = "⚡️ Новые объявления Авито в Telegram 24/7: проверка от раза в 20 с, стоп-слова, чёрный список."
-
+    """Sets the command menu. The bot descriptions are edited by hand in BotFather."""
     try:
-        await bot.set_my_description(description=bot_description, language_code="ru")
-        await bot.set_my_description(description=bot_description)
-        await bot.set_my_short_description(short_description=bot_short_description, language_code="ru")
-        await bot.set_my_short_description(short_description=bot_short_description)
         await bot.set_my_commands([
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="tariffs", description="Тарифы и оплата Telegram Stars"),
@@ -99,9 +80,9 @@ async def setup_bot_profile(bot: Bot):
             BotCommand(command="terms", description="Условия подписки и возврата"),
             BotCommand(command="paysupport", description="Помощь с оплатой / возврат Stars"),
         ])
-        logger.info("Презентационное описание бота (до /start) успешно обновлено в Telegram API!")
+        logger.info("Команды бота обновлены в Telegram API")
     except Exception as e:
-        logger.warning(f"Не удалось обновить описание бота в Telegram API: {e}")
+        logger.warning(f"Не удалось обновить команды бота в Telegram API: {e}")
 
 
 async def main():

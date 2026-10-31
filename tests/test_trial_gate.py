@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, Chat, Message, User
 
 import config
 import database
+import legal_docs
 import trial_gate
 from handlers import common
 from middlewares import AccessControlMiddleware
@@ -111,6 +112,21 @@ class TestOfferInMiddleware(unittest.IsolatedAsyncioTestCase):
         call = CallbackQuery(id="t", from_user=self.user, chat_instance="t", data="trial_check")
         await AccessControlMiddleware()(self.handler, call, self.data)
         self.handler.assert_awaited_once()
+
+    async def start(self, user_record, user_id=123456):
+        message = SimpleNamespace(from_user=SimpleNamespace(id=user_id, username="u", first_name="U"), answer=AsyncMock())
+        with patch.object(database, "get_or_create_user", new=AsyncMock(return_value=user_record)):
+            await common.cmd_start(message, self.state)
+        return [call.args[0] for call in message.answer.await_args_list]
+
+    async def test_new_user_gets_code_as_own_message_before_the_offer(self):
+        texts = await self.start({"trial_used": 0})
+        self.assertEqual(texts[1], legal_docs.VERIFICATION_CODE)
+        self.assertIn("бесплатно", texts[-1])
+
+    async def test_code_is_not_repeated_after_the_trial_or_for_admins(self):
+        self.assertNotIn(legal_docs.VERIFICATION_CODE, await self.start({"trial_used": 1}))
+        self.assertNotIn(legal_docs.VERIFICATION_CODE, await self.start({"trial_used": 0}, config.ADMIN_IDS[0]))
 
     def test_offer_has_channel_and_check_buttons(self):
         _text, markup = trial_gate.offer()
