@@ -417,6 +417,72 @@ class TestSharedCalibration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(monitoring.MONITORING_STATS["subscriptions"], 2)
         parser.close.assert_called_once()
 
+    def _crash_fixture(self, process, *radars):
+        parser = Mock(last_failure=None, last_coverage_gap=False)
+        return (
+            patch.object(config, "MAX_CONCURRENT_WORKERS", 1),
+            patch.object(config, "ADMIN_IDS", [7]),
+            patch.object(config, "SCAN_STARTUP_SPREAD", 0),
+            patch.object(config, "SOURCE_BACKOFF_MAX", 0.05),
+            patch.object(monitoring, "WORKER_CRASH_PAUSE", 0.01),
+            patch.object(monitoring, "AvitoParser", Mock(return_value=parser, normalize_url=staticmethod(lambda url: url))),
+            patch.object(monitoring.database, "get_all_active_searches", new=AsyncMock(return_value=list(radars))),
+            patch.object(scheduler, "process_url_group", new=process),
+            patch.object(monitoring.METRICS, "record_scan_attempt", side_effect=lambda **kw: self._maybe_crash(kw)),
+        )
+
+    def _maybe_crash(self, fields):
+        if not fields["success"]:
+            raise OverflowError("bad link")
+
+    async def test_one_crashing_link_leaves_the_rest_scanning_and_alerts_once(self):
+        bad = {"id": 1, "user_id": 1, "url": "https://www.avito.ru/bad", "tariff_plan": "standart"}
+        good = {"id": 2, "user_id": 2, "url": "https://www.avito.ru/good", "tariff_plan": "standart"}
+        bad_runs, good_runs = 0, 0
+        done = asyncio.Event()
+
+        async def process(_bot, _parser, key, *args, **kwargs):
+            nonlocal bad_runs, good_runs
+            if "bad" in key:
+                bad_runs += 1
+                if bad_runs >= 3:
+                    done.set()
+                return False
+            good_runs += 1
+            return True
+
+        bot = Mock(send_message=AsyncMock())
+        patches = self._crash_fixture(process, bad, good)
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        task = asyncio.create_task(monitoring.run_monitoring(bot))
+        await asyncio.wait_for(done.wait(), 5)
+        self.assertFalse(task.done())
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertGreaterEqual(good_runs, 1)
+        self.assertEqual(bot.send_message.await_count, 1)
+        self.assertIn("OverflowError", bot.send_message.await_args.kwargs["text"])
+
+    async def test_crashes_with_no_healthy_scans_reach_the_supervisor(self):
+        bad = {"id": 1, "user_id": 1, "url": "https://www.avito.ru/bad", "tariff_plan": "standart"}
+
+        async def process(*args, **kwargs):
+            return False
+
+        patches = (
+            *self._crash_fixture(process, bad),
+            patch.object(config, "HEALTH_ALERT_AFTER_SECONDS", 0),
+        )
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        with self.assertRaises(OverflowError):
+            await asyncio.wait_for(monitoring.run_monitoring(Mock(send_message=AsyncMock())), 5)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -630,3 +696,39 @@ class TestFastSkipCatchupAndHysteresis(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(planner.sources["u"].source_failure_streak, 1025)
         self.assertAlmostEqual(planner.sources["u"].due_at - 1.0, 20.0, delta=0.01)
+
+    def test_abandon_returns_a_crashed_scan_to_the_schedule(self):
+        planner = DeadlineScheduler()
+        planner.sync({"u": [{"id": 1}]}, None, 0.0)
+        task = planner.take_due(0.0)
+
+        planner.abandon(task, 1.0)
+
+        self.assertNotIn("u", planner.running)
+        self.assertIsNone(planner.take_due(1.0 + config.SOURCE_BACKOFF_MAX - 0.1))
+        self.assertIsNotNone(planner.take_due(1.0 + config.SOURCE_BACKOFF_MAX + 0.1))
+
+    def test_crash_inside_complete_keeps_the_source_recoverable(self):
+        planner = DeadlineScheduler()
+        planner.sync({"u": [{"id": 1}]}, None, 0.0)
+        task = planner.take_due(0.0)
+
+        with patch.object(planner, "_apply_failure", side_effect=OverflowError("boom")):
+            with self.assertRaises(OverflowError):
+                planner.complete(task, 1.0, False)
+        planner.abandon(task, 1.0)
+
+        self.assertIsNotNone(planner.take_due(1.0 + config.SOURCE_BACKOFF_MAX + 0.1))
+
+    def test_abandon_ignores_a_finished_or_foreign_task(self):
+        planner = DeadlineScheduler()
+        planner.sync({"u": [{"id": 1}]}, None, 0.0)
+        finished = planner.take_due(0.0)
+        planner.complete(finished, 1.0, True)
+        due = planner.sources["u"].due_at
+        current = planner.take_due(due + 0.1)
+
+        planner.abandon(finished, due + 0.2)
+
+        self.assertIs(planner.running["u"], current)
+        self.assertTrue(planner.sources["u"].http_in_flight)

@@ -464,15 +464,14 @@ class DeadlineScheduler:
         now_val = self.monotonic_fn() if now is None else now
         if self.running.get(task.key) is not task:
             return
-        del self.running[task.key]
         state = self.sources.get(task.key)
         if state is None:
+            del self.running[task.key]
             return
         if state.generation != task.generation:
+            del self.running[task.key]
             self._push_heap(state)
             return
-        state.http_in_flight = False
-        state.fanout_pending = False
         self.completed += 1
         if success:
             self._apply_success(
@@ -492,6 +491,26 @@ class DeadlineScheduler:
                 retryable=retryable,
                 exhausted_proxies=exhausted_proxies,
             )
+        # Released last: a crash above leaves the task running, so abandon() can still recover the source.
+        del self.running[task.key]
+        state.http_in_flight = False
+        state.fanout_pending = False
+        self._push_heap(state)
+
+    def abandon(self, task: ScheduledScan, now: Optional[float] = None) -> None:
+        """Releases a scan whose worker crashed, so the source is retried later instead of lost until a restart."""
+        now_val = self.monotonic_fn() if now is None else now
+        if self.running.get(task.key) is not task:
+            return
+        del self.running[task.key]
+        state = self.sources.get(task.key)
+        if state is None:
+            return
+        state.http_in_flight = False
+        state.fanout_pending = False
+        if state.generation == task.generation:
+            state.retry_attempt = 0
+            state.due_at = now_val + float(config.SOURCE_BACKOFF_MAX)
         self._push_heap(state)
 
     def seconds_until_next(self, now: Optional[float] = None) -> float:
