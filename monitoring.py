@@ -267,6 +267,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             task, collection, worker_id, scan_trace = item
             set_trace(scan_trace)
             fanout_t0 = time.monotonic()
+            fanout_ok = False
             try:
                 await scheduler.process_collected_group_fanout(
                     task.key,
@@ -276,6 +277,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     previous_processed_at=task.previous_processed_at,
                 )
                 await seen_store.remember(task.key, task.group_revision, settled_item_ids(collection))
+                fanout_ok = True
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -284,17 +286,20 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 try:
                     now_mono = time.monotonic()
                     METRICS.record_fanout_batch(now_mono - fanout_t0)
+                    # After a failed fanout the next scan must repeat it: a saved top-3 would fast-skip these lots.
+                    top_ids = collection.top_ids if fanout_ok else ()
                     planner.complete(
                         task,
                         now_mono,
                         True,
-                        top_ids=collection.top_ids,
+                        top_ids=top_ids,
                         fast_skipped=collection.fast_skipped,
-                        processed_epoch=collection.captured_at,
+                        processed_epoch=collection.captured_at if fanout_ok else None,
                     )
                     state = planner.sources.get(task.key)
                     streak = state.source_failure_streak if state else 0
-                    await queue_state_update(task.key, collection.captured_at, collection.top_ids, streak)
+                    processed_at = collection.captured_at if fanout_ok else task.previous_processed_at
+                    await queue_state_update(task.key, processed_at, top_ids, streak)
                 except Exception as exc:
                     logger.exception("Сбой завершения fanout источника %s", task.key[:60])
                     planner.abandon(task, time.monotonic())

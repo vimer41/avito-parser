@@ -11,7 +11,7 @@ import random
 import re
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from contextlib import contextmanager
 from http.cookiejar import Cookie
@@ -55,6 +55,7 @@ COOKIE_FILE = DATA_DIR / "avito_cookies.json"
 COOKIE_IO_LOCK = Lock()
 
 _CHALLENGE_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_COOKIE_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _EXECUTOR_LOCK = Lock()
 
 # Cheap regex scans replace a full DOM parse for the few HTML facts we still need.
@@ -79,6 +80,16 @@ def _get_challenge_executor() -> ThreadPoolExecutor:
                     thread_name_prefix="avito-challenge",
                 )
     return _CHALLENGE_EXECUTOR
+
+
+def _get_cookie_executor() -> ThreadPoolExecutor:
+    global _COOKIE_EXECUTOR
+    if _COOKIE_EXECUTOR is None:
+        with _EXECUTOR_LOCK:
+            if _COOKIE_EXECUTOR is None:
+                # One thread: a slow disk must not occupy the default pool that aiogram filters run in.
+                _COOKIE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="avito-cookies")
+    return _COOKIE_EXECUTOR
 
 
 @dataclass
@@ -258,6 +269,7 @@ class AvitoParser:
         self._install_request_budget()
         self._last_saved_cookies: list = []
         self._cookies_saved_at = 0.0
+        self._cookie_write: Optional[Future] = None
         self._load_cookies()
 
         # Кэш SSR-редиректов Авито: исходный URL -> канонический URL (экономит 1 запрос на радар)
@@ -388,34 +400,58 @@ class AvitoParser:
         with self._session_lock:
             self.session.close()
 
+    @staticmethod
+    def _snapshot_cookies(cookie_jar) -> list:
+        """Scopes, expiry and flags of the Avito cookies, without merging proxy identities."""
+        cookies = []
+        for cookie in cookie_jar:
+            domain = cookie.domain.lstrip(".").lower()
+            if cookie.name in ("pow_challenge", "pow_solved") or cookie.is_expired() or not (domain == "avito.ru" or domain.endswith(".avito.ru")):
+                continue
+            cookies.append({
+                "name": cookie.name, "value": cookie.value, "domain": cookie.domain,
+                "domain_specified": cookie.domain_specified, "path": cookie.path,
+                "secure": cookie.secure, "expires": cookie.expires, "discard": cookie.discard,
+                "rest": copy.deepcopy(cookie._rest),
+            })
+        cookies.sort(key=lambda c: (c["domain"], c["path"], c["name"]))
+        return cookies
+
     def _save_cookies_from_jar(self, cookie_jar):
-        """Atomically save scopes, expiry and flags, without merging proxy identities."""
+        try:
+            cookies = self._snapshot_cookies(cookie_jar)
+        except Exception as e:
+            logger.debug(f"Не удалось сохранить куки: {e}")
+            return
+        if cookies != self._last_saved_cookies:
+            self._write_cookies(cookies)
+
+    def _queue_cookie_save(self, cookie_jar):
+        """Hot path: the snapshot stays on the event loop, the slow fsync goes to the background thread."""
+        if self._cookie_write is not None and not self._cookie_write.done():
+            return
+        try:
+            cookies = self._snapshot_cookies(cookie_jar)
+        except Exception as e:
+            logger.debug(f"Не удалось сохранить куки: {e}")
+            return
+        if cookies != self._last_saved_cookies:
+            self._cookie_write = _get_cookie_executor().submit(self._write_cookies, cookies)
+
+    def _write_cookies(self, cookies: list) -> None:
+        """Atomic replace. The lock covers only the swap, so the event loop never waits for an fsync on it."""
         temporary_path = None
         try:
-            cookies = []
-            for cookie in cookie_jar:
-                domain = cookie.domain.lstrip(".").lower()
-                if cookie.name in ("pow_challenge", "pow_solved") or cookie.is_expired() or not (domain == "avito.ru" or domain.endswith(".avito.ru")):
-                    continue
-                cookies.append({
-                    "name": cookie.name, "value": cookie.value, "domain": cookie.domain,
-                    "domain_specified": cookie.domain_specified, "path": cookie.path,
-                    "secure": cookie.secure, "expires": cookie.expires, "discard": cookie.discard,
-                    "rest": copy.deepcopy(cookie._rest),
-                })
-            cookies.sort(key=lambda c: (c["domain"], c["path"], c["name"]))
-            if cookies == self._last_saved_cookies:
-                return
             payload = {"version": 2, "profile": BROWSER_PROFILE, "proxy_key": self._proxy_key, "cookies": cookies}
+            self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.cookie_file.parent, delete=False) as f:
+                temporary_path = f.name
+                json.dump(payload, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
             with COOKIE_IO_LOCK:
-                self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.cookie_file.parent, delete=False) as f:
-                    temporary_path = f.name
-                    json.dump(payload, f, ensure_ascii=False)
-                    f.flush()
-                    os.fsync(f.fileno())
                 os.replace(temporary_path, self.cookie_file)
-                temporary_path = None
+            temporary_path = None
             self._last_saved_cookies = cookies
             logger.debug("Cookies saved (%d scoped records)", len(cookies))
         except Exception as e:
@@ -436,7 +472,7 @@ class AvitoParser:
         if now - self._cookies_saved_at < float(config.COOKIE_SAVE_INTERVAL):
             return
         self._cookies_saved_at = now
-        self._save_cookies_from_jar(cookie_jar)
+        self._queue_cookie_save(cookie_jar)
 
     def _load_cookies_into_jar(self, cookies_obj):
         if not self.cookie_file.exists():
@@ -813,7 +849,7 @@ class AvitoParser:
                     if challenge_attempts:
                         # Fresh clearance cookies are worth persisting immediately.
                         self._cookies_saved_at = time.monotonic()
-                        self._save_cookies_from_jar(async_session.cookies.jar)
+                        self._queue_cookie_save(async_session.cookies.jar)
                     else:
                         self._maybe_save_cookies_from_jar(async_session.cookies.jar)
                     return page_html

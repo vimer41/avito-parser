@@ -436,6 +436,10 @@ class DeadlineScheduler:
                 float(config.SOURCE_BACKOFF_MAX),
                 float(config.SOURCE_BACKOFF_BASE) * (2 ** min(state.source_failure_streak - 1, 16)),
             )
+            if state.source_failure_streak >= config.SOURCE_SLOW_AFTER:
+                # A link failing in a row must not hit Avito more often than a healthy link of its tariff.
+                factor = min(state.source_failure_streak - 1, config.SOURCE_SLOW_MAX_FACTOR)
+                delay = max(delay, state.interval * factor)
             state.backoff_until = now_val + max(delay, retry_after)
             state.due_at = state.backoff_until
             return

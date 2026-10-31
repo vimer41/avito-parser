@@ -668,7 +668,7 @@ class TestFastSkipCatchupAndHysteresis(unittest.IsolatedAsyncioTestCase):
         planner.complete(task, 1.0, False, exhausted_proxies=False)
         self.assertEqual(planner.sources["u"].source_failure_streak, 0)
 
-        # Every channel failed (exhausted_proxies=True) twice -> streak 2 -> 10s backoff, capped at 20s
+        # Every channel failed (exhausted_proxies=True) twice -> streak 2 -> 10s backoff
         t2 = planner.take_due(10.0)
         planner.complete(t2, 11.0, False, exhausted_proxies=True)
         t3 = planner.take_due(50.0)
@@ -678,7 +678,8 @@ class TestFastSkipCatchupAndHysteresis(unittest.IsolatedAsyncioTestCase):
         for at in (100.0, 200.0, 300.0, 400.0):
             tk = planner.take_due(at)
             planner.complete(tk, at + 1.0, False, exhausted_proxies=True)
-        self.assertLessEqual(planner.sources["u"].due_at - 401.0, 20.0)
+        state = planner.sources["u"]
+        self.assertAlmostEqual(state.due_at - 401.0, max(20.0, state.interval * config.SOURCE_SLOW_MAX_FACTOR), delta=0.01)
 
         # One healthy scan clears the streak
         due = planner.sources["u"].due_at
@@ -694,8 +695,28 @@ class TestFastSkipCatchupAndHysteresis(unittest.IsolatedAsyncioTestCase):
 
         planner.complete(task, 1.0, False, exhausted_proxies=True)
 
-        self.assertEqual(planner.sources["u"].source_failure_streak, 1025)
-        self.assertAlmostEqual(planner.sources["u"].due_at - 1.0, 20.0, delta=0.01)
+        state = planner.sources["u"]
+        self.assertEqual(state.source_failure_streak, 1025)
+        self.assertAlmostEqual(state.due_at - 1.0, max(20.0, state.interval * config.SOURCE_SLOW_MAX_FACTOR), delta=0.01)
+
+    def test_failing_link_slows_down_past_its_tariff_interval_and_recovers(self):
+        planner = DeadlineScheduler(use_source_backoff=True)
+        planner.sync({"u": [{"id": 1}]}, {"u": 40.0}, 0.0)
+        delays = []
+        now = 0.0
+        for _ in range(7):
+            task = planner.take_due(now)
+            planner.complete(task, now, False, exhausted_proxies=True)
+            delays.append(planner.sources["u"].due_at - now)
+            now = planner.sources["u"].due_at
+
+        self.assertEqual(delays[:2], [5.0, 10.0])  # one bad minute stays fast
+        self.assertEqual(delays[2:], [80.0, 120.0, 160.0, 200.0, 200.0])
+
+        task = planner.take_due(now)
+        planner.complete(task, now, True)
+        self.assertEqual(planner.sources["u"].source_failure_streak, 0)
+        self.assertEqual(planner.sources["u"].due_at - now, 40.0)
 
     def test_abandon_returns_a_crashed_scan_to_the_schedule(self):
         planner = DeadlineScheduler()

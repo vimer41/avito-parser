@@ -85,6 +85,8 @@ HTTP_COST_MIN_SAMPLES = positive_int_setting("HTTP_COST_MIN_SAMPLES", "30")
 SOURCE_BACKOFF_BASE = positive_float_setting("SOURCE_BACKOFF_BASE", "5.0")
 SOURCE_BACKOFF_MAX = positive_float_setting("SOURCE_BACKOFF_MAX", "20.0")
 SOURCE_RECOVERY_SUCCESSES = positive_int_setting("SOURCE_RECOVERY_SUCCESSES", "1")
+SOURCE_SLOW_AFTER = positive_int_setting("SOURCE_SLOW_AFTER", "3")
+SOURCE_SLOW_MAX_FACTOR = positive_int_setting("SOURCE_SLOW_MAX_FACTOR", "5")
 SCAN_PROXY_ATTEMPTS = positive_int_setting("SCAN_PROXY_ATTEMPTS", "3")
 
 # --- Прокси и HTTP ---

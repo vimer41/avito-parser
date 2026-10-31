@@ -347,6 +347,40 @@ class TestParserProtection(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((stored[0].domain, stored[0].path, stored[0].secure, stored[0].expires), ("m.avito.ru", "/api", True, cookie.expires))
             self.assertEqual(json.loads(first.cookie_file.read_text(encoding="utf-8"))["version"], 2)
 
+    def test_hot_path_cookie_save_never_waits_for_fsync(self):
+        import os
+        import threading
+        import parser as parser_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            parser = self.make_parser(FakeSession(), save=True)
+            parser.cookie_file = Path(directory) / "cookies.json"
+            parser.session.cookies.set("scoped", "value", domain="m.avito.ru")
+            jar = parser.session.cookies.jar
+            release = threading.Event()
+            entered = threading.Event()
+            fsync_threads = []
+
+            def slow_fsync(_fd):
+                fsync_threads.append(threading.get_ident())
+                entered.set()
+                release.wait(5)
+
+            with patch.object(os, "fsync", slow_fsync):
+                parser._queue_cookie_save(jar)
+                pending = parser._cookie_write
+                self.assertTrue(entered.wait(5))
+                self.assertFalse(pending.done())
+                parser._queue_cookie_save(jar)  # a second write never queues behind a slow disk
+                self.assertIs(parser._cookie_write, pending)
+                self.assertTrue(parser_module.COOKIE_IO_LOCK.acquire(timeout=1))  # session creation reads under it
+                parser_module.COOKIE_IO_LOCK.release()
+                release.set()
+                pending.result(5)
+
+            self.assertNotEqual(fsync_threads, [threading.get_ident()])
+            self.assertEqual(json.loads(parser.cookie_file.read_text(encoding="utf-8"))["cookies"][0]["name"], "scoped")
+
     async def test_async_cancellation_stops_worker_before_returning(self):
         parser = self.make_parser(FakeSession())
         started, stopped = Event(), Event()

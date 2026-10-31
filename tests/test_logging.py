@@ -479,6 +479,52 @@ class TestProductionScanLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["channels"], "0/0")
         self.assertIn("minute", by_event)
 
+    async def test_failed_fanout_is_repeated_instead_of_fast_skipped(self):
+        import monitoring
+        import scheduler
+        from collector import SourceCollection
+
+        radar = {
+            "id": 1, "user_id": 9, "url": "https://www.avito.ru/search?q=x", "tariff_plan": "pro",
+            "title": "радар", "initialized_at": "2026-01-01 00:00:00",
+        }
+        scans = []
+        fanouts = 0
+        repeated = asyncio.Event()
+
+        async def collect(parser_, url, *args, **kwargs):
+            scans.append((kwargs["can_fast_skip"], kwargs["last_top_ids"]))
+            return SourceCollection("Поиск", (), time.time(), 1, False, 120, top_ids=("1",))
+
+        async def fanout(*args, **kwargs):
+            nonlocal fanouts
+            fanouts += 1
+            if fanouts == 1:
+                raise RuntimeError("database is locked")
+            repeated.set()
+            return True
+
+        with (
+            patch.object(monitoring, "get_proxy_pool", return_value=_FakePool()),
+            patch.object(monitoring, "AvitoParser", _ScanParser),
+            patch.object(monitoring, "collect_source", collect),
+            patch.object(scheduler, "process_collected_group_fanout", fanout),
+            patch.object(database, "get_all_active_searches", AsyncMock(return_value=[radar])),
+            patch.object(database, "get_outbox_metrics", AsyncMock(return_value={"pending": 0, "oldest_seconds": 0})),
+            patch.object(database, "load_all_source_scan_states", AsyncMock(return_value={})),
+            patch.object(database, "upsert_source_scan_states_batch", AsyncMock()),
+            patch.object(config, "SCAN_STARTUP_SPREAD", 0),
+            patch.object(config, "MAX_CONCURRENT_WORKERS", 1),
+            patch.dict(config.TARIFF_SCAN_INTERVAL, {key: 0.05 for key in config.TARIFF_SCAN_INTERVAL}),
+        ):
+            task = asyncio.create_task(monitoring.run_monitoring(Mock(send_message=AsyncMock())))
+            await asyncio.wait_for(repeated.wait(), 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(scans[1], (False, ()))
+
 
 if __name__ == "__main__":
     unittest.main()
