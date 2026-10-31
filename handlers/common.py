@@ -10,12 +10,38 @@ from aiogram.fsm.context import FSMContext
 
 import config
 import database
+import legal_docs
 import trial_gate
 import ui
 from logger_setup import log_user_event
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+def get_docs_keyboard() -> InlineKeyboardMarkup:
+    return ui.kb(
+        [ui.btn("Пользовательское соглашение", "docs", callback_data="doc_agreement")],
+        [ui.btn("Политика конфиденциальности", "lock", callback_data="doc_privacy")],
+        [ui.btn("Условия подписки и возврата", "card", callback_data="payment_terms")],
+        [ui.home_btn()],
+    )
+
+
+def get_doc_keyboard(name: str, page: int) -> InlineKeyboardMarkup:
+    pages = legal_docs.DOCS[name][2]
+    nav = []
+    if page > 0:
+        nav.append(ui.btn("« Назад", callback_data=f"doc_page:{name}:{page - 1}"))
+    if page < len(pages) - 1:
+        nav.append(ui.btn("Далее »", callback_data=f"doc_page:{name}:{page + 1}"))
+    return ui.kb(
+        nav,
+        [ui.btn("К списку документов", "docs", callback_data="open_docs_menu")],
+        [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
+         ui.btn("Поддержка", "support", callback_data="support_start_ticket")],
+        [ui.home_btn()],
+    )
 
 
 def get_main_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
@@ -38,7 +64,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
          ui.btn("Профиль", "profile", callback_data="refresh_profile")],
         [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
          ui.btn("Инструкция", "help", callback_data="open_help_menu")],
-        [ui.btn("Поддержка", "support", callback_data="support_start_ticket")],
+        [ui.btn("Поддержка", "support", callback_data="support_start_ticket"),
+         ui.btn("Документы", "docs", callback_data="open_docs_menu")],
     )
 
 
@@ -308,7 +335,10 @@ async def cmd_subscription_menu(event):
             f"{config.plan_title(plan)} — {config.rub_price(plan)} ₽{mark}", plan,
             callback_data=f"buy_tariff:{plan}", style="primary" if plan == "standart" and not current else None,
         )])
-    rows.append([ui.btn("Вопрос по оплате", "support", callback_data="payment_support")])
+    rows.append([
+        ui.btn("Условия", "docs", callback_data="payment_terms"),
+        ui.btn("Вопрос по оплате", "support", callback_data="payment_support"),
+    ])
     rows.append([ui.home_btn()])
     await ui.show(event, text, ui.kb(*rows))
 
@@ -342,7 +372,7 @@ async def cb_select_tariff(call: CallbackQuery):
         f"• Проверка каждого радара раз в <b>{config.plan_interval(plan)} с</b>\n"
         "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n\n"
         f"<i>{PLAN_PERKS[plan]}</i>\n\n"
-        "Разовая оплата без автосписаний, доступ включается сразу.\n\n"
+        "Разовая оплата без автосписаний, доступ включается сразу. Оплачивая, вы соглашаетесь с /terms.\n\n"
         "<b>Способ оплаты:</b>"
     )
 
@@ -375,10 +405,46 @@ async def cb_pay_method(call: CallbackQuery):
     await call.answer(f"Оплата {title} скоро появится.{stars_hint}", show_alert=True)
 
 
-@router.callback_query(F.data.in_({"other_payment_methods", "payment_terms", "open_docs_menu", "doc_agreement", "doc_privacy"}))
+@router.callback_query(F.data == "other_payment_methods")
 async def cb_other_payment_methods(call: CallbackQuery):
-    # The "other payment methods" and document screens are gone; old buttons open the tariff list.
+    # The separate "other payment methods" screen is gone; old buttons open the tariff list.
     await cmd_subscription_menu(call)
+
+
+# ── Документы и регламенты ─────────────────────────────────────────────
+
+@router.message(F.text.in_(ui.menu_texts("docs")))
+@router.message(Command("docs"))
+@router.callback_query(F.data == "open_docs_menu")
+async def cmd_docs_hub(event):
+    await ui.show(event, f"{ui.e('docs')} {legal_docs.HUB_TEXT}", get_docs_keyboard())
+
+
+async def show_doc(event, name: str, page: int = 0) -> None:
+    _, icon, pages = legal_docs.DOCS[name]
+    page = max(0, min(page, len(pages) - 1))
+    await ui.show(event, f"{ui.e(icon)} {legal_docs.doc_header(name, page)}{pages[page]}", get_doc_keyboard(name, page))
+
+
+@router.message(Command("agreement", "offer", "contract"))
+@router.callback_query(F.data == "doc_agreement")
+async def cmd_doc_agreement(event):
+    await show_doc(event, "agreement")
+
+
+@router.message(Command("privacy", "policy"))
+@router.callback_query(F.data == "doc_privacy")
+async def cmd_doc_privacy(event):
+    await show_doc(event, "privacy")
+
+
+@router.callback_query(F.data.startswith("doc_page:"))
+async def cb_doc_page(call: CallbackQuery):
+    _, name, page = call.data.split(":")
+    if name not in legal_docs.DOCS or not page.isdigit():
+        await call.answer("Документ не найден", show_alert=True)
+        return
+    await show_doc(call, name, int(page))
 
 
 # ── Служба поддержки и контакты ───────────────────────────────────────
@@ -394,12 +460,13 @@ async def cmd_support(event, state: Optional[FSMContext] = None):
         "Вопросы о работе бота, оплате и возвратах.\n"
         "• Ежедневно с 09:00 до 23:00 (МСК), ответ за 5–15 минут\n"
         "• Возвраты рассматриваем в течение 24 часов\n"
-        f"• {ui.e('mail')} bernardgofov@gmail.com\n\n"
+        f"• {ui.e('mail')} {legal_docs.SUPPORT_EMAIL}\n\n"
         "Нажмите кнопку ниже и опишите вопрос: оператор ответит в этом чате."
     )
     await ui.show(event, text, ui.kb(
         [ui.btn("Написать в поддержку", "write", callback_data="support_start_ticket", style="primary")],
-        [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu")],
+        [ui.btn("Документы", "docs", callback_data="open_docs_menu"),
+         ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu")],
         [ui.home_btn()],
     ))
 

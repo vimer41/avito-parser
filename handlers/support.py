@@ -18,6 +18,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
 import config
 import database
+import legal_docs
 import ui
 from logger_setup import log_user_event
 
@@ -40,7 +41,7 @@ async def cb_support_start(call: CallbackQuery, state: FSMContext):
         f"{ui.e('write')} <b>Сообщение в поддержку</b>\n\n"
         "Опишите вопрос одним сообщением. Можно приложить скриншот, фото или голосовое.\n"
         "Оператор ответит прямо в этом чате.\n\n"
-        f"{ui.e('mail')} Или на почту: bernardgofov@gmail.com"
+        f"{ui.e('mail')} Или на почту: {legal_docs.SUPPORT_EMAIL}"
     )
     await ui.show(call, text, ui.kb([ui.btn("Отмена", "cancel", callback_data="support_cancel")]))
 

@@ -13,6 +13,8 @@ from aiogram.types import PreCheckoutQuery, RefundedPayment, SuccessfulPayment, 
 import billing
 import config
 import database
+import legal_docs
+import ui
 
 
 class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
@@ -247,10 +249,52 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await database.is_user_allowed(self.user_id))
         self.assertIn("Деньги не списаны", self.methods("SendMessage")[-1].text)
 
-    async def test_old_document_buttons_open_the_tariff_list(self):
-        for callback in ("open_docs_menu", "doc_agreement", "doc_privacy", "payment_terms"):
-            await self.dispatch_callback(callback)
-        self.assertIn("buy_tariff:standart", self.callback_values())
-        self.assertNotIn("payment_terms", self.callback_values())
-        self.assertNotIn("open_docs_menu", self.callback_values())
+    async def test_legal_documents_and_verification_code(self):
+        await self.dispatch_message(text="/agreement")
+        text = self.methods("SendMessage")[-1].text
+        self.assertIn("Пользовательское соглашение", text)
+        self.assertIn("mekbuda", text)
+        self.assertIn("31.10.2026", text)
+        self.assertIn("doc_page:agreement:1", self.callback_values())
+
+        await self.dispatch_callback("doc_page:agreement:2")
+        text = self.methods("EditMessageText")[-1].text
+        self.assertIn("10 000 ₽", text)
+        self.assertIn("24 часов", text)
+        self.assertIn("avitoradar.help.support@gmail.com", text)
+
+        await self.dispatch_message(text="/privacy")
+        text = self.methods("SendMessage")[-1].text
+        self.assertIn("Политика конфиденциальности", text)
+        self.assertIn("mekbuda", text)
+        self.assertIn("avitoradar.help.support@gmail.com", text)
+
+        await self.dispatch_message(text="/terms")
+        text = self.methods("SendMessage")[-1].text
+        self.assertIn("Условия подписки", text)
+        self.assertIn("mekbuda", text)
+        self.assertIn("10 000 ₽", text)
+        self.assertIn("24 часов", text)
+        self.assertIn(f"{config.rub_price('pro')} ₽", text)
+        self.assertIn("doc_agreement", self.callback_values())
+        self.assertIn("doc_privacy", self.callback_values())
+
+        await self.dispatch_message(text="/docs")
+        text = self.methods("SendMessage")[-1].text
+        self.assertIn("Документы", text)
+        self.assertIn("doc_agreement", self.callback_values())
+        self.assertIn("doc_privacy", self.callback_values())
+        self.assertIn("payment_terms", self.callback_values())
+
+    def test_legal_documents_fit_telegram_and_name_no_legal_entity(self):
+        for title, icon, pages in legal_docs.DOCS.values():
+            for index, page in enumerate(pages):
+                name = next(key for key, doc in legal_docs.DOCS.items() if doc[2] is pages)
+                text = f"{ui.e(icon)} {legal_docs.doc_header(name, index)}{page}"
+                self.assertLessEqual(ui.visible_len(text), 4096, title)
+                for word in ("ИНН", "ОГРН", "ООО", " ИП "):
+                    self.assertNotIn(word, text)
+
+    def test_tariff_prices_stay_under_the_payment_limit(self):
+        self.assertLessEqual(max(config.PRICE_RUB.values()), config.PAYMENT_LIMIT_RUB)
 

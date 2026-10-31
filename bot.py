@@ -96,6 +96,7 @@ async def setup_bot_profile(bot: Bot):
             BotCommand(command="tariffs", description="Тарифы и оплата Telegram Stars"),
             BotCommand(command="profile", description="Моя подписка и радары"),
             BotCommand(command="help", description="Инструкция"),
+            BotCommand(command="terms", description="Условия подписки и возврата"),
             BotCommand(command="paysupport", description="Помощь с оплатой / возврат Stars"),
         ])
         logger.info("Презентационное описание бота (до /start) успешно обновлено в Telegram API!")

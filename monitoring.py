@@ -21,7 +21,7 @@ from logger_setup import get_trace, log_event, new_trace, set_trace, write_metri
 from parser import AvitoParser
 from proxy_pool import get_proxy_pool
 from request_budget import get_network_block_state
-from runtime_metrics import METRICS, format_minute_line, short_channel
+from runtime_metrics import FAILURE_LABELS, METRICS, format_minute_line, short_channel
 from scan_planner import DeadlineScheduler, ScheduledScan, calculate_interval_plan
 from seen_cache import InMemorySeenStore
 
@@ -36,6 +36,9 @@ STALL_DUMP_REARM_SECONDS = 1.0
 SOURCE_STATS_SECONDS = 600
 WORKER_CRASH_PAUSE = 1.0
 CRASH_ALERT_INTERVAL = 3600
+# Failures that describe the page itself. Blocks and timeouts say nothing about the link.
+DEAD_LINK_KINDS = frozenset({"catalog_missing", "invalid_redirect", "invalid_html", "invalid_response", "http_client"})
+DEAD_LINK_OK_WINDOW = 120.0
 
 
 def group_sources(searches: list[dict]) -> dict[str, list[dict]]:
@@ -256,6 +259,22 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             f"⚠️ Ошибка в коде: «{label}»\n{type(exc).__name__}: {str(exc)[:200]}\n{where}\n\n"
             "Мониторинг не остановлен: остальные ссылки работают, эта повторится позже. "
             "Подробности — в logs/errors.log."
+        )
+
+    async def alert_dead_link(task: ScheduledScan, failure, streak: int):
+        """The verdict comes from scans that already ran, so a user's bad link costs no extra requests."""
+        if streak != config.SOURCE_DEAD_ALERT_STREAK or failure is None or failure.kind not in DEAD_LINK_KINDS:
+            return
+        if time.monotonic() - last_ok_at >= DEAD_LINK_OK_WINDOW:
+            return  # Nothing scans at all: that is an outage, not one bad link
+        radars = "\n".join(
+            f"#{radar.get('id')} «{radar.get('title') or 'Радар'}», пользователь {radar.get('user_id')}"
+            for radar in task.radars[:5]
+        )
+        await notify_admins_text(
+            f"⚠️ Ссылка не работает: {streak} проверок подряд\n"
+            f"Причина: {FAILURE_LABELS.get(failure.kind, failure.kind)}\n\n{radars}\n{task.key[:300]}\n\n"
+            "Радар продолжает проверяться реже. Удалить: Админка → пользователь → Удалить радары."
         )
 
     async def fanout_worker(f_id: int):
@@ -526,6 +545,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             if catalog_down() and not alert_sent:
                 alert_sent = True
                 await notify_health(False)
+            await alert_dead_link(task, last_failure, state_after.source_failure_streak if state_after else 0)
             return
 
         log_scan_success(

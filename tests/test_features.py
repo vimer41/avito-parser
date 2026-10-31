@@ -11,6 +11,7 @@ from tests._dispatcher import DispatcherFixture
 import config
 import database
 import reports
+import source_cache
 from runtime_metrics import RuntimeMetricsRegistry as RuntimeMetrics
 
 
@@ -121,6 +122,30 @@ class TestRadarEditing(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn("kazan", searches[0]["url"])
         self.assertEqual(searches[0]["stop_words"], ["копия"])
         self.assertEqual(await database.get_seen_item_ids_for_search(search_id), {"9"})
+
+    def last_text(self):
+        return [m for m in self.session.calls if type(m).__name__ in ("SendMessage", "EditMessageText")][-1].text
+
+    async def test_bad_link_gets_an_error_and_creates_no_radar(self):
+        await self.dispatch_callback("add_search_prompt", user_id=self.user_id)
+        with patch("source_cache.SOURCE_SNAPSHOTS.load", new=AsyncMock(side_effect=source_cache.BadSourceLink("catalog_missing"))):
+            await self.dispatch_message(user_id=self.user_id, text="https://www.avito.ru/moskva/muzykalnye_instr=104")
+        self.assertEqual(await database.get_user_searches(self.user_id), [])
+        self.assertIn("Радар не создан", self.last_text())
+
+    async def test_bad_replacement_link_keeps_the_old_one(self):
+        search_id = await self.add(1)
+        await self.dispatch_callback(f"change_url:{search_id}", user_id=self.user_id)
+        with patch("source_cache.SOURCE_SNAPSHOTS.load", new=AsyncMock(side_effect=source_cache.BadSourceLink("http_client"))):
+            await self.dispatch_message(user_id=self.user_id, text="https://www.avito.ru/kazan/broken")
+        self.assertIn("q=r1", (await database.get_search(search_id))["url"])
+        self.assertIn("Прежняя ссылка радара осталась", self.last_text())
+
+    async def test_blocked_scan_still_creates_the_radar(self):
+        await self.dispatch_callback("add_search_prompt", user_id=self.user_id)
+        with patch("source_cache.SOURCE_SNAPSHOTS.load", new=AsyncMock(return_value=None)):
+            await self.dispatch_message(user_id=self.user_id, text="https://www.avito.ru/kazan?q=iphone")
+        self.assertEqual(len(await database.get_user_searches(self.user_id)), 1)
 
     async def test_admin_bulk_delete_removes_only_selected(self):
         ids = [await self.add(n) for n in range(3)]

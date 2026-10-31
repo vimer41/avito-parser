@@ -16,6 +16,7 @@ from runtime_metrics import FAILURE_LABELS
 
 logger = logging.getLogger(__name__)
 router = Router()
+RADARS_DELETE_PAGE = 20
 
 
 class AdminStates(StatesGroup):
@@ -261,14 +262,16 @@ async def render_user_card_data(target_id: int, page: int = 0):
         InlineKeyboardButton(text="🔍 Найти другого", callback_data="admin_search_user_prompt"),
         InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{page}"),
     ]
+    delete_row = [InlineKeyboardButton(text="🗑 Удалить радары", callback_data=f"admin_rdel:new:{target_id}:{page}")] if user_radars else []
     if config.is_admin(target_id):
         # Admins have no subscription: only radars and the radar limit are managed here.
         text = text.replace(f"• Статус: {status_line}\n", "• Статус: 👑 <b>Администратор</b>\n")
-        return text, InlineKeyboardMarkup(inline_keyboard=[
+        return text, InlineKeyboardMarkup(inline_keyboard=[row for row in (
             [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}")],
+            delete_row,
             limit_row,
             back_row,
-        ])
+        ) if row])
 
     buttons = [
         [InlineKeyboardButton(text="💳 Выдать / продлить → выбрать тариф", callback_data=f"admin_sub_menu:{target_id}:{page}")],
@@ -277,6 +280,8 @@ async def render_user_card_data(target_id: int, page: int = 0):
          InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
         limit_row,
     ]
+    if delete_row:
+        buttons.insert(3, delete_row)
     if has_access:
         buttons.append([InlineKeyboardButton(text="🚫 Отозвать доступ", callback_data=f"admin_revoke_prompt:{target_id}:{page}")])
     buttons.append([
@@ -534,6 +539,105 @@ async def cb_admin_user_radars(call: CallbackQuery):
     ])
     await call.message.edit_text("\n".join(text_lines), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     await call.answer()
+
+
+async def _selected_radars(state: FSMContext, radars: list[dict]) -> set[int]:
+    """Only this user's radars stay selected, whatever a stale button carries."""
+    return set((await state.get_data()).get("admin_rsel") or []) & {r["id"] for r in radars}
+
+
+async def _radars_delete_screen(call: CallbackQuery, state: FSMContext, target_id: int, page: int, card_page: int) -> None:
+    radars = await database.get_user_searches(target_id)
+    selected = await _selected_radars(state, radars)
+    await state.update_data(admin_rsel=sorted(selected))
+    pages = max(1, -(-len(radars) // RADARS_DELETE_PAGE))
+    page = max(0, min(page, pages - 1))
+    suffix = f"{target_id}:{card_page}"
+    rows = []
+    first = page * RADARS_DELETE_PAGE
+    for i, radar in enumerate(radars[first:first + RADARS_DELETE_PAGE], first + 1):
+        mark = "☑" if radar["id"] in selected else "☐"
+        title = (radar.get("title") or "Без названия").strip()
+        rows.append([ui.btn(f"{mark} {i}. {title[:30]}", callback_data=f"admin_rtog:{radar['id']}:{page}:{suffix}")])
+    nav = []
+    if page > 0:
+        nav.append(ui.btn("«", callback_data=f"admin_rdel:{page - 1}:{suffix}"))
+    if page < pages - 1:
+        nav.append(ui.btn("»", callback_data=f"admin_rdel:{page + 1}:{suffix}"))
+    rows.append(nav)
+    rows.append([ui.btn("Выбрать все", callback_data=f"admin_rall:{page}:{suffix}"),
+                 ui.btn("Снять все", callback_data=f"admin_rnone:{page}:{suffix}")])
+    if selected:
+        rows.append([ui.btn(f"Удалить выбранные ({len(selected)})", "trash", callback_data=f"admin_rgo:{suffix}", style="danger")])
+    rows.append([ui.btn("« Карточка пользователя", callback_data=f"admin_user:{suffix}")])
+    text = (
+        f"{ui.e('trash')} <b>Удалить радары пользователя</b>\n"
+        f"ID: <code>{target_id}</code>\n"
+        f"Выбрано: <b>{len(selected)}</b> из {len(radars)}" + (f" · стр. {page + 1}/{pages}" if pages > 1 else "")
+        + "\n\nНажимайте на радары, чтобы отметить их."
+    )
+    await ui.show(call, text, ui.kb(*rows))
+
+
+@router.callback_query(F.data.startswith(("admin_rdel:", "admin_rtog:", "admin_rall:", "admin_rnone:")))
+async def cb_admin_radars_select(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    action, *args = call.data.split(":")
+    try:
+        page_arg, target_id, card_page = args[-3], int(args[-2]), int(args[-1])
+        radar_id = int(args[0]) if action == "admin_rtog" else None
+    except (ValueError, IndexError):
+        await call.answer("Некорректная кнопка", show_alert=True)
+        return
+    selected = set((await state.get_data()).get("admin_rsel") or [])
+    if action == "admin_rdel" and page_arg == "new":
+        selected, page_arg = set(), "0"
+    elif action == "admin_rtog":
+        selected ^= {radar_id}
+    elif action == "admin_rall":
+        selected = {r["id"] for r in await database.get_user_searches(target_id)}
+    elif action == "admin_rnone":
+        selected = set()
+    await state.update_data(admin_rsel=sorted(selected))
+    await _radars_delete_screen(call, state, target_id, int(page_arg) if page_arg.isdigit() else 0, card_page)
+
+
+@router.callback_query(F.data.startswith("admin_rgo:"))
+async def cb_admin_radars_confirm(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    _, target_id, card_page = call.data.split(":")
+    selected = await _selected_radars(state, await database.get_user_searches(int(target_id)))
+    if not selected:
+        await call.answer("Ничего не выбрано", show_alert=True)
+        return
+    await ui.show(call, (
+        f"{ui.e('trash')} <b>Удалить {len(selected)} радаров пользователя <code>{target_id}</code>?</b>\n\n"
+        "Их стоп-слова тоже удалятся. Отменить это нельзя."
+    ), ui.kb([ui.btn("Да, удалить", "trash", callback_data=f"admin_ryes:{target_id}:{card_page}", style="danger"),
+              ui.btn("Отмена", callback_data=f"admin_rdel:0:{target_id}:{card_page}")]))
+
+
+@router.callback_query(F.data.startswith("admin_ryes:"))
+async def cb_admin_radars_delete(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    _, target_id, card_page = call.data.split(":")
+    target_id = int(target_id)
+    selected = await _selected_radars(state, await database.get_user_searches(target_id))
+    await state.update_data(admin_rsel=[])
+    deleted = 0
+    for radar_id in selected:
+        deleted += int(await database.delete_search(radar_id, target_id))
+    logger.info("👑 [АДМИН] Администратор ID:%s удалил радары пользователя ID:%s: %s из %s", call.from_user.id, target_id, deleted, len(selected))
+    await call.answer(f"Удалено радаров: {deleted}")
+    text, kb = await render_user_card_data(target_id, int(card_page))
+    if text:
+        await ui.show(call, text, kb, answer=False)
 
 
 @router.callback_query(F.data.startswith("admin_revoke_prompt:"))

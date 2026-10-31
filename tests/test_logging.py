@@ -525,6 +525,69 @@ class TestProductionScanLoop(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(scans[1], (False, ()))
 
+    async def _dead_link_alerts(self, kind, *, ok_window=120.0):
+        """Scans one failing and one healthy link and returns the dead-link alerts sent to admins."""
+        import monitoring
+        import scheduler
+        from collector import SourceCollection
+
+        radars = [
+            {"id": 7, "user_id": 42, "url": "https://www.avito.ru/moskva/bad", "tariff_plan": "pro", "title": "битая"},
+            {"id": 8, "user_id": 43, "url": "https://www.avito.ru/moskva/good", "tariff_plan": "pro", "title": "живая"},
+        ]
+        enough = asyncio.Event()
+        bad_scans = 0
+
+        async def collect(parser_, url, *args, **kwargs):
+            nonlocal bad_scans
+            if "bad" not in url:
+                return SourceCollection("Поиск", (), time.time(), 1, False, 120, top_ids=("1",))
+            parser_.last_failure = FetchFailure(kind)
+            bad_scans += 1
+            if bad_scans >= 15:  # 3 channel attempts per scan: past the alert streak
+                enough.set()
+            return None
+
+        bot = Mock(send_message=AsyncMock())
+        with (
+            patch.object(monitoring, "get_proxy_pool", return_value=_FakePool()),
+            patch.object(monitoring, "AvitoParser", _ScanParser),
+            patch.object(monitoring, "collect_source", collect),
+            patch.object(monitoring, "DEAD_LINK_OK_WINDOW", ok_window),
+            patch.object(scheduler, "process_collected_group_fanout", AsyncMock(return_value=True)),
+            patch.object(database, "get_all_active_searches", AsyncMock(return_value=radars)),
+            patch.object(database, "get_outbox_metrics", AsyncMock(return_value={"pending": 0, "oldest_seconds": 0})),
+            patch.object(database, "load_all_source_scan_states", AsyncMock(return_value={})),
+            patch.object(database, "upsert_source_scan_states_batch", AsyncMock()),
+            patch.object(config, "ADMIN_IDS", [7001]),
+            patch.object(config, "SCAN_STARTUP_SPREAD", 0),
+            patch.object(config, "MAX_CONCURRENT_WORKERS", 1),
+            patch.object(config, "SOURCE_BACKOFF_BASE", 0.01),
+            patch.object(config, "SOURCE_BACKOFF_MAX", 0.02),
+            patch.object(config, "SOURCE_SLOW_AFTER", 1000),
+            patch.object(config, "SOURCE_DEAD_ALERT_STREAK", 3),
+            patch.dict(config.TARIFF_SCAN_INTERVAL, {key: 0.05 for key in config.TARIFF_SCAN_INTERVAL}),
+        ):
+            task = asyncio.create_task(monitoring.run_monitoring(bot))
+            await asyncio.wait_for(enough.wait(), 8)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        texts = [call.kwargs["text"] for call in bot.send_message.await_args_list]
+        return [text for text in texts if "Ссылка не работает" in text]
+
+    async def test_dead_link_alerts_admins_once_with_its_owner(self):
+        alerts = await self._dead_link_alerts("catalog_missing")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("#7 «битая», пользователь 42", alerts[0])
+        self.assertIn("https://www.avito.ru/moskva/bad", alerts[0])
+
+    async def test_blocks_are_not_reported_as_a_dead_link(self):
+        self.assertEqual(await self._dead_link_alerts("forbidden"), [])
+
+    async def test_a_general_outage_is_not_reported_as_a_dead_link(self):
+        self.assertEqual(await self._dead_link_alerts("catalog_missing", ok_window=0.0), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -87,6 +87,7 @@ SOURCE_BACKOFF_MAX = positive_float_setting("SOURCE_BACKOFF_MAX", "20.0")
 SOURCE_RECOVERY_SUCCESSES = positive_int_setting("SOURCE_RECOVERY_SUCCESSES", "1")
 SOURCE_SLOW_AFTER = positive_int_setting("SOURCE_SLOW_AFTER", "3")
 SOURCE_SLOW_MAX_FACTOR = positive_int_setting("SOURCE_SLOW_MAX_FACTOR", "5")
+SOURCE_DEAD_ALERT_STREAK = positive_int_setting("SOURCE_DEAD_ALERT_STREAK", "8")
 SCAN_PROXY_ATTEMPTS = positive_int_setting("SCAN_PROXY_ATTEMPTS", "3")
 
 # --- Прокси и HTTP ---
@@ -331,6 +332,10 @@ PRICE_RUB: dict[str, int] = {
     "standart": positive_int_setting("PRICE_RUB_MEDIUM", "449"),
     "pro": positive_int_setting("PRICE_RUB_FULL", "899"),
 }
+# The payment provider refuses a single transaction above this.
+PAYMENT_LIMIT_RUB = 10000
+if max(PRICE_RUB.values()) > PAYMENT_LIMIT_RUB:
+    raise ValueError(f"Цена тарифа не должна превышать {PAYMENT_LIMIT_RUB} ₽ за одну оплату")
 
 
 def rub_price(plan: str) -> int:

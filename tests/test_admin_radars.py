@@ -106,6 +106,52 @@ class TestAdminRadars(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback(f"admin_radar_limit:{USER_ID}:20:0", USER_ID)
         self.assertEqual(await database.get_user_max_radars(USER_ID), 4)
 
+    async def add_user_radars(self, count):
+        return [await database.add_search(USER_ID, f"R{i}", f"https://www.avito.ru/moskva?q=u{i}") for i in range(count)]
+
+    async def test_admin_deletes_selected_radars_of_a_user(self):
+        radars = await self.add_user_radars(3)
+        await self.dispatch_callback(f"admin_user:{USER_ID}:0", config.ADMIN_ID)
+        self.assertIn(f"admin_rdel:new:{USER_ID}:0", self.callback_values())
+
+        await self.dispatch_callback(f"admin_rdel:new:{USER_ID}:0", config.ADMIN_ID)
+        await self.dispatch_callback(f"admin_rtog:{radars[0]}:0:{USER_ID}:0", config.ADMIN_ID)
+        await self.dispatch_callback(f"admin_rtog:{radars[1]}:0:{USER_ID}:0", config.ADMIN_ID)
+        await self.dispatch_callback(f"admin_rtog:{radars[1]}:0:{USER_ID}:0", config.ADMIN_ID)
+        await self.dispatch_callback(f"admin_rtog:{radars[2]}:0:{USER_ID}:0", config.ADMIN_ID)
+        self.assertIn("Выбрано: <b>2</b> из 3", self.last_text())
+        await self.dispatch_callback(f"admin_rgo:{USER_ID}:0", config.ADMIN_ID)
+        self.assertIn("Удалить 2 радаров", self.last_text())
+        self.assertEqual(len(await database.get_user_searches(USER_ID)), 3, "nothing goes before the confirmation")
+
+        await self.dispatch_callback(f"admin_ryes:{USER_ID}:0", config.ADMIN_ID)
+        self.assertEqual([s["id"] for s in await database.get_user_searches(USER_ID)], [radars[1]])
+
+    async def test_admin_delete_screen_pages_a_long_radar_list(self):
+        await database.change_user_extra_radars(USER_ID, 40)
+        await self.add_user_radars(25)
+        await self.dispatch_callback(f"admin_rdel:new:{USER_ID}:0", config.ADMIN_ID)
+        self.assertIn(f"admin_rdel:1:{USER_ID}:0", self.callback_values())
+        await self.dispatch_callback(f"admin_rall:0:{USER_ID}:0", config.ADMIN_ID)
+        self.assertIn("Выбрано: <b>25</b> из 25", self.last_text())
+        await self.dispatch_callback(f"admin_ryes:{USER_ID}:0", config.ADMIN_ID)
+        self.assertEqual(await database.get_user_searches(USER_ID), [])
+
+    async def test_selection_never_reaches_another_users_radar(self):
+        own = await database.add_search(config.ADMIN_ID, "Свой", "https://www.avito.ru/moskva?q=own")
+        await self.add_user_radars(1)
+        await self.dispatch_callback(f"admin_rdel:new:{USER_ID}:0", config.ADMIN_ID)
+        await self.dispatch_callback(f"admin_rtog:{own}:0:{USER_ID}:0", config.ADMIN_ID)
+        await self.dispatch_callback(f"admin_ryes:{USER_ID}:0", config.ADMIN_ID)
+        self.assertEqual(len(await database.get_user_searches(config.ADMIN_ID)), 1)
+        self.assertEqual(len(await database.get_user_searches(USER_ID)), 1)
+
+    async def test_non_admin_cannot_delete_radars_of_others(self):
+        radars = await self.add_user_radars(1)
+        for data in (f"admin_rall:0:{USER_ID}:0", f"admin_rtog:{radars[0]}:0:{USER_ID}:0", f"admin_ryes:{USER_ID}:0"):
+            await self.dispatch_callback(data, USER_ID)
+        self.assertEqual(len(await database.get_user_searches(USER_ID)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ import config
 import database
 import ui
 from parser import AvitoParser
-from source_cache import SOURCE_SNAPSHOTS
+from source_cache import SOURCE_SNAPSHOTS, BadSourceLink
 from logger_setup import log_user_event
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,8 @@ async def route_menu_text(message: Message, state: FSMContext) -> bool:
         await common.cmd_profile(message)
     elif text in ui.menu_texts("help"):
         await common.cmd_help(message)
+    elif text in ui.menu_texts("docs"):
+        await common.cmd_docs_hub(message)
     elif text in ui.menu_texts("support"):
         await common.cmd_support(message)
     elif text in ui.menu_texts("admin") and config.is_admin(message.from_user.id):
@@ -216,6 +218,12 @@ def search_url_error(raw_url: str) -> Optional[str]:
     return None
 
 
+def bad_link_text(outcome: str) -> str:
+    return (f"{ui.e('warn')} <b>По этой ссылке нет объявлений</b>\n\n"
+            f"Авито не показал по ней страницу поиска. {outcome}\n\n"
+            "<blockquote>Откройте поиск на avito.ru и скопируйте адрес из браузера целиком.</blockquote>")
+
+
 # Registered before process_avito_url: a link sent while replacing a radar's link must not become a new radar.
 @router.message(SearchStates.waiting_for_new_url)
 async def process_new_url(message: Message, state: FSMContext):
@@ -246,6 +254,12 @@ async def process_new_url(message: Message, state: FSMContext):
     status_msg = await message.answer(f"{ui.e('wait')} <b>Запоминаю новую выдачу…</b>", parse_mode="HTML")
     try:
         snapshot = await SOURCE_SNAPSHOTS.load(normalized_url)
+    except BadSourceLink:
+        log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Замена ссылки радара",
+                       f"Ссылка без каталога: «{normalized_url[:80]}»", status="WARN")
+        await status_msg.edit_text(bad_link_text("Прежняя ссылка радара осталась."), parse_mode="HTML", reply_markup=ui.kb(
+            [ui.btn("К радару", "radar", callback_data=f"open_search:{search_id}")]))
+        return
     except Exception as e:
         logger.warning("Ошибка калибровки при замене ссылки: %s", e)
         snapshot = None
@@ -321,6 +335,11 @@ async def process_avito_url(message: Message, state: FSMContext):
 
     try:
         snapshot = await SOURCE_SNAPSHOTS.load(normalized_url)
+    except BadSourceLink:
+        log_user_event(user_id, message.from_user.username, message.from_user.first_name, "Добавление радара",
+                       f"Ссылка без каталога: «{normalized_url[:80]}»", status="WARN")
+        await status_msg.edit_text(bad_link_text("Радар не создан."), reply_markup=_url_error_kb(), parse_mode="HTML")
+        return
     except Exception as e:
         logger.warning("Ошибка калибровки: %s", e)
         snapshot = None

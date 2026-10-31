@@ -11,6 +11,14 @@ from parser import AvitoParser, AvitoItem
 from proxy_pool import get_proxy_pool
 
 
+# Answers about the page itself. Blocks and timeouts prove nothing, and invalid_redirect also hits working links.
+BAD_LINK_KINDS = frozenset({"catalog_missing", "http_client"})
+
+
+class BadSourceLink(Exception):
+    """Every channel reached Avito and got no catalog: the link is wrong, not the network."""
+
+
 @dataclass
 class SourceSnapshot:
     title: str
@@ -66,6 +74,8 @@ class SourceSnapshotCache:
     async def _fetch(self, key: str):
         pool = get_proxy_pool()
         excluded: set[str] = set()
+        failed_attempts = bad_pages = 0
+        bad_kind = ""
         for _ in range(max(1, int(config.SCAN_PROXY_ATTEMPTS))):
             lease = pool.acquire_client(exclude_ids=excluded)
             if lease is None and len(pool.clients) == 1:
@@ -89,8 +99,16 @@ class SourceSnapshotCache:
                     snapshot = SourceSnapshot(result.title, result.items, result.captured_at)
                     self.put(key, snapshot)
                     return snapshot
+                failed_attempts += 1
+                failure = parser.last_failure
+                if failure is not None and failure.kind in BAD_LINK_KINDS:
+                    bad_pages += 1
+                    bad_kind = failure.kind
             finally:
                 lease.release()
+
+        if failed_attempts and bad_pages == failed_attempts:
+            raise BadSourceLink(bad_kind)
 
         # Fallback for direct/legacy mode when pool has no clients
         parser = None

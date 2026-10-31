@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from tests import _environment
 from freshness import freshness_status, publication_age_seconds
-from parser import AvitoParser
+from parser import AvitoParser, FetchFailure
 from curl_cffi import requests as curl_requests
 from request_budget import NetworkBlockState, RequestDeferred, RequestBudgetExceeded, parse_retry_after
 from scan_planner import DeadlineScheduler, calculate_interval_plan
@@ -21,6 +21,7 @@ import config
 import monitoring
 import parser as parser_module
 import scheduler
+import source_cache
 
 
 class TestDeadlineScheduling(unittest.TestCase):
@@ -395,6 +396,27 @@ class TestSharedCalibration(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(cache.get("same"))
         await asyncio.sleep(0.02)
         self.assertIsNone(cache.get("other"))
+
+    async def _fetch_with_failures(self, kinds):
+        """Each channel of the fake pool fails with its own kind; returns what load() gave."""
+        clients = [SimpleNamespace(proxy_id=str(i), _bound_parser=Mock(last_failure=FetchFailure(kind))) for i, kind in enumerate(kinds)]
+        pool = Mock(clients=clients)
+        pool.acquire_client.side_effect = lambda exclude_ids=(): next(
+            (Mock(client=client) for client in clients if client.proxy_id not in exclude_ids), None)
+        fallback = Mock(last_failure=None)
+        with (
+            patch.object(source_cache, "get_proxy_pool", return_value=pool),
+            patch.object(source_cache, "collect_source", new=AsyncMock(return_value=None)),
+            patch.object(source_cache, "AvitoParser", return_value=fallback),
+        ):
+            return await SourceSnapshotCache().load("https://www.avito.ru/moskva/x")
+
+    async def test_link_is_bad_only_when_every_channel_saw_no_catalog(self):
+        with self.assertRaises(source_cache.BadSourceLink):
+            await self._fetch_with_failures(["catalog_missing", "catalog_missing", "http_client"])
+
+    async def test_a_block_on_any_channel_proves_nothing_about_the_link(self):
+        self.assertIsNone(await self._fetch_with_failures(["catalog_missing", "forbidden", "catalog_missing"]))
 
     async def test_scheduler_runtime_groups_sources_and_closes_owned_parsers(self):
         radar = {"id": 1, "user_id": 123, "url": "https://www.avito.ru/search", "tariff_plan": "standart"}
