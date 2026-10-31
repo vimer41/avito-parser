@@ -325,8 +325,7 @@ async def cmd_subscription_menu(event):
         f"Сейчас: <b>{access_status(user, user_id)}</b>\n\n"
         f"{plan_summary('lite')}\n\n"
         f"{plan_summary('standart')}\n\n"
-        f"{plan_summary('pro')}\n"
-        "+ догон свежих лотов после технических пауз\n\n"
+        f"{plan_summary('pro')}\n\n"
         "<blockquote>Чем чаще проверка, тем раньше вы увидите лот и успеете написать первым.</blockquote>\n"
         "Оплата разовая на 30 дней, без автосписаний. Оплаченные дни добавляются к текущему сроку."
     )
