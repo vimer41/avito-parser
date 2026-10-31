@@ -434,7 +434,7 @@ class DeadlineScheduler:
             state.retry_attempt = task.retry_attempt + 1 if retryable else 0
             delay = min(
                 float(config.SOURCE_BACKOFF_MAX),
-                float(config.SOURCE_BACKOFF_BASE) * (2 ** (state.source_failure_streak - 1)),
+                float(config.SOURCE_BACKOFF_BASE) * (2 ** min(state.source_failure_streak - 1, 16)),
             )
             state.backoff_until = now_val + max(delay, retry_after)
             state.due_at = state.backoff_until

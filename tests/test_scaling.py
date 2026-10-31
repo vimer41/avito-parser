@@ -619,3 +619,14 @@ class TestFastSkipCatchupAndHysteresis(unittest.IsolatedAsyncioTestCase):
         tk = planner.take_due(due + 0.1)
         planner.complete(tk, due + 0.2, True)
         self.assertEqual(planner.sources["u"].source_failure_streak, 0)
+
+    def test_source_backoff_survives_huge_persisted_streak(self):
+        # A link failing for hours reloads its streak after a restart: 2 ** 1024 must not overflow float
+        planner = DeadlineScheduler(use_source_backoff=True)
+        planner.sync({"u": [{"id": 1}]}, None, 0.0, persisted_states={"u": {"failure_streak": 1024}})
+        task = planner.take_due(0.0)
+
+        planner.complete(task, 1.0, False, exhausted_proxies=True)
+
+        self.assertEqual(planner.sources["u"].source_failure_streak, 1025)
+        self.assertAlmostEqual(planner.sources["u"].due_at - 1.0, 20.0, delta=0.01)
