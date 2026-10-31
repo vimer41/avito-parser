@@ -24,6 +24,7 @@ class SourceCollection:
     discovery_times: dict[str, float] = field(default_factory=dict)
     top_ids: tuple[str, ...] = ()
     fast_skipped: bool = False
+    channel: str = ""  # the egress that served this collection
 
 
 def reached_old_boundary(items, max_age_minutes):

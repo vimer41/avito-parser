@@ -332,6 +332,45 @@ class TestReport(LogFixture):
         hour_note = log_report.findings(log_report.read_rows(log_report.METRICS_LOG, 0), [])
         self.assertTrue(any("Провалов работы: 1, всего 120 мин" in note for note in hour_note))
 
+    def test_capacity_is_judged_over_a_window_not_a_single_minute(self):
+        channel = {"http": 2, "ok": 2, "403": 0, "429": 0, "5xx": 0, "terr": 0, "coll": 2, "coll_ok": 2,
+                   "ms_p50": 500, "fail": {}, "state": "healthy", "rate": 1.5}
+        self.write_day(lambda stamp: self.healthy_minute(stamp, ch={f"10.0.0.{i}:3000": dict(channel) for i in range(5)}))
+        self.flush()
+        self.assertIn("✅ Запас хороших прокси: хватает 100% минут", log_report.build_readiness(24))
+
+    def test_blind_zone_names_its_radar(self):
+        def row(stamp):
+            offset = (int(time.time()) - stamp) // 60
+            return self.healthy_minute(stamp, coverage_s=700.0, coverage_rid=172) if offset < 5 else self.healthy_minute(stamp, coverage_rid=165)
+
+        self.write_day(row)
+        self.flush()
+        report = log_report.build_readiness(24)
+        self.assertIn("худшая слепая зона 700 с (#172)", report)
+        self.assertIn("слепая зона до 700 с (#172)", report)
+
+    def test_speed_by_radar_shows_the_rest_without_the_busiest(self):
+        self.write_day(self.healthy_minute)
+        self.lots(30, rid=212, age=180.0)
+        self.lots(20, rid=212, age=480.0, fresh=False, pos=30, ch="10.0.0.1:3000")
+        self.lots(10, rid=184, age=78.0, pos=2, ch="10.0.0.2:3000")
+        self.flush()
+        report = log_report.build_readiness(24)
+        self.assertIn("#212: 50 · 40% · 180 с · 180 с", report)
+        self.assertIn("#184: 10 · 0% · 78 с · 78 с", report)
+        self.assertIn("Без #212 (у него 83% лотов): p50 78 с, p95 78 с, свежих 10", report)
+        self.assertIn("Место в выдаче: старые p50 30, p95 30; свежие p50 2, p95 2", report)
+        self.assertIn("Старые по каналам: 10.0.0.1:3000×20", report)
+
+    def test_redirect_failure_goes_to_another_channel_and_says_where(self):
+        import re
+        from parser import redirect_failure
+        failure = redirect_failure(re.search("(.+)", r"/moskva/audio_i_video?cd=1\u0026q=x"), 2)
+        self.assertTrue(failure.retryable)
+        self.assertEqual(failure.detail, "переход 3: /moskva/audio_i_video")
+        self.assertEqual(redirect_failure(None, 0).detail, "переход 1: нет адреса")
+
     def test_short_history_gives_no_verdict_yet(self):
         self.write_day(self.healthy_minute, minutes=120)
         self.flush()

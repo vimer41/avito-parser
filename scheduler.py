@@ -763,6 +763,7 @@ def log_new_lots(radar_id: int, items: list, collection: SourceCollection, previ
     """
     if previous_scan_at <= 0:
         return
+    positions = {item.item_id: index for index, item in enumerate(collection.items)}
     for item in items[:MAX_LOT_LOGS_PER_SCAN]:
         published = normalize_timestamp(item.timestamp)
         if published is None:
@@ -780,6 +781,8 @@ def log_new_lots(radar_id: int, items: list, collection: SourceCollection, previ
             gap=round(max(0.0, seen_at - previous_scan_at), 1),
             fresh=bool(fresh.get(item.item_id)),
             promo=bool(item.is_promotion),
+            pos=positions.get(item.item_id),
+            ch=collection.channel,
         )
 
 

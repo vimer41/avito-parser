@@ -101,6 +101,12 @@ class FetchFailure:
     detail: str = ""
 
 
+def redirect_failure(match: Optional[re.Match], redirects: int) -> FetchFailure:
+    """Another channel may get past the redirect, so the scan goes on; the detail shows where this one stopped."""
+    where = urlparse(match.group(1).replace(r"\u0026", "&")).path if match else "нет адреса"
+    return FetchFailure("invalid_redirect", detail=f"переход {redirects + 1}: {where}")
+
+
 _STUB_MARKERS = ("firewall", "captcha", "geetest", "qrator", "login", "доступ ограничен", "доступ временно", "blocked")
 
 
@@ -826,7 +832,7 @@ class AvitoParser:
                     if '"isSuspenseRedirect":true' in page_html:
                         match = re.search(r'"redirect"\s*:\s*"([^"]+)"', page_html)
                         if not match or ssr_redirects >= 2:
-                            self.last_failure = FetchFailure("invalid_redirect", False)
+                            self.last_failure = redirect_failure(match, ssr_redirects)
                             return None
                         redirect_path = match.group(1).replace(r"\u0026", "&")
                         target = urljoin(actual_url, redirect_path)
@@ -994,7 +1000,7 @@ class AvitoParser:
                     if '"isSuspenseRedirect":true' in page_html:
                         match = re.search(r'"redirect"\s*:\s*"([^"]+)"', page_html)
                         if not match or ssr_redirects >= 2:
-                            self.last_failure = FetchFailure("invalid_redirect", False)
+                            self.last_failure = redirect_failure(match, ssr_redirects)
                             return None
                         redirect_path = match.group(1).replace(r"\u0026", "&")
                         target = urljoin(actual_url, redirect_path)

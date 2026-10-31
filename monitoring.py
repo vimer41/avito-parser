@@ -493,6 +493,8 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         elapsed_ms = (time.monotonic() - scan_t0) * 1000.0
         ok = collection is not None
         record_source_result(task, scan_client, ok, attempts)
+        if ok and scan_client is not None:
+            collection = dataclasses.replace(collection, channel=short_channel(scan_client.proxy_id, scan_client.masked_url))
         if ok and await nothing_new_for_fanout(seen_store, task, collection, has_pro_catchup):
             collection = dataclasses.replace(collection, fast_skipped=True)
         gap = bool(collection.coverage_gap) if collection is not None else False
@@ -760,6 +762,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                         rps_have=round(cap["available_rps"], 2),
                         channels=f"{healthy_proxies}/{len(proxy_snaps)}",
                         coverage_s=round(planner_snap["full_coverage_age_seconds"] or 0.0, 1),
+                        coverage_rid=planner_snap["least_covered_radar"],
                         outbox=metrics_snap["outbox"]["pending_depth"],
                         outbox_oldest_s=metrics_snap["outbox"]["oldest_pending_age_seconds"],
                         fanout_q=fanout_queue.qsize(),

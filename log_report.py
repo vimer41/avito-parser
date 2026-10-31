@@ -34,6 +34,8 @@ COVERED_S = 120  # a link is covered when its last good scan is younger than thi
 LONG_STALL_MS = 5000
 SAFE_RPS_PER_IP = 0.5
 GOOD_CHANNEL_OK = 0.7
+CAPACITY_WINDOW_MIN = 10  # one minute holds too few requests per channel to judge it
+RADAR_SPEED_ROWS = 10
 ENOUGH_LOTS = 20
 
 
@@ -378,17 +380,23 @@ def _bot_waits(lots: list[dict]) -> list[float]:
 def _safe_capacity_share(metrics: list[dict]) -> float:
     """Share of minutes when proven proxies alone cover the load at the safe per-IP rate, with a 20 % reserve."""
     covered = total = 0
-    for row in metrics:
-        need = row.get("rps_need")
-        if not need:
+    for start in range(0, len(metrics), CAPACITY_WINDOW_MIN):
+        window = metrics[start:start + CAPACITY_WINDOW_MIN]
+        needs = [row["rps_need"] for row in window if row.get("rps_need")]
+        if not needs:
             continue
-        total += 1
         good = sum(
-            1 for name, stats in (row.get("ch") or {}).items()
+            1 for name, stats in _channels(window).items()
             if name != "direct" and stats.get("http", 0) >= 3 and stats.get("ok", 0) / stats["http"] >= GOOD_CHANNEL_OK
         )
-        covered += good * SAFE_RPS_PER_IP >= need * 1.2
+        total += len(needs)
+        covered += len(needs) if good * SAFE_RPS_PER_IP >= max(needs) * 1.2 else 0
     return covered / total if total else 0.0
+
+
+def _worst_link(rows: list[dict]) -> str:
+    worst = max(rows, key=lambda row: row.get("coverage_s") or 0, default={})
+    return f" (#{worst['coverage_rid']})" if worst.get("coverage_rid") else ""
 
 
 def readiness_checks(metrics: list[dict], events: list[dict], hours: int) -> list[str]:
@@ -408,7 +416,7 @@ def readiness_checks(metrics: list[dict], events: list[dict], hours: int) -> lis
         share, worst = sum(1 for age in coverage if age <= COVERED_S) / len(coverage), max(coverage)
         mark = _grade(share, 0.99, 0.95)
         add("⚠️" if mark == "✅" and worst > 300 else mark, "Все ссылки под присмотром",
-            f"{share:.1%} минут, худшая слепая зона {worst:.0f} с", f"99 % минут за {COVERED_S} с, зона до 300 с")
+            f"{share:.1%} минут, худшая слепая зона {worst:.0f} с{_worst_link(metrics)}", f"99 % минут за {COVERED_S} с, зона до 300 с")
     else:
         add("⏳", "Все ссылки под присмотром", "нет данных", "99 % минут")
 
@@ -470,7 +478,50 @@ def _lot_timing(events: list[dict]) -> list[str]:
         *split(fresh, "Свежие"),
         *split(old, "Старше лимита радара"),
         *([f"Старые по радарам: {_top(by_radar, 5)}"] if by_radar else []),
+        *_old_lot_origin(fresh, old),
     ]
+
+
+def _old_lot_origin(fresh: list[dict], old: list[dict]) -> list[str]:
+    """Deep positions mean a late insert into the list; one or two channels mean they see a different list."""
+    old_places = [lot["pos"] for lot in old if lot.get("pos") is not None]
+    if not old_places:
+        return []
+    fresh_places = [lot["pos"] for lot in fresh if lot.get("pos") is not None]
+    channels = Counter(lot.get("ch") or "?" for lot in old)
+    return [
+        f"Место в выдаче: старые p50 {_percentile(old_places, 0.5):.0f}, p95 {_percentile(old_places, 0.95):.0f}; "
+        f"свежие p50 {_percentile(fresh_places, 0.5):.0f}, p95 {_percentile(fresh_places, 0.95):.0f}",
+        f"Старые по каналам: {_top(channels, 5)}",
+    ]
+
+
+def _radar_speed(events: list[dict]) -> list[str]:
+    """One flooded radar sets the shared percentiles, so each is shown alone and the rest without the busiest."""
+    by_radar: dict = defaultdict(list)
+    for lot in _lots(events):
+        if not lot.get("promo"):
+            by_radar[lot.get("rid")].append(lot)
+    ranked = sorted(by_radar.items(), key=lambda pair: -len(pair[1]))
+    if not ranked:
+        return []
+
+    def fresh_ages(lots: list[dict]) -> list[float]:
+        return [lot["age"] for lot in lots if lot.get("fresh")]
+
+    lines = ["радар: лотов · старше лимита · свежие от публикации до бота p50 · p95"]
+    for rid, lots in ranked[:RADAR_SPEED_ROWS]:
+        ages = fresh_ages(lots)
+        speed = f"{_percentile(ages, 0.5):.0f} с · {_percentile(ages, 0.95):.0f} с" if ages else "— · —"
+        lines.append(f"#{rid}: {len(lots)} · {_pct(len(lots) - len(ages), len(lots))} · {speed}")
+    others = fresh_ages([lot for _, lots in ranked[1:] for lot in lots])
+    if others:
+        share = _pct(len(ranked[0][1]), sum(len(lots) for _, lots in ranked))
+        lines.append(
+            f"Без #{ranked[0][0]} (у него {share} лотов): p50 {_percentile(others, 0.5):.0f} с, "
+            f"p95 {_percentile(others, 0.95):.0f} с, свежих {len(others)}"
+        )
+    return lines
 
 
 def _channel_load(metrics: list[dict]) -> list[str]:
@@ -513,7 +564,7 @@ def _outage_lines(metrics: list[dict]) -> list[str]:
         ]
         lines.append(
             f"{run[0].get('ts')} … {str(run[-1].get('ts'))[-5:]} · {len(run)} мин · провалов {failed} из {ok + failed} · "
-            f"слепая зона до {_worst(run, 'coverage_s')} с · {_top(_merge(run, 'fail'), 3)}"
+            f"слепая зона до {_worst(run, 'coverage_s')} с{_worst_link(run)} · {_top(_merge(run, 'fail'), 3)}"
             + (f" · не отвечали: {', '.join(dead)}" if dead else "")
         )
     return lines
@@ -530,6 +581,7 @@ def build_readiness(hours: int = 24, live_state: Optional[dict] = None) -> str:
     lines += _section("Вердикт", [readiness_verdict(checks)])
     lines += _section("Критерии", checks)
     lines += _section("Скорость лота", _lot_timing(events))
+    lines += _section("Скорость по радарам", _radar_speed(events))
     lines += _section("Провалы работы", _outage_lines(metrics))
     lines += _section("По часам", _timeline(metrics, 60))
     lines += _section("Каналы", _channel_load(metrics))

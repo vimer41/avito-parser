@@ -526,13 +526,20 @@ class DeadlineScheduler:
 
     def full_coverage_age_seconds(self, now: Optional[float] = None) -> float:
         now_val = self.monotonic_fn() if now is None else now
-        if not self.sources:
-            return 0.0
-        oldest_covered = min(
-            (state.last_success if state.last_success is not None else state.created_at)
-            for state in self.sources.values()
-        )
-        return max(0.0, now_val - oldest_covered)
+        worst = self._least_covered()
+        return max(0.0, now_val - self._covered_at(worst)) if worst else 0.0
+
+    @staticmethod
+    def _covered_at(state: SourceState) -> float:
+        return state.last_success if state.last_success is not None else state.created_at
+
+    def _least_covered(self) -> Optional[SourceState]:
+        return min(self.sources.values(), key=self._covered_at, default=None)
+
+    def least_covered_radar(self) -> Optional[int]:
+        """The radar behind the coverage age: a blind zone is useless without knowing whose it is."""
+        worst = self._least_covered()
+        return worst.radars[0].get("id") if worst and worst.radars else None
 
     def snapshot(self, now: Optional[float] = None) -> dict:
         now_val = self.monotonic_fn() if now is None else now
@@ -560,6 +567,7 @@ class DeadlineScheduler:
                 default=0.0,
             ),
             "full_coverage_age_seconds": self.full_coverage_age_seconds(now_val),
+            "least_covered_radar": self.least_covered_radar(),
             "capacity_mode": self.capacity_mode,
             "interval_bounds": [self.interval_low, self.interval_high],
             "completed": self.completed,
